@@ -1640,6 +1640,73 @@ void UpdateReplacesChangedFiles(const std::filesystem::path& root) {
   CHECK(installer.Run({}, UpdateTarget(root.string() + "-missing"), cancel).error == InstallError::kProtocol);
 }
 
+// MeasureUpdate counts what an update downloads: the files Run stages (changed or new), not whole depots.
+void MeasureUpdateMatchesTheUpdate(const std::filesystem::path& root) {
+  auto world = MakeWorld();
+  InstallBase(world, root);
+  auto& base = world.manifests[441];
+  base.gid = 21;
+  base.files[0] = world.AddFile("game.exe", {"MZ-executable-", "patched-chunk"});
+  base.files.push_back(world.AddFile("new/added.txt", {"added"}));
+  auto target = UpdateTarget(root);
+  target.depots[0].manifest_gid = 21;
+  DepotInstaller installer(world.Hooks());
+  installer.SetTuning({1, 256});
+  std::atomic<bool> cancel{false};
+  world.chunk_calls = 0;
+  const auto measured = installer.MeasureUpdate({}, target.app_id, target.depots, {}, root.string(), cancel);
+  CHECK(measured.error == InstallError::kNone && world.chunk_calls == 0);
+  CHECK(!std::filesystem::exists(root / DepotInstaller::kUpdateDir));
+  CHECK(measured.staged_bytes == 27 + 5 && measured.install_bytes == 27 + 13 + 5);
+  InstallProgress last;
+  CHECK(installer.Run({}, target, cancel, [&](const InstallProgress& progress) { last = progress; }).error == InstallError::kNone);
+  CHECK(measured.download_bytes == last.download_total && measured.download_bytes > 0);
+  // Up to date: nothing to download.
+  const auto same = installer.MeasureUpdate({}, target.app_id, target.depots, {}, root.string(), cancel);
+  CHECK(same.error == InstallError::kNone && same.download_bytes == 0 && same.staged_bytes == 0);
+  // A file changed on disk since (another size) downloads again, as Run would fetch it.
+  std::ofstream(root / "new/added.txt") << "edited by hand";
+  CHECK(installer.MeasureUpdate({}, target.app_id, target.depots, {}, root.string(), cancel).staged_bytes == 5);
+  // Without a tree and the installed manifests, only hashing the files could tell: no size.
+  std::filesystem::remove(root / DepotInstaller::kFileTree);
+  const auto unknown = installer.MeasureUpdate({}, target.app_id, target.depots, {}, root.string(), cancel);
+  CHECK(unknown.error == InstallError::kProtocol && unknown.detail == "no file tree");
+}
+
+// An install from before trees were kept: the manifests its record names stand in for the tree.
+void MeasureUpdateWithoutTreeUsesTheInstalledManifests(const std::filesystem::path& root) {
+  auto world = MakeWorld();
+  InstallBase(world, root);
+  std::filesystem::remove(root / DepotInstaller::kFileTree);
+  const auto installed_base = world.manifests[441];
+  auto& base = world.manifests[441];
+  base.gid = 21;
+  base.files[0] = world.AddFile("game.exe", {"MZ-executable-", "patched-chunk"});
+  base.files.push_back(world.AddFile("new/added.txt", {"added"}));
+  auto hooks = world.Hooks();
+  std::vector<std::pair<std::uint32_t, std::uint64_t>> asked;
+  hooks.manifest = [&](const ContentServer&, const DepotGrant& grant, const std::atomic<bool>&, DepotManifest* out) {
+    asked.emplace_back(grant.depot_id, grant.manifest_gid);
+    *out = grant.depot_id == 441 && grant.manifest_gid == 11 ? installed_base : world.manifests.at(grant.depot_id);
+    return InstallError::kNone;
+  };
+  DepotInstaller installer(hooks);
+  installer.SetTuning({1, 256});
+  std::atomic<bool> cancel{false};
+  auto target = UpdateTarget(root);
+  const auto installed = target.depots;  // 441 at 11, 442 at 12
+  target.depots[0].manifest_gid = 21;
+  world.chunk_calls = 0;
+  const auto measured = installer.MeasureUpdate({}, target.app_id, target.depots, {}, root.string(), cancel, installed);
+  CHECK(measured.error == InstallError::kNone && world.chunk_calls == 0);
+  CHECK((asked == std::vector<std::pair<std::uint32_t, std::uint64_t>>{{441, 11}, {442, 12}, {441, 21}, {442, 12}}));
+  CHECK(measured.staged_bytes == 27 + 5);
+  // The update hashes the files and downloads the same ones.
+  InstallProgress last;
+  CHECK(installer.Run({}, target, cancel, [&](const InstallProgress& progress) { last = progress; }).error == InstallError::kNone);
+  CHECK(measured.download_bytes == last.download_total);
+}
+
 // A depot that leaves the selection gives its files back to the depot under it: the patch depot won
 // level.dat; without it the base depot's level.dat must be written again (it never changed itself).
 void UpdateRestoresFilesOfARemovedDepot(const std::filesystem::path& root) {
@@ -2693,6 +2760,8 @@ int main(int argc, char** argv) {
   BrokenManifestIsFetchedAgainElsewhere(base / "manifest");
   RemovesOnlyManagedFolders(base);
   UpdateReplacesChangedFiles(base / "update");
+  MeasureUpdateMatchesTheUpdate(base / "update-measure");
+  MeasureUpdateWithoutTreeUsesTheInstalledManifests(base / "update-measure-no-tree");
   UpdateRestoresFilesOfARemovedDepot(base / "update-removed-depot");
   UpdateWithoutTreeHashesFiles(base / "update-no-tree");
   InterruptedUpdateResumes(base / "update-resume");

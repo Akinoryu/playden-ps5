@@ -343,6 +343,17 @@ std::optional<std::map<std::string, TreeFile>> ReadFileTree(const std::string& p
   return tree;
 }
 
+// An update leaves a file alone when the install's tree has the same path with the same SHA-1 and size, and
+// the file on disk still has that size.
+bool UnchangedInTree(const std::map<std::string, TreeFile>& tree, const std::string& key, const ManifestFile& file,
+                     const std::string& install_root) {
+  const auto found = tree.find(key);
+  struct stat info {};
+  return found != tree.end() && found->second.path == file.path && found->second.size == file.size &&
+         found->second.sha == Hex(file.sha_content) && lstat((install_root + "/" + file.path).c_str(), &info) == 0 &&
+         S_ISREG(info.st_mode) && static_cast<std::uint64_t>(info.st_size) == file.size;
+}
+
 // Whether the file at `path` is a regular file of `size` bytes whose SHA-1 is `sha` (read through a
 // heap buffer; worker stacks are small). An empty file needs no hash.
 bool SameContent(const std::string& path, std::uint64_t size, const std::array<std::uint8_t, 20>& sha,
@@ -638,14 +649,14 @@ DepotInstaller::DepotInstaller(InstallerHooks hooks) : hooks_(std::move(hooks)) 
   if (!hooks_.free_bytes) hooks_.free_bytes = &DefaultFreeBytes;
 }
 
-InstallMeasure DepotInstaller::Measure(const StoredSession& session, std::uint32_t app_id,
-                                      const std::vector<DepotInfo>& depots, const std::string& branch,
-                                      const std::atomic<bool>& cancel) {
-  InstallMeasure measure;
-  const auto fail = [&measure](InstallError error, std::string detail) {
-    measure.error = error;
-    measure.detail = std::move(detail);
-    return measure;
+std::optional<DepotMerge> DepotInstaller::MergedManifests(const StoredSession& session, std::uint32_t app_id,
+                                                         const std::vector<DepotInfo>& depots, const std::string& branch,
+                                                         const std::atomic<bool>& cancel,
+                                                         std::vector<DepotManifest>* manifests, InstallMeasure* measure) {
+  const auto fail = [measure](InstallError error, std::string detail) -> std::optional<DepotMerge> {
+    measure->error = error;
+    measure->detail = std::move(detail);
+    return std::nullopt;
   };
   if (app_id == 0 || depots.empty()) return fail(InstallError::kProtocol, "nothing to measure");
   std::vector<DepotRequest> requests;
@@ -656,19 +667,19 @@ InstallMeasure DepotInstaller::Measure(const StoredSession& session, std::uint32
   const auto access = hooks_.access(session, app_id, requests, cancel);
   if (!access.ok()) return fail(FromCm(access.error), access.detail.empty() ? "depot access failed" : access.detail);
   if (access.grants.empty()) return fail(InstallError::kRejected, "no depot granted");
-  measure.partial = !access.skipped.empty();
+  measure->partial = !access.skipped.empty();
   std::vector<ContentServer> servers;
   const auto listed = hooks_.servers(session.cell_id.value_or(0), cancel, &servers);
   if (listed == CdnError::kCanceled) return fail(InstallError::kCanceled, "canceled");
   if (listed != CdnError::kNone || servers.empty()) return fail(InstallError::kNetwork, "no content servers");
   // As Run: another server after a failure or a manifest that doesn't parse, with a pause between.
-  std::vector<DepotManifest> manifests(access.grants.size());
+  manifests->assign(access.grants.size(), {});
   for (std::size_t index = 0; index < access.grants.size(); ++index) {
     InstallError fetched = InstallError::kNetwork;
     bool network_failed = false;
     const std::size_t attempts = std::min<std::size_t>(std::max<std::size_t>(servers.size() * 2, 4), 6);
     for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
-      fetched = hooks_.manifest(servers[attempt % servers.size()], access.grants[index], cancel, &manifests[index]);
+      fetched = hooks_.manifest(servers[attempt % servers.size()], access.grants[index], cancel, &(*manifests)[index]);
       if (fetched != InstallError::kNetwork && fetched != InstallError::kCorrupt) break;
       network_failed = network_failed || fetched == InstallError::kNetwork;
       if (hooks_.pause && attempt + 1 < attempts) hooks_.pause(1000 << std::min<std::size_t>(attempt, 3), cancel);
@@ -678,11 +689,61 @@ InstallMeasure DepotInstaller::Measure(const StoredSession& session, std::uint32
     if (fetched == InstallError::kCorrupt && network_failed) fetched = InstallError::kNetwork;
     if (fetched != InstallError::kNone) return fail(fetched, "manifest unavailable");
   }
-  const auto merged = MergeDepotManifests(manifests);
+  auto merged = MergeDepotManifests(*manifests);
   if (!merged.conflict.empty()) return fail(InstallError::kCorrupt, "conflicting depots");
+  return merged;
+}
+
+InstallMeasure DepotInstaller::Measure(const StoredSession& session, std::uint32_t app_id,
+                                      const std::vector<DepotInfo>& depots, const std::string& branch,
+                                      const std::atomic<bool>& cancel) {
+  InstallMeasure measure;
+  std::vector<DepotManifest> manifests;
+  const auto merged = MergedManifests(session, app_id, depots, branch, cancel, &manifests, &measure);
+  if (!merged) return measure;
   measure.error = InstallError::kNone;
-  measure.install_bytes = merged.install_bytes;
-  measure.download_bytes = merged.download_bytes;
+  measure.install_bytes = merged->install_bytes;
+  measure.download_bytes = merged->download_bytes;
+  return measure;
+}
+
+InstallMeasure DepotInstaller::MeasureUpdate(const StoredSession& session, std::uint32_t app_id,
+                                            const std::vector<DepotInfo>& depots, const std::string& branch,
+                                            const std::string& install_root, const std::atomic<bool>& cancel,
+                                            const std::vector<DepotInfo>& installed) {
+  InstallMeasure measure;
+  auto previous = ReadFileTree(install_root + "/" + kFileTree);
+  if (!previous && installed.empty()) {
+    measure.detail = "no file tree";
+    return measure;
+  }
+  if (!previous) {
+    // The installed version's files, from its manifests.
+    std::vector<DepotManifest> old_manifests;
+    InstallMeasure old_measure;
+    const auto old = MergedManifests(session, app_id, installed, branch, cancel, &old_manifests, &old_measure);
+    if (!old) {
+      measure.error = old_measure.error;
+      measure.detail = "installed " + old_measure.detail;
+      return measure;
+    }
+    previous.emplace();
+    for (const auto& [key, placement] : old->placements) {
+      const auto& file = *placement.file;
+      if (!file.is_directory() && !file.is_symlink()) (*previous)[key] = {Hex(file.sha_content), file.size, file.path};
+    }
+  }
+  std::vector<DepotManifest> manifests;
+  const auto merged = MergedManifests(session, app_id, depots, branch, cancel, &manifests, &measure);
+  if (!merged) return measure;
+  for (const auto& [key, placement] : merged->placements) {
+    const auto& file = *placement.file;
+    if (file.is_directory() || file.is_symlink() || UnchangedInTree(*previous, key, file, install_root)) continue;
+    measure.staged_bytes += file.size;
+    for (const auto& chunk : file.chunks) measure.download_bytes += chunk.compressed_size;
+  }
+  measure.error = InstallError::kNone;
+  measure.install_bytes = merged->install_bytes;
   return measure;
 }
 
@@ -913,16 +974,8 @@ InstallOutcome DepotInstaller::Run(const StoredSession& session, const InstallTa
         const auto& file = *placement.file;
         if (file.is_directory() || file.is_symlink()) continue;
         const auto path = target.install_root + "/" + file.path;
-        bool same = false;
-        if (previous) {
-          const auto found = previous->find(key);
-          struct stat info {};
-          same = found != previous->end() && found->second.path == file.path && found->second.size == file.size &&
-                 found->second.sha == Hex(file.sha_content) && lstat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) &&
-                 static_cast<std::uint64_t>(info.st_size) == file.size;
-        } else {
-          same = SameContent(path, file.size, file.sha_content, cancel);
-        }
+        const bool same = previous ? UnchangedInTree(*previous, key, file, target.install_root)
+                                   : SameContent(path, file.size, file.sha_content, cancel);
         if (cancel.load()) return fail(InstallError::kCanceled, "canceled");
         if (!same) staged_keys.insert(key);
       }

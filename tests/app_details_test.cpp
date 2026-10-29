@@ -393,6 +393,35 @@ void SlowSizeChecksDontBlockDetails() {
   assert(AwaitMeasured(service, 1)[0].measured);
 }
 
+// The install sheet's size is waited for on screen: it goes ahead of updates' sizes already queued.
+void InstallSizesGoAheadOfUpdates() {
+  Sessions sessions;
+  Source source;
+  source.hold = true;
+  AppDetailsService service(source, sessions);
+  assert(service.Measure({SteamId(500), {}, {}, true}, 1));  // holds the worker
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(source.mutex);
+      if (!source.measures.empty()) break;
+    }
+    assert(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(1ms);
+  }
+  assert(service.Measure({SteamId(501), {}, {}, true}, 1) && service.Measure({SteamId(502), {}, {}, true}, 1));
+  // Updates fill their own room: a full one still takes the install sheet's.
+  for (std::uint32_t app = 600; app < 600 + AppDetailsService::kMaxPending - 2; ++app)
+    assert(service.Measure({SteamId(app), {}, {}, true}, 1));
+  assert(!service.Measure({SteamId(700), {}, {}, true}, 1));
+  assert(service.Measure({SteamId(400), "public", "english"}, 1) && service.Measure({SteamId(501), {}, {}, true}, 1));
+  source.hold = false;
+  AwaitMeasured(service, 4 + AppDetailsService::kMaxPending - 2);
+  std::lock_guard<std::mutex> lock(source.mutex);
+  assert(source.measures[1] == (SizeRequest{SteamId(400), "public", "english"}) && source.measures[2].id == SteamId(501) &&
+         source.measures[3].id == SteamId(502));
+}
+
 // Only a selection whose merged size can be far from Steam's sum is worth its manifests: two depots or more of
 // kMeasureDepotBytes. Portal's 401 and 409 hold mostly the same files.
 void LargeOverlappingDepotsAreMeasured() {
@@ -680,16 +709,19 @@ void InstalledGamesCompareWithTheirRecord() {
   record.depots = {{8001, 11, 8000, 8000}, {8002, 21, 8000, 8000}, {8011, 31, 8100, 8000}};
   // The same manifests: nothing to do.
   auto details = DetailsFromAppInfo(8000, buffer, grant, "english", record);
-  assert(!details.update.available() && details.update.download_bytes == 0);
-  // A new manifest: an update with that depot's download.
+  assert(!details.update.available() && details.update.target == 0);
+  // A new manifest: an update, to what Steam selects now (its target, which DepotsToUpdate selects too).
   record.depots[1].gid = 20;
   details = DetailsFromAppInfo(8000, buffer, grant, "english", record);
-  assert(details.update.newer && !details.update.new_dlc && details.update.download_bytes == 40);
+  assert(details.update.newer && !details.update.new_dlc && details.update.target != 0);
+  const auto to_update = DepotsToUpdate(8000, buffer, grant, record, {});
+  assert(!to_update.empty() && details.update.target == UpdateTarget(to_update));
+  assert(DepotsToUpdate(8000, buffer, std::nullopt, record, {}).empty());
   record.depots[1].gid = 21;
   // A recorded depot Steam no longer selects (here: no longer licensed... as a removed one reads).
   record.depots.push_back({8003, 41, 8000, 8000});
   details = DetailsFromAppInfo(8000, buffer, grant, "english", record);
-  assert(details.update.newer && details.update.download_bytes == 0);
+  assert(details.update.newer);
   record.depots.pop_back();
   // A depot listed by a DLC app whose appinfo wasn't read can't have left.
   record.depots.push_back({8201, 51, 8200, 8200});
@@ -700,7 +732,7 @@ void InstalledGamesCompareWithTheirRecord() {
   const auto bought = record;
   record.depots.pop_back();
   details = DetailsFromAppInfo(8000, buffer, grant, "english", record);
-  assert(details.update.new_dlc && !details.update.newer && details.update.download_bytes == 5);
+  assert(details.update.new_dlc && !details.update.newer);
   // A version 1 record names the game as every depot's owner: a held DLC depot is not new DLC.
   record = bought;
   record.version = 1;
@@ -718,7 +750,10 @@ void InstalledGamesCompareWithTheirRecord() {
   record = bought;
   record.branch = "beta";
   details = DetailsFromAppInfo(8000, buffer, grant, "english", record);
-  assert(details.update.newer && details.update.download_bytes == 500);
+  assert(details.update.newer);
+  // Another branch's manifests: another target.
+  const auto beta = DepotsToUpdate(8000, buffer, grant, record, {});
+  assert(details.update.target == UpdateTarget(beta) && UpdateTarget(beta) != UpdateTarget(to_update));
   const auto has_beta = [](const AppDetails& value) {
     return std::any_of(value.launches.begin(), value.launches.end(),
                        [](const LaunchOption& option) { return option.executable == "beta.exe"; });
@@ -728,6 +763,7 @@ void InstalledGamesCompareWithTheirRecord() {
 
 int main() {
   SizeChecksAreAnsweredOncePerChoice();
+  InstallSizesGoAheadOfUpdates();
   SlowSizeChecksDontBlockDetails();
   OpenedGameGoesFirst();
   LargeOverlappingDepotsAreMeasured();

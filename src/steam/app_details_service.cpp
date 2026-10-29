@@ -84,16 +84,28 @@ InstalledCheck AppDetailsService::CheckProgress() {
   return check_;
 }
 
-void AppDetailsService::Measure(SizeRequest request, std::uint64_t account_generation) {
-  if (!request.id.steam_app() || account_generation == 0) return;
+bool AppDetailsService::Measure(SizeRequest request, std::uint64_t account_generation) {
+  if (!request.id.steam_app() || account_generation == 0) return false;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (stopping_) return;
+  if (stopping_) return false;
   // Another account: what was asked for the previous one goes, as for Request.
   if (account_generation != generation_) Reset(account_generation);
-  if (measure_requested_.count(request) || measure_pending_.size() >= kMaxPending) return;
+  if (measure_requested_.count(request)) return true;
+  // Each kind has its own room: updates' sizes waiting never keep out the install sheet's.
+  const auto same_kind = std::count_if(measure_pending_.begin(), measure_pending_.end(),
+                                       [&](const SizeRequest& queued) { return queued.update == request.update; });
+  if (static_cast<std::size_t>(same_kind) >= kMaxPending) return false;
   measure_requested_.insert(request);
-  measure_pending_.push_back(std::move(request));
+  // The install sheet's choice is waited for on screen: ahead of the updates' sizes.
+  if (request.update) {
+    measure_pending_.push_back(std::move(request));
+  } else {
+    const auto first_update = std::find_if(measure_pending_.begin(), measure_pending_.end(),
+                                           [](const SizeRequest& queued) { return queued.update; });
+    measure_pending_.insert(first_update, std::move(request));
+  }
   wake_.notify_all();
+  return true;
 }
 
 std::vector<MeasuredSize> AppDetailsService::PumpMeasured() {

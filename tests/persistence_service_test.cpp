@@ -408,7 +408,7 @@ void UpdateChecksLoadAndSavePerAccount() {
   assert(loaded.error == StorageError::kNone && !loaded.update_check && loaded.account_id == 7);
   SavedUpdateCheck check;
   check.checked_at = 1'800'000'000;
-  check.games[SteamId(440)] = {true, false, 12};
+  check.games[SteamId(440)] = {true, false, 12, 30, 99, true};
   const auto saved = Await(service, PersistenceEventKind::kUpdateCheckSaved, service.SaveUpdateCheck(7, 3, check));
   assert(saved.error == StorageError::kNone && saved.revision == 3 && saved.account_id == 7);
   loaded = Await(service, PersistenceEventKind::kUpdateCheckLoaded, service.LoadUpdateCheck(7));
@@ -416,7 +416,7 @@ void UpdateChecksLoadAndSavePerAccount() {
   loaded = Await(service, PersistenceEventKind::kUpdateCheckLoaded, service.LoadUpdateCheck(8));
   assert(loaded.error == StorageError::kNone && !loaded.update_check);
   service.Shutdown();
-  std::remove((directory.path() + "/updates-7.v1").c_str());
+  std::remove((directory.path() + "/updates-7.v2").c_str());
 }
 
 int main() {

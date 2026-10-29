@@ -598,6 +598,13 @@ int main(int argc, char** argv) {
                 if (game.id == playden::GameId::Steam(app) && game.available) return game.record;
             return std::nullopt;
         });
+        details_source->SetInstallRoot([&installs](std::uint32_t app) -> std::optional<std::string> {
+            if (!installs) return std::nullopt;
+            const auto snapshot = installs->Snapshot();
+            for (const auto& game : snapshot.installed)
+                if (game.id == playden::GameId::Steam(app) && game.available) return game.root;
+            return std::nullopt;
+        });
         details_sessions = std::make_unique<playden::LocalSessionRepository>(options->data_directory.string(), playden::LocalSessionRepository::DiagnosticReport{}, session_vault.get());
         app_details = std::make_unique<playden::steam::AppDetailsService>(*details_source, *details_sessions);
         install_cm = std::make_unique<playden::steam::CmClient>(PLAYDEN_HOMEBREW_CA_BUNDLE, *library_storage);

@@ -646,7 +646,7 @@ void live_program_change_applies_like_other_settings(const std::filesystem::path
           "program: closing the sheet applies the new program");
     model.action("circle");
     activate(model, "details-play");
-    check(model.state().navigation.modals.empty() && model.TakeRuntimePlayRequests() == std::vector<GameId>{SteamId(22380)},
+    check(model.state().navigation.modals.empty() && model.TakeRuntimePlayRequests() == std::vector<playden::GameId>{SteamId(22380)},
           "program: Play starts at once");
 
     // Reset to recipe goes back to Steam's launch option, not the program the recipe lists first.
@@ -1464,8 +1464,8 @@ void live_manage_games_tabs(const std::filesystem::path& base) {
     model.BeginUpdateCheckLoad(kAccount);
     playden::SavedUpdateCheck saved;
     saved.checked_at = kNow - 2 * 60 * 60;
-    saved.games[SteamId(10)] = {true, false, 2 * gb};
-    saved.games[SteamId(20)] = {false, true, 120'000'000};
+    saved.games[SteamId(10)] = {true, false, 2 * gb, 2 * gb, 1, true};
+    saved.games[SteamId(20)] = {false, true, 120'000'000, 120'000'000, 2, true};
     model.ApplyUpdateCheck(kAccount, saved);
     for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
     activate(model, "settings-installed");
@@ -1598,10 +1598,10 @@ void live_manage_update_selected(const std::filesystem::path& base) {
     model.BeginUpdateCheckLoad(kAccount);
     playden::SavedUpdateCheck saved;
     saved.checked_at = kNow - 60 * 60;
-    saved.games[SteamId(10)] = {true, false, 2 * gb};
-    saved.games[SteamId(20)] = {false, true, 1 * gb};
-    saved.games[SteamId(30)] = {true, false, 3 * gb};
-    saved.games[SteamId(40)] = {true, false, 4 * gb};
+    saved.games[SteamId(10)] = {true, false, 2 * gb, 2 * gb, 1, true};
+    saved.games[SteamId(20)] = {false, true, 1 * gb, 1 * gb, 2, true};
+    saved.games[SteamId(30)] = {true, false, 3 * gb, 3 * gb, 3, true};
+    saved.games[SteamId(40)] = {true, false, 4 * gb, 4 * gb, 4, true};
     model.ApplyUpdateCheck(kAccount, saved);
     for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
     activate(model, "settings-installed");
@@ -1614,13 +1614,14 @@ void live_manage_update_selected(const std::filesystem::path& base) {
     activate(model, "manage-toggle-40");
     check(!find_row(model, "manage-toggle-40")->selected, "update selected: a game in the Queue can't be checked");
 
-    // Tunic's 3 GB estimate doesn't fit in the USB drive's 2 GB: Triangle warns first, and Cancel queues nothing.
-    check(model.view().footer == "3 selected · 6.0 GB to download · may need 1.0 GB more on USB Drive",
-          "update selected: the footer names the drive that may lack room");
+    // Tunic's 3 GB of changed files and the install margin don't fit in the USB drive's 2 GB: Triangle warns
+    // first, and Cancel queues nothing.
+    check(model.view().footer == "3 selected · 6.0 GB to download · needs 1.1 GB more on USB Drive",
+          "update selected: the footer names the drive that lacks room");
     model.action("triangle");
     check(model.TakeInstallRequests().empty(), "update selected: the warning comes before anything is queued");
     check(!navigation.modals.empty() && navigation.modals.back().title == "Update anyway?" &&
-              navigation.modals.back().body.find("may need 1.0 GB more on USB Drive") != std::string::npos,
+              navigation.modals.back().body.find("need 1.1 GB more on USB Drive") != std::string::npos,
           "update selected: the warning names the drive and the room it may lack");
     activate(model, "cancel");
     check(navigation.route == Route::ManageGames && navigation.modals.empty() && model.TakeInstallRequests().empty(),
@@ -1743,12 +1744,31 @@ void live_settings_manage_rows(const std::filesystem::path& base) {
     model.UpdateCheckProgress(32, 24, 40);
     check(value("settings-game-updates") == "Checking 24 of 40…", "settings rows: checking with progress");
 
-    // Found: two updates and their download.
-    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 2'100'000'000});
-    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{false, true, 200'000'000});
+    // Found: two updates, their sizes not measured yet.
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 0, 0, 11});
+    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{false, true, 0, 0, 21});
     model.FinishUpdateCheck(false);
-    check(value("settings-game-updates") == "2 updates · 2.3 GB" && subtitle("settings-game-updates") == "Checked just now",
+    check(value("settings-game-updates") == "2 updates" && subtitle("settings-game-updates") == "Checked just now",
           "settings rows: updates found");
+    // Each update's size is asked once; one for another target than the saved update's is dropped.
+    auto sizes = model.TakeUpdateSizeChecks();
+    check(sizes == std::vector<playden::GameId>{SteamId(10), SteamId(20)} && model.TakeUpdateSizeChecks().empty(),
+          "settings rows: each update's size is asked once");
+    check(!model.UpdateMeasuredUpdate(SteamId(10), true, 11, 2'100'000'000, 2'500'000'000), "settings rows: a size is kept");
+    check(model.UpdateMeasuredUpdate(SteamId(20), true, 99, 200'000'000, 200'000'000),
+          "settings rows: a size for a newer update asks Steam about the game again");
+    check(value("settings-game-updates") == "2 updates" && model.TakeUpdateSizeChecks().empty(),
+          "settings rows: a size for another update isn't used or asked again");
+    // Steam answers for the game again (the same update): its size is asked again, and a size stays with its update.
+    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{false, true, 0, 0, 21});
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 0, 0, 11});
+    sizes = model.TakeUpdateSizeChecks();
+    check(sizes == std::vector<playden::GameId>{SteamId(20)}, "settings rows: Steam's answer asks an unmeasured size again");
+    model.UpdateMeasuredUpdate(SteamId(20), true, 21, 200'000'000, 200'000'000);
+    check(value("settings-game-updates") == "2 updates · 2.3 GB", "settings rows: measured sizes add up");
+    check(model.state().update_check.games.at(SteamId(10)).staged_bytes == 2'500'000'000 &&
+              model.ExportUpdateCheck().games.at(SteamId(10)).sized,
+          "settings rows: the staged bytes are kept and saved");
     check(value("settings-installed") == "3 games · 60.0 GB · 2 updates", "settings rows: Storage counts the updates");
     model.SetWallClock(kNow + 2 * 60 * 60);
     check(subtitle("settings-game-updates") == "Checked 2 h ago", "settings rows: when it was checked");
@@ -1778,7 +1798,7 @@ void live_settings_manage_rows(const std::filesystem::path& base) {
           "settings rows: up to date");
 
     // One update is singular.
-    model.UpdateAppDetails(SteamId(30), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 48'000'000});
+    model.UpdateAppDetails(SteamId(30), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 48'000'000, 48'000'000, 5, true});
     check(value("settings-game-updates") == "1 update · 48 MB" && value("settings-installed") == "3 games · 60.0 GB · 1 update",
           "settings rows: one update");
 }
@@ -1930,7 +1950,7 @@ void live_manage_queue_full(const std::filesystem::path& base) {
     model.BeginUpdateCheckLoad(kAccount);
     playden::SavedUpdateCheck saved;
     saved.checked_at = kNow - 60 * 60;
-    saved.games[SteamId(10)] = {true, false, 2 * gb};
+    saved.games[SteamId(10)] = {true, false, 2 * gb, 2 * gb, 1, true};
     saved.games[SteamId(20)] = {true, false, 1 * gb};
     model.ApplyUpdateCheck(kAccount, saved);
     for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");

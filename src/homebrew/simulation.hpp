@@ -509,7 +509,12 @@ struct SizeCheckRequest {
 struct GameUpdate {
     bool newer = false;    // a newer version of the game's content
     bool new_dlc = false;  // DLC the account owns that the install doesn't hold
-    std::uint64_t download_bytes = 0;  // Steam's estimate for the changed content; 0 unknown
+    // Measured from the manifests against the install's files (`sized`): what the update downloads, and the
+    // changed files' bytes staged beside the game until they go in place.
+    std::uint64_t download_bytes = 0;
+    std::uint64_t staged_bytes = 0;
+    std::uint64_t target = 0;  // the depots and manifests updated to (0 unknown): sizes hold for this one only
+    bool sized = false;
     [[nodiscard]] bool available() const noexcept { return newer || new_dlc; }
     bool operator==(const GameUpdate&) const = default;
 };
@@ -896,6 +901,14 @@ public:
     // stand (nothing to check, or the check failed; `failed` lets the sheet ask again when it opens next).
     [[nodiscard]] std::vector<SizeCheckRequest> TakeSizeChecks();
     void UpdateMeasuredSize(const SizeCheckRequest& request, bool measured, bool failed, MeasuredInstallSize size);
+    // Live mode: installed games whose update has no measured size yet, each asked once for what it updates to;
+    // and the answers. `target` is the selection measured: a size for another one than the saved update's is
+    // dropped. Not measured (the network, a full queue): the size stays unknown until Steam answers for the
+    // game again. True when Steam should be asked about the game again (a size for a newer update than the
+    // one listed), once per update measured.
+    [[nodiscard]] std::vector<GameId> TakeUpdateSizeChecks();
+    bool UpdateMeasuredUpdate(GameId id, bool measured, std::uint64_t target, std::uint64_t download_bytes,
+                              std::uint64_t staged_bytes);
     // The details service dropped what it was asked (another account, or the language changed): checks
     // still waiting for an answer are asked again.
     void ResetSizeChecks();
@@ -1289,6 +1302,11 @@ private:
     bool update_check_requested_ = false;
     std::optional<bool> update_check_waiting_;  // asked (true: by the player) before the saved check was read
     std::map<GameId, GameUpdate> update_check_early_;  // results before the saved check was read
+    std::map<GameId, std::uint64_t> update_sizes_running_;          // asked, with the target then saved
+    std::set<std::pair<GameId, std::uint64_t>> update_sizes_ended_;  // answered without a size: not asked again
+    std::set<std::pair<GameId, std::uint64_t>> update_sizes_newer_;  // measured targets Steam was asked about again
+    // An update's size as the screens say it: the download, "Checking size…" while it is measured, else "Size unknown".
+    [[nodiscard]] std::string update_size_text(GameId id) const;
 
     // The screen opened (`forced` false: only a day after the last full check) or Check for updates.
     void request_update_check(bool forced);
@@ -1410,7 +1428,8 @@ private:
     // the first drive without room for its share (empty when they all fit or free space can't be read).
     struct ManageUpdates {
         std::vector<GameId> games;
-        std::uint64_t bytes = 0;
+        std::uint64_t bytes = 0;     // the sized games' downloads
+        std::size_t unsized = 0;     // games whose size isn't known yet
         std::vector<std::pair<std::string, std::uint64_t>> free;  // each drive's label and free space
         std::string short_drive;
         std::uint64_t short_bytes = 0;
@@ -1511,7 +1530,7 @@ private:
         bool allowed = false;
         std::string volume_label;
         std::optional<std::uint64_t> free_bytes;
-        std::uint64_t download_bytes = 0;  // 0 unknown
+        std::optional<std::uint64_t> download_bytes;  // measured; none unknown
         std::string reason;  // short, for the confirm row: why not, or what pressing does
     };
     [[nodiscard]] UpdateCheck update_check(GameId id) const;

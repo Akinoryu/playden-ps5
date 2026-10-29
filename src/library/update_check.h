@@ -10,12 +10,16 @@
 
 namespace playden {
 
-// What a check found for one installed game: a newer version, DLC the install doesn't hold, and Steam's
-// estimate of the download.
+// What a check found for one installed game: a newer version, DLC the install doesn't hold, the selection
+// it updates to (0 unknown) and, once measured from the manifests (`sized`), what the update downloads and
+// stages beside the game.
 struct SavedGameUpdate {
   bool newer = false;
   bool new_dlc = false;
   std::uint64_t download_bytes = 0;
+  std::uint64_t staged_bytes = 0;
+  std::uint64_t target = 0;
+  bool sized = false;
 };
 bool operator==(const SavedGameUpdate& left, const SavedGameUpdate& right);
 
@@ -36,9 +40,10 @@ class UpdateCheckRepository {
   virtual Result<void> Save(std::uint64_t account_id, const SavedUpdateCheck& check) const = 0;
 };
 
-// `updates-<account>.v1` in the storage root, owner-only: "version=1", "checked_at=<seconds>", then one
-// "<game key> <flags> <download bytes>" line per game (flags: 1 newer, 2 new DLC). A damaged file fails
-// the load with kInvalidData.
+// `updates-<account>.v2` in the storage root, owner-only: "version=2", "checked_at=<seconds>", then one
+// "<game key> <flags> <download bytes> <staged bytes> <target>" line per game (flags: 1 newer, 2 new DLC,
+// 4 sized). Without it, `updates-<account>.v1` ("version=1", lines "<game key> <flags> <bytes>" with Steam's
+// whole-depot estimate) is read for its flags only. A damaged file fails the load with kInvalidData.
 class UpdateCheckStore final : public UpdateCheckRepository {
  public:
   explicit UpdateCheckStore(Storage& storage) : storage_(storage) {}

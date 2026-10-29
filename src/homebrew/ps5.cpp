@@ -771,6 +771,12 @@ int main() {
                 if (game.id == playden::GameId::Steam(app) && game.available) return game.record;
             return std::nullopt;
         });
+        details_source.SetInstallRoot([&installs](std::uint32_t app) -> std::optional<std::string> {
+            const auto snapshot = installs.Snapshot();
+            for (const auto& game : snapshot.installed)
+                if (game.id == playden::GameId::Steam(app) && game.available) return game.root;
+            return std::nullopt;
+        });
         playden::steam::CmClient servers_cm(paths.trust_store, library_storage);
         servers_cm.SetOwner("servers");
         servers_cm.SetSharedSession(steam_cm);

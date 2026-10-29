@@ -13,7 +13,6 @@ AppDetails::Update CompareWithRecord(std::uint32_t id, const std::vector<DepotIn
   if (record.depots.empty()) return update;  // an imported copy, or a record that names no depots
   std::set<std::uint32_t> owners{id};
   for (const auto& depot : record.depots) owners.insert(depot.owner == 0 ? id : depot.owner);
-  std::vector<DepotInfo> download;
   for (const auto& depot : selected) {
     const auto recorded = std::find_if(record.depots.begin(), record.depots.end(),
                                        [&](const installs::RecordedDepot& entry) { return entry.id == depot.id; });
@@ -25,10 +24,8 @@ AppDetails::Update CompareWithRecord(std::uint32_t id, const std::vector<DepotIn
       const auto owner = depot.owner_app == 0 ? id : depot.owner_app;
       if (owner != id && !owners.count(owner)) update.new_dlc = true;
       else update.newer = true;
-      download.push_back(depot);
     } else if (depot.manifest_gid.value_or(0) != recorded->gid) {
       update.newer = true;
-      download.push_back(depot);
     }
   }
   for (const auto& entry : record.depots) {
@@ -37,10 +34,36 @@ AppDetails::Update CompareWithRecord(std::uint32_t id, const std::vector<DepotIn
     if (std::none_of(selected.begin(), selected.end(), [&](const DepotInfo& depot) { return depot.id == entry.id; }))
       update.newer = true;
   }
-  std::uint64_t install = 0;
-  DepotBytes(download, &install, &update.download_bytes);
-  if (update.download_bytes == 0) update.download_bytes = install;
+  if (update.available()) update.target = UpdateTarget(selected);
   return update;
+}
+
+std::uint64_t UpdateTarget(const std::vector<DepotInfo>& selected) {
+  // FNV-1a over each depot's ID and manifest.
+  std::uint64_t hash = 14695981039346656037ull;
+  const auto mix = [&hash](std::uint64_t value) {
+    for (int byte = 0; byte < 8; ++byte, value >>= 8) hash = (hash ^ (value & 0xff)) * 1099511628211ull;
+  };
+  for (const auto& depot : selected) {
+    mix(depot.id);
+    mix(depot.manifest_gid.value_or(0));
+  }
+  return hash == 0 ? 1 : hash;
+}
+
+std::vector<DepotInfo> DepotsToUpdate(std::uint32_t id, const std::string& buffer,
+                                      const std::optional<LicensedDepots::Grant>& licensed,
+                                      const installs::InstalledRecord& record, const std::vector<AppInfo>& dlc_apps) {
+  const auto app = ParseAppInfo(id, buffer);
+  if (!app || !licensed) return {};
+  DepotSelection selection;
+  if (!record.language.empty()) selection.language = record.language;
+  if (!record.branch.empty()) selection.branch = record.branch;
+  std::set<std::uint32_t> apps{id};
+  apps.insert(licensed->apps.begin(), licensed->apps.end());
+  SelectionResult selected;
+  if (!SelectDepots(*app, dlc_apps, apps, licensed->depots, selection, &selected)) return {};
+  return selected.depots;
 }
 
 AppDetails DetailsFromAppInfo(std::uint32_t id, const std::string& buffer,
@@ -211,6 +234,7 @@ MeasuredSize CmAppDetailsSource::Measure(const StoredSession& session, const Siz
   MeasuredSize result{request};
   const auto app = request.id.steam_app();
   if (!measurer_ || !measure_client_ || !app) return result;
+  if (request.update) return MeasureUpdate(session, request, cancel);
   const auto started = std::chrono::steady_clock::now();
   const auto language = !request.language.empty() ? request.language
                         : language_ ? language_() : std::string(kDefaultContentLanguage);
@@ -278,6 +302,90 @@ MeasuredSize CmAppDetailsSource::Measure(const StoredSession& session, const Siz
   std::uint64_t summed = 0;
   for (const auto& depot : depots) summed += depot.size;
   log("fetched", "steam_sum=" + std::to_string(summed) + (measure.partial ? " partial=1" : ""));
+  return result;
+}
+
+MeasuredSize CmAppDetailsSource::MeasureUpdate(const StoredSession& session, const SizeRequest& request,
+                                               const std::atomic<bool>& cancel) {
+  MeasuredSize result{request};
+  const auto app = *request.id.steam_app();
+  const auto started = std::chrono::steady_clock::now();
+  std::size_t depot_count = 0;
+  const auto log = [&](const char* outcome, const std::string& extra) {
+    if (!log_) return;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    std::string detail = "update depots=" + std::to_string(depot_count);
+    if (result.measured)
+      detail += " download=" + std::to_string(result.download_bytes) + " staged=" + std::to_string(result.staged_bytes);
+    if (!extra.empty()) detail += " " + extra;
+    log_(app, "size", outcome, detail + " ms=" + std::to_string(ms));
+  };
+  const auto record = installed_ ? installed_(app) : std::nullopt;
+  const auto root = install_root_ ? install_root_(app) : std::nullopt;
+  if (!record || record->depots.empty() || !root) {
+    log("skipped", "why=not-installed");
+    return result;
+  }
+  const auto fetched = measure_client_->FetchAppInfo(session, {app}, cancel);
+  if (!fetched.ok()) {
+    result.failed = true;
+    log("failed", "why=appinfo");
+    return result;
+  }
+  const auto buffer = fetched.buffers.find(app);
+  if (buffer == fetched.buffers.end()) {
+    log("failed", "why=no-appinfo");
+    return result;
+  }
+  const auto dlc_apps = FetchDlcApps(*measure_client_, session, app, buffer->second, cancel);
+  if (cancel.load()) {
+    result.failed = true;
+    log("failed", "why=canceled");
+    return result;
+  }
+  const auto depots = DepotsToUpdate(app, buffer->second, licensed_ ? licensed_->Get(session.steam_id) : std::nullopt,
+                                     *record, dlc_apps);
+  depot_count = depots.size();
+  if (depots.empty()) {
+    log("skipped", "why=no-selection");
+    return result;
+  }
+  result.target = UpdateTarget(depots);
+  std::string key = std::to_string(session.steam_id) + " " + *root;
+  for (const auto& depot : record->depots) key += " " + std::to_string(depot.id) + ":" + std::to_string(depot.gid);
+  key += " >";
+  for (const auto& depot : depots) key += " " + std::to_string(depot.id) + ":" + std::to_string(depot.manifest_gid.value_or(0));
+  if (const auto known = measured_updates_.find(key); known != measured_updates_.end()) {
+    result.measured = true;
+    result.download_bytes = known->second.first;
+    result.staged_bytes = known->second.second;
+    log("cached", {});
+    return result;
+  }
+  const auto branch = record->branch.empty() ? std::string("public") : record->branch;
+  // Without the install's tree its record's manifests say what it holds: the recorded depots Steam still selects,
+  // asked for as the new ones are.
+  std::vector<DepotInfo> installed;
+  for (const auto& depot : depots) {
+    const auto recorded = std::find_if(record->depots.begin(), record->depots.end(),
+                                       [&](const installs::RecordedDepot& entry) { return entry.id == depot.id; });
+    if (recorded == record->depots.end() || recorded->gid == 0) continue;
+    installed.push_back(depot);
+    installed.back().manifest_gid = recorded->gid;
+  }
+  const auto measure = measurer_->MeasureUpdate(session, app, depots, branch, *root, cancel, installed);
+  if (measure.error != InstallError::kNone) {
+    result.failed = measure.error == InstallError::kNetwork || measure.error == InstallError::kCanceled ||
+                    measure.error == InstallError::kNoSession;
+    log("failed", std::string("why=") + InstallErrorName(measure.error) + (measure.detail.empty() ? "" : " (" + measure.detail + ")"));
+    return result;
+  }
+  if (!measure.partial) measured_updates_[key] = {measure.download_bytes, measure.staged_bytes};
+  result.measured = true;
+  result.download_bytes = measure.download_bytes;
+  result.staged_bytes = measure.staged_bytes;
+  result.install_bytes = measure.install_bytes;
+  log("fetched", measure.partial ? "partial=1" : "");
   return result;
 }
 

@@ -727,10 +727,10 @@ void game_update_scenarios(const std::filesystem::path& fixtures, const std::fil
     };
     check(simulation.scenario("update-available"), "update-available loads");
     check(row("details-update") && row("details-update")->title == "Update" && row("details-update-note") &&
-              row("details-update-note")->title == "Update available" && row("details-update-note")->value == "Up to 1.2 GB",
+              row("details-update-note")->title == "Update available" && row("details-update-note")->value == "1.2 GB",
           "update-available offers Update with its size");
     check(simulation.action("cross") && simulation.view().surface == "update" && row("update-confirm") &&
-              row("update-confirm")->enabled && row("update-confirm")->value == "Up to 1.2 GB",
+              row("update-confirm")->enabled && row("update-confirm")->value == "1.2 GB",
           "Update opens the update sheet");
     check(simulation.action("circle"), "the sheet closes");
     check(simulation.scenario("dlc-available") && row("details-update")->title == "DLC available",

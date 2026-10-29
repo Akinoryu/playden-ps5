@@ -2263,7 +2263,7 @@ void Controller::TickAppDetails() {
       }
       model_.UpdateAppDetails(details.id, details.download_bytes, details.install_bytes, details.windows_installable,
                               details.languages, details.dlc_count, std::move(versions),
-                              {details.update.newer, details.update.new_dlc, details.update.download_bytes}, !check_waits);
+                              {details.update.newer, details.update.new_dlc, 0, 0, details.update.target, false}, !check_waits);
       if (details.launches_any_branch) launches_any_branch_.insert(details.id);
       else launches_any_branch_.erase(details.id);
       launch_options_[details.id] = details.launches;
@@ -2290,11 +2290,22 @@ void Controller::TickAppDetails() {
   const bool signed_in = model_.state().account().authentication == AuthState::SignedIn;
   for (const auto& check : model_.TakeSizeChecks()) {
     auto* details = Details(check.id.store);
-    if (signed_in && details == app_details_) details->Measure({check.id, check.branch, check.language}, generation);
-    else model_.UpdateMeasuredSize(check, false, !signed_in, {});
+    // Not queued: as a check that failed, asked again when the sheet opens next.
+    if (!signed_in || details != app_details_ || !details->Measure({check.id, check.branch, check.language}, generation))
+      model_.UpdateMeasuredSize(check, false, true, {});
   }
+  // Updates' sizes: the files that change, from the new manifests and each install's tree.
+  if (signed_in)
+    for (const auto id : model_.TakeUpdateSizeChecks())
+      if (!app_details_->Measure({id, {}, {}, true}, generation)) model_.UpdateMeasuredUpdate(id, false, 0, 0, 0);
   for (const auto& size : app_details_->PumpMeasured()) {
     if (size.account_generation != generation) continue;
+    if (size.request.update) {
+      // Measured for a newer update than the one listed: Steam is asked about the game again.
+      if (model_.UpdateMeasuredUpdate(size.request.id, size.measured, size.target, size.download_bytes, size.staged_bytes))
+        app_details_->Refresh(size.request.id, generation);
+      continue;
+    }
     model_.UpdateMeasuredSize({size.request.id, size.request.branch, size.request.language}, size.measured, size.failed,
                               {size.install_bytes, size.download_bytes});
   }

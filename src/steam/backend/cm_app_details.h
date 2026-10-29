@@ -31,6 +31,8 @@ class CmAppDetailsSource final : public AppDetailsSource {
   void SetInstalled(std::function<std::optional<installs::InstalledRecord>(std::uint32_t app)> installed) {
     installed_ = std::move(installed);
   }
+  // An installed game's folder, for an update's size (its tree says which files change). Called on the size worker.
+  void SetInstallRoot(std::function<std::optional<std::string>(std::uint32_t app)> root) { install_root_ = std::move(root); }
   // What measures an install choice from its manifests (MeasuredSize), and the connection its size checks read
   // appinfo on: Measure runs on its own worker beside Fetch, so not the details one. Without them Steam's figures
   // stand.
@@ -51,6 +53,7 @@ class CmAppDetailsSource final : public AppDetailsSource {
                        const std::atomic<bool>& cancel) override;
 
  private:
+  MeasuredSize MeasureUpdate(const StoredSession& session, const SizeRequest& request, const std::atomic<bool>& cancel);
   // The game's DLC apps' appinfo (a batch Steam doesn't answer is left out).
   std::vector<AppInfo> FetchDlcApps(CmClient& client, const StoredSession& session, std::uint32_t id,
                                     const std::string& buffer, const std::atomic<bool>& cancel);
@@ -58,11 +61,15 @@ class CmAppDetailsSource final : public AppDetailsSource {
   const LicensedDepots* licensed_ = nullptr;
   std::function<std::string()> language_;
   std::function<std::optional<installs::InstalledRecord>(std::uint32_t)> installed_;
+  std::function<std::optional<std::string>(std::uint32_t)> install_root_;
   DepotInstaller* measurer_ = nullptr;
   CmClient* measure_client_ = nullptr;
   std::function<void(std::uint32_t, const char*, const char*, const std::string&)> log_;
   // Measured sizes (the size worker's only) by the depots and manifests measured: a manifest never changes, so neither does its size.
   std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> measured_;
+  // Updates' download and staged bytes, by the install's folder, the record's manifests and the new ones: the
+  // tree changes only with the record.
+  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> measured_updates_;
 };
 
 // The depots an install of `branch` in `language` selects, as DetailsFromAppInfo selects them, when their
@@ -83,6 +90,16 @@ AppDetails DetailsFromAppInfo(std::uint32_t id, const std::string& buffer,
                               std::string_view language = kDefaultContentLanguage,
                               const std::optional<installs::InstalledRecord>& installed = std::nullopt,
                               const std::vector<AppInfo>& dlc_apps = {});
+
+// The selection an update installs (depots and manifests, in order), as a number: an update's size is measured
+// for one. Never 0.
+std::uint64_t UpdateTarget(const std::vector<DepotInfo>& selected);
+
+// The depots an update of `record` selects, as DetailsFromAppInfo compares them: the record's branch and language,
+// with the licenses. Empty without licenses or when they grant nothing.
+std::vector<DepotInfo> DepotsToUpdate(std::uint32_t id, const std::string& buffer,
+                                      const std::optional<LicensedDepots::Grant>& licensed,
+                                      const installs::InstalledRecord& record, const std::vector<AppInfo>& dlc_apps);
 
 // What `selected` (as an install of the record's branch and language selects now) changes against
 // `record`. Recorded depots listed by an app whose appinfo is not in `listed` are not compared: they

@@ -68,13 +68,13 @@ struct AppDetails {
   std::vector<AppVersion> versions;
   // An installed game: what Steam has now against its install record (selected with the record's branch
   // and language). `newer`: a depot has another manifest, is new, or left the selection; `new_dlc`: DLC
-  // the account owns now that the install doesn't hold. `download_bytes` is Steam's estimate for the
-  // changed and new depots (the update downloads only changed files). All false when the licenses or the
-  // record's depots are unknown.
+  // the account owns now that the install doesn't hold. `target` names the selection updated to
+  // (UpdateTarget): its download size is measured from the manifests (a SizeRequest with `update`). All
+  // false when the licenses or the record's depots are unknown.
   struct Update {
     bool newer = false;
     bool new_dlc = false;
-    std::uint64_t download_bytes = 0;
+    std::uint64_t target = 0;
     bool available() const { return newer || new_dlc; }
   };
   Update update;
@@ -95,16 +95,19 @@ struct InstalledCheck {
 };
 
 // One install choice whose exact size is asked for: a version (Steam branch, "public" by default) and a
-// content language.
+// content language. With `update`, an installed game's update instead: the version and language are its
+// install record's, and branch and language stay empty.
 struct SizeRequest {
   GameId id;
   std::string branch;
   std::string language;
+  bool update = false;
   bool operator==(const SizeRequest& other) const {
-    return id == other.id && branch == other.branch && language == other.language;
+    return id == other.id && branch == other.branch && language == other.language && update == other.update;
   }
   bool operator<(const SizeRequest& other) const {
     if (!(id == other.id)) return id < other.id;
+    if (update != other.update) return other.update;
     return branch != other.branch ? branch < other.branch : language < other.language;
   }
 };
@@ -119,6 +122,10 @@ struct MeasuredSize {
   bool failed = false;  // the check could not finish (no session, the network); asking again may work
   std::uint64_t install_bytes = 0;
   std::uint64_t download_bytes = 0;
+  // An update's: the changed files' bytes (staged beside the game), and the selection measured
+  // (AppDetails::Update::target); `measured` false when the install keeps no file tree or isn't there.
+  std::uint64_t staged_bytes = 0;
+  std::uint64_t target = 0;
 };
 
 // Runs on the service worker; may block on the network.
@@ -157,9 +164,10 @@ class AppDetailsService {
   bool CheckInstalled(const std::vector<GameId>& ids, std::uint64_t account_generation);
   InstalledCheck CheckProgress();
   std::vector<AppDetails> Pump(std::size_t maximum = 8);
-  // Asks for the exact size of one install choice, after the details already asked for. A choice already
-  // queued or being checked is not asked twice.
-  void Measure(SizeRequest request, std::uint64_t account_generation);
+  // Asks for the exact size of one install choice, after the details already asked for, or of an update
+  // (`request.update`). Install choices go ahead of updates. A request already queued or being checked is not
+  // asked twice. False when it can't be queued (stopping, or kMaxPending of its kind already wait).
+  bool Measure(SizeRequest request, std::uint64_t account_generation);
   std::vector<MeasuredSize> PumpMeasured();
   void Shutdown();
 

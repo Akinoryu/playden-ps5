@@ -89,8 +89,8 @@ class SteamDetailsSource final : public DetailsSource {
     return service_.CheckInstalled(ids, generation);
   }
   steam::InstalledCheck CheckProgress() override { return service_.CheckProgress(); }
-  void Measure(const steam::SizeRequest& request, std::uint64_t generation) override {
-    if (request.id.steam_app()) service_.Measure(request, generation);
+  bool Measure(const steam::SizeRequest& request, std::uint64_t generation) override {
+    return request.id.steam_app() && service_.Measure(request, generation);
   }
   std::vector<steam::MeasuredSize> PumpMeasured() override { return service_.PumpMeasured(); }
   void Shutdown() override { service_.Shutdown(); }

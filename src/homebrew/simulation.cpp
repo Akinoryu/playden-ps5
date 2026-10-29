@@ -1466,11 +1466,12 @@ std::vector<GameId> Simulation::manage_list(ManageTab tab) const {
         std::uint64_t bytes = installation.installed_bytes;
         // Move: imported games have their own Copy/Move into Playden.
         if (tab == ManageTab::Move && id.store == Store::kLocal) continue;
-        // Updates: installed Steam games whose update or new DLC Steam told of; their size is the download.
+        // Updates: installed Steam games whose update or new DLC Steam told of; their size is the download (an
+        // unknown one sorts last).
         if (updates) {
             const auto update = state_.update_check.games.find(id);
             if (!id.steam_app() || update == state_.update_check.games.end() || !update->second.available()) continue;
-            bytes = update->second.download_bytes;
+            bytes = update->second.sized ? update->second.download_bytes : 0;
         }
         const auto* game = find_game(state_, id);
         entries.push_back({id, bytes, game ? game->last_played : std::nullopt,
@@ -1643,8 +1644,8 @@ void Simulation::ask_manage_uninstall() {
     open_modal(std::move(confirmation));
 }
 
-// Updates stage the changed files beside each game, so every drive needs room for its games' downloads.
-// Steam's estimate counts whole depots: it may ask for more room than the update uses, never less.
+// Updates stage the changed files beside each game, so every drive needs room for its games' changed files.
+// A game whose size isn't known yet adds nothing: its download checks the room itself.
 Simulation::ManageUpdates Simulation::manage_updates() const {
     ManageUpdates result;
     const auto found = manage_tabs_.find(ManageTab::Updates);
@@ -1654,9 +1655,11 @@ Simulation::ManageUpdates Simulation::manage_updates() const {
         if (!found->second.selected.contains(id) || !manage_blocker(ManageTab::Updates, id).empty()) continue;
         const auto* installation = find_installation(state_, id);
         const auto update = state_.update_check.games.find(id);
-        const std::uint64_t bytes = update == state_.update_check.games.end() ? 0 : update->second.download_bytes;
+        const bool sized = update != state_.update_check.games.end() && update->second.sized;
+        const std::uint64_t bytes = sized ? update->second.staged_bytes : 0;
         result.games.push_back(id);
-        result.bytes += bytes;
+        result.bytes += sized ? update->second.download_bytes : 0;
+        if (!sized) ++result.unsized;
         auto drive = std::find_if(needed.begin(), needed.end(), [&](const auto& entry) { return entry.first == installation->volume_id; });
         if (drive == needed.end()) needed.emplace_back(installation->volume_id, bytes);
         else drive->second += bytes;
@@ -1665,28 +1668,29 @@ Simulation::ManageUpdates Simulation::manage_updates() const {
     for (const auto& volume : state_.volumes) {
         const auto drive = std::find_if(needed.begin(), needed.end(), [&](const auto& entry) { return entry.first == volume.id; });
         const auto free = drive == needed.end() ? std::nullopt : volume_free(volume);
-        // Free space that can't be read is checked by the download itself.
+        // Free space that can't be read is checked by the download itself, which keeps the install margin free.
         if (!free) continue;
         result.free.emplace_back(volume.label, *free);
-        if (drive->second > *free && result.short_drive.empty()) {
+        const auto room = drive->second > 0 ? drive->second + steam::kInstallSpaceMargin : 0;
+        if (room > *free && result.short_drive.empty()) {
             result.short_drive = volume.label;
-            result.short_bytes = drive->second - *free;
+            result.short_bytes = room - *free;
         }
     }
     return result;
 }
 
 // The Updates tab's action: every checked game that can update now goes to the Queue in the list's order.
-// Steam's estimate counts whole depots, so a drive that looks short only warns: the player may go ahead.
+// A drive that looks short only warns (its free space may change before the downloads get there): the player
+// may go ahead.
 void Simulation::queue_manage_updates(bool anyway) {
     const auto plan = manage_updates();
     if (plan.games.empty()) return;
     if (!plan.short_drive.empty() && !anyway) {
         pending_destructive_action_ = "manage-update-anyway";
         ModalEntry warning{"confirmation", "Update anyway?", state_.navigation.focus_key, {"cancel", "confirm-destructive"}, 0, true};
-        warning.body = "These updates may need " + format_bytes(plan.short_bytes) + " more on " + plan.short_drive +
-                       ". Steam's sizes count whole parts of each game, so an update usually downloads less. An update "
-                       "that runs out of room stops, and its game stays as it was.";
+        warning.body = "These updates need " + format_bytes(plan.short_bytes) + " more on " + plan.short_drive +
+                       " for their changed files. An update that runs out of room stops, and its game stays as it was.";
         open_modal(std::move(warning));
         return;
     }
@@ -1989,9 +1993,8 @@ void Simulation::build_manage_games_view() {
                          game && !game->title.empty() ? game->title : "Steam app " + ToKey(id), "manage-toggle-" + ToKey(id));
         item.game_id = id;
         item.selected = tab.selected.contains(id);
-        const std::uint64_t size = update != check.games.end() ? update->second.download_bytes
-                                   : installation ? installation->installed_bytes : 0;
-        item.value = size > 0 ? format_bytes(size) : updates ? "Unknown" : std::string();
+        const std::uint64_t size = installation ? installation->installed_bytes : 0;
+        item.value = update != check.games.end() ? update_size_text(id) : size > 0 ? format_bytes(size) : std::string();
         if (item.selected) bytes += size;
         // The last-played column.
         const auto runtime = state_.runtime_games.find(id);
@@ -2066,11 +2069,14 @@ void Simulation::build_manage_games_view() {
     } else if (!updates) {
         view_.footer = std::to_string(count) + " selected · frees " + format_bytes(bytes);
     } else {
-        view_.footer = std::to_string(count) + " selected · " + (bytes ? format_bytes(bytes) : std::string("Size unknown")) + " to download";
-        // Each drive's free space, or the drive that may lack room for its games: Update warns when pressed.
+        // Each drive's free space, or the drive that lacks room for its games: Update warns when pressed.
         const auto plan = manage_updates();
+        view_.footer = std::to_string(count) + " selected · ";
+        if (plan.unsized == 0) view_.footer += format_bytes(plan.bytes) + " to download";
+        else if (plan.bytes > 0) view_.footer += "at least " + format_bytes(plan.bytes) + " to download";
+        else view_.footer += plan.unsized == 1 ? "size not known yet" : "sizes not known yet";
         if (!plan.short_drive.empty()) {
-            view_.footer += " · may need " + format_bytes(plan.short_bytes) + " more on " + plan.short_drive;
+            view_.footer += " · needs " + format_bytes(plan.short_bytes) + " more on " + plan.short_drive;
         } else {
             std::string free_words;
             for (const auto& [label, free] : plan.free)
@@ -3162,6 +3168,7 @@ void Simulation::ResetSizeChecks() {
     size_checks_.clear();
     size_checks_running_.clear();
     size_checks_failed_.clear();
+    update_sizes_running_.clear();
     rebuild_view();
 }
 
@@ -3209,13 +3216,15 @@ Simulation::UpdateCheck Simulation::update_check(GameId id) const {
     const auto* game = find_game(state_, id);
     const auto* installation = find_installation(state_, id);
     if (!game || !installation) { check.reason = "Not installed"; return check; }
-    check.download_bytes = game->update.download_bytes;
+    if (const auto saved = state_.update_check.games.find(id); saved != state_.update_check.games.end() && saved->second.sized)
+        check.download_bytes = saved->second.download_bytes;
+    else if (game->update.sized)
+        check.download_bytes = game->update.download_bytes;
     const auto* volume = find_volume(const_cast<State&>(state_), installation->volume_id);
     check.volume_label = volume ? volume->label : std::string("its drive");
     if (!installation->available || !volume || !volume->available) { check.reason = "Drive disconnected"; return check; }
     if (!volume->writable) { check.reason = "Drive is read-only"; return check; }
-    // Steam's estimate counts whole depots, not the changed files that download beside the game: it is
-    // shown, never checked. The download checks the room its changed files need and fails as an install does.
+    // The download checks the room its changed files need and fails as an install does.
     if (volume->capacity_known) {
         const auto occupied = std::min(volume->capacity_bytes, volume->used_bytes + volume->reserved_bytes);
         check.free_bytes = volume->capacity_bytes - occupied;
@@ -3260,6 +3269,14 @@ bool Simulation::UpdateAppDetails(GameId id, std::optional<std::uint64_t> downlo
     std::erase_if(measured_sizes_, [id](const auto& entry) { return std::get<0>(entry.first) == id; });
     const auto game = std::find_if(state_.games.begin(), state_.games.end(),
                                    [id](const Game& candidate) { return candidate.id == id; });
+    // A size measured for the same update stays with it.
+    if (const auto saved = state_.update_check.games.find(id);
+        saved != state_.update_check.games.end() && saved->second.sized && !update.sized && update.target != 0 &&
+        saved->second.target == update.target) {
+        update.download_bytes = saved->second.download_bytes;
+        update.staged_bytes = saved->second.staged_bytes;
+        update.sized = true;
+    }
     // An installed game's update, from its page or the check, is what the update list saves. Before the
     // licenses are read every game answers "no update": that would empty the list.
     if (updates_known) set_saved_update(id, update);
@@ -3877,7 +3894,8 @@ void Simulation::ApplyUpdateCheck(std::uint64_t account, std::optional<playden::
     check.loaded = true;
     if (saved) {
         check.checked_at = saved->checked_at;
-        for (const auto& [id, game] : saved->games) check.games[id] = {game.newer, game.new_dlc, game.download_bytes};
+        for (const auto& [id, game] : saved->games)
+            check.games[id] = {game.newer, game.new_dlc, game.download_bytes, game.staged_bytes, game.target, game.sized};
     }
     update_check_saved_revision_ = update_check_revision_;
     // Pages opened before the file was read answered for now: they win.
@@ -3892,6 +3910,9 @@ void Simulation::ResetUpdateCheck() {
     update_check_requested_ = false;
     update_check_waiting_.reset();
     update_check_early_.clear();
+    update_sizes_running_.clear();
+    update_sizes_ended_.clear();
+    update_sizes_newer_.clear();
     update_check_saved_revision_ = update_check_revision_;
 }
 
@@ -3903,7 +3924,7 @@ playden::SavedUpdateCheck Simulation::ExportUpdateCheck() const {
     playden::SavedUpdateCheck saved;
     saved.checked_at = state_.update_check.checked_at;
     for (const auto& [id, update] : state_.update_check.games)
-        saved.games[id] = {update.newer, update.new_dlc, update.download_bytes};
+        saved.games[id] = {update.newer, update.new_dlc, update.download_bytes, update.staged_bytes, update.target, update.sized};
     return saved;
 }
 
@@ -3965,14 +3986,82 @@ void Simulation::set_saved_update(GameId id, const GameUpdate& update) {
         return;
     }
     auto& games = state_.update_check.games;
+    // Steam answered again: an update whose size couldn't be measured is asked again.
+    std::erase_if(update_sizes_ended_, [id](const auto& key) { return key.first == id; });
     if (update.available()) {
         const auto found = games.find(id);
-        if (found != games.end() && found->second == update) return;
-        games[id] = update;
+        auto kept = update;
+        // A size measured for the same update stays with it.
+        if (found != games.end() && found->second.sized && !kept.sized && kept.target != 0 && found->second.target == kept.target) {
+            kept.download_bytes = found->second.download_bytes;
+            kept.staged_bytes = found->second.staged_bytes;
+            kept.sized = true;
+        }
+        if (found != games.end() && found->second == kept) return;
+        games[id] = kept;
     } else if (!games.erase(id)) {
         return;
     }
     ++update_check_revision_;
+}
+
+std::vector<GameId> Simulation::TakeUpdateSizeChecks() {
+    std::vector<GameId> ids;
+    if (!live() || !state_.update_check.loaded) return ids;
+    for (const auto& [id, update] : state_.update_check.games) {
+        if (!update.available() || update.sized || update_sizes_running_.contains(id) ||
+            update_sizes_ended_.contains({id, update.target}) || !find_installation(state_, id))
+            continue;
+        update_sizes_running_[id] = update.target;
+        ids.push_back(id);
+    }
+    if (!ids.empty()) rebuild_view();
+    return ids;
+}
+
+bool Simulation::UpdateMeasuredUpdate(GameId id, bool measured, std::uint64_t target, std::uint64_t download_bytes,
+                                      std::uint64_t staged_bytes) {
+    const auto running = update_sizes_running_.find(id);
+    if (running == update_sizes_running_.end()) return false;
+    const auto asked = running->second;
+    update_sizes_running_.erase(running);
+    auto& games = state_.update_check.games;
+    const auto found = games.find(id);
+    // A saved update from before targets were kept (0) takes the size of what Steam has now.
+    const bool applies = found != games.end() && measured && target != 0 && (found->second.target == 0 || found->second.target == target);
+    if (!applies) {
+        update_sizes_ended_.insert({id, asked});
+        rebuild_view();
+        // Steam has a newer update than the one listed: its details list it, and its size is measured then.
+        return found != games.end() && measured && target != 0 && update_sizes_newer_.insert({id, target}).second;
+    }
+    auto& update = found->second;
+    update.target = target;
+    update.download_bytes = download_bytes;
+    update.staged_bytes = staged_bytes;
+    update.sized = true;
+    ++update_check_revision_;
+    const auto game = std::find_if(state_.games.begin(), state_.games.end(), [id](const Game& candidate) { return candidate.id == id; });
+    if (game != state_.games.end() && game->update.available() && (game->update.target == 0 || game->update.target == target)) {
+        game->update.target = target;
+        game->update.download_bytes = download_bytes;
+        game->update.staged_bytes = staged_bytes;
+        game->update.sized = true;
+    }
+    rebuild_view();
+    return false;
+}
+
+std::string Simulation::update_size_text(GameId id) const {
+    const auto found = state_.update_check.games.find(id);
+    if (found != state_.update_check.games.end() && found->second.sized) return format_bytes(found->second.download_bytes);
+    if (found == state_.update_check.games.end()) {
+        const auto* game = find_game(state_, id);
+        if (game && game->update.sized) return format_bytes(game->update.download_bytes);
+    }
+    const bool waiting = found != state_.update_check.games.end() && !update_sizes_ended_.contains({id, found->second.target}) &&
+                         state_.account().authentication == AuthState::SignedIn;
+    return waiting ? "Checking size…" : "Size unknown";
 }
 
 void Simulation::PreferencesSaveResult(std::uint64_t revision, playden::StorageError error) {
@@ -4582,7 +4671,7 @@ bool Simulation::scenario(const std::string& name) {
             const auto& seed = seeds[index];
             state_.installations.push_back({game.id, seed.volume, seed.bytes, true, true, true});
             game.last_played = seed.played > 0 ? std::optional<std::int64_t>(seed.played) : std::nullopt;
-            if (seed.download > 0) state_.update_check.games[game.id] = {seed.newer, seed.dlc, seed.download};
+            if (seed.download > 0) state_.update_check.games[game.id] = {seed.newer, seed.dlc, seed.download, seed.download, index + 1, true};
         }
         // The fourth game is running: it can't be uninstalled now.
         LiveRuntimeGame running;
@@ -4770,7 +4859,8 @@ bool Simulation::scenario(const std::string& name) {
         std::erase_if(state_.jobs, [id](const Job& job) { return job.game_id == id; });
         if (auto* installation = find_installation(state_, id)) installation->runtime_ready = true;
         if (auto* game = const_cast<Game*>(find_game(state_, id)))
-            game->update = name == "dlc-available" ? GameUpdate{true, true, 312'000'000} : GameUpdate{true, false, 1'240'000'000};
+            game->update = name == "dlc-available" ? GameUpdate{true, true, 312'000'000, 330'000'000, 1, true}
+                                                   : GameUpdate{true, false, 1'240'000'000, 1'500'000'000, 1, true};
         state_.navigation.route = Route::Details;
         state_.navigation.detail_origin = Route::Library;
         state_.navigation.detail_id = id;
@@ -5233,7 +5323,7 @@ void Simulation::rebuild_view() {
             view_.subtitle += "On " + check.volume_label + ". ";
             if (check.free_bytes) view_.subtitle += format_bytes(*check.free_bytes) + " free. ";
             view_.subtitle += check.download_bytes
-                ? "Downloads up to " + format_bytes(check.download_bytes) + ", only the files that changed. "
+                ? "Downloads " + format_bytes(*check.download_bytes) + ", only the files that changed. "
                 : "Its size is checked when the download starts. ";
             view_.subtitle += check.allowed ? std::string("You can play until the update puts its files in place.")
                                             : check.reason + ".";
@@ -5394,7 +5484,7 @@ void Simulation::rebuild_view() {
             }
             if (modal.id == "update" && action_key == "update-confirm") {
                 const auto check = update_check(state_.navigation.detail_id.value_or(state_.navigation.selected_game_id));
-                if (check.download_bytes) item.value = "Up to " + format_bytes(check.download_bytes);
+                if (check.download_bytes) item.value = format_bytes(*check.download_bytes);
                 item.subtitle = check.reason;
                 item.enabled = check.allowed;
             }
@@ -6246,8 +6336,8 @@ void Simulation::rebuild_view() {
             auto& button = row("details-update", RowKind::Action, dlc ? "DLC available" : "Update", "details-update");
             button.game_id = game->id;
             auto& note = row("details-update-note", RowKind::Status, dlc ? "DLC available" : "Update available", "");
-            // Steam's size for the changed depots; only the files that changed download.
-            if (game->update.download_bytes) note.value = "Up to " + format_bytes(game->update.download_bytes);
+            // What the changed files download, once measured.
+            note.value = update_size_text(game->id);
             note.enabled = false;
         };
         if (!live()) {
@@ -6882,9 +6972,14 @@ void Simulation::rebuild_view() {
                 item.subtitle = "Steam didn't answer" + (when.empty() ? std::string() : " · last checked " + when);
             } else if (!updates.empty()) {
                 std::uint64_t bytes = 0;
-                for (const auto id : updates) bytes += check.games.at(id).download_bytes;
+                bool all_sized = true;
+                for (const auto id : updates) {
+                    const auto& found = check.games.at(id);
+                    bytes += found.sized ? found.download_bytes : 0;
+                    all_sized = all_sized && found.sized;
+                }
                 item.value = std::to_string(updates.size()) + (updates.size() == 1 ? " update" : " updates") +
-                             (bytes > 0 ? " · " + format_bytes(bytes) : std::string());
+                             (all_sized ? " · " + format_bytes(bytes) : std::string());
             } else {
                 item.value = check.checked_at > 0 ? "Up to date" : "Not checked";
             }

@@ -3816,22 +3816,22 @@ void live_game_update() {
     check(model.action("details:42"), "details open");
     check(!has_row(model, "details-update") && !has_row(model, "details-update-note"), "nothing to update, no button");
 
-    model.UpdateAppDetails(SteamId(42), 100, 6'000'000'000, true, {}, 0, {}, GameUpdate{true, false, 1'200'000'000});
+    model.UpdateAppDetails(SteamId(42), 100, 6'000'000'000, true, {}, 0, {}, GameUpdate{true, false, 1'200'000'000, 1'400'000'000, 1, true});
     const auto& rows = model.view().rows;
     const auto play_at = std::find_if(rows.begin(), rows.end(), [](const auto& row) { return row.key == "details-play"; });
     const auto update_at = std::find_if(rows.begin(), rows.end(), [](const auto& row) { return row.key == "details-update"; });
     check(play_at != rows.end() && update_at == play_at + 1 && update_at->title == "Update" && update_at->enabled,
           "Update follows Play");
     const auto* note = find_row(model, "details-update-note");
-    check(note && note->title == "Update available" && note->value == "Up to 1.2 GB", "the note says the update's size");
+    check(note && note->title == "Update available" && note->value == "1.2 GB", "the note says the update's size");
     activate(model, "details-update");
     check(model.view().surface == "update" && model.view().title == "Update game", "Update opens its sheet");
     const auto* confirm = find_row(model, "update-confirm");
-    check(confirm && confirm->title == "Download and install" && confirm->value == "Up to 1.2 GB" && confirm->enabled &&
+    check(confirm && confirm->title == "Download and install" && confirm->value == "1.2 GB" && confirm->enabled &&
               confirm->subtitle == "Starts the download",
           "the sheet's confirm row has the size, as the install sheet");
     check(model.view().subtitle.find("On Console storage. ") != std::string::npos &&
-              model.view().subtitle.find("Downloads up to 1.2 GB") != std::string::npos,
+              model.view().subtitle.find("Downloads 1.2 GB") != std::string::npos,
           "the sheet says where and how much");
     activate(model, "update-confirm");
     auto requests = model.TakeInstallRequests();
@@ -3840,19 +3840,19 @@ void live_game_update() {
     check(model.view().surface != "update", "the sheet closes");
 
     // DLC bought since wins the label, even when an update downloads with it.
-    model.UpdateAppDetails(SteamId(42), 100, 6'000'000'000, true, {}, 0, {}, GameUpdate{true, true, 300'000'000});
+    model.UpdateAppDetails(SteamId(42), 100, 6'000'000'000, true, {}, 0, {}, GameUpdate{true, true, 300'000'000, 300'000'000, 2, true});
     check(find_row(model, "details-update")->title == "DLC available" &&
               find_row(model, "details-update-note")->title == "DLC available" &&
-              find_row(model, "details-update-note")->value == "Up to 300 MB",
+              find_row(model, "details-update-note")->value == "300 MB",
           "new DLC says DLC available");
 
-    // Less room than Steam's whole-depot estimate: only the download knows what the changed files need, so the
-    // sheet shows the estimate and lets it start.
+    // Less room than the changed files need: the sheet shows the size and lets it start; the download checks the
+    // room itself.
     model.UpdateVolumes({{"internal", "Console storage", true, 100'000'000'000, 200'000'000}}, "internal");
     activate(model, "details-update");
     confirm = find_row(model, "update-confirm");
-    check(confirm && confirm->enabled && confirm->subtitle == "Starts the download", "the estimate doesn't block the update");
-    check(model.view().subtitle.find("Downloads up to 300 MB") != std::string::npos, "it is shown as an estimate");
+    check(confirm && confirm->enabled && confirm->subtitle == "Starts the download", "the room doesn't block the update");
+    check(model.view().subtitle.find("Downloads 300 MB") != std::string::npos, "the sheet says the size");
     activate(model, "update-confirm");
     requests = model.TakeInstallRequests();
     check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Update, "the update is sent");

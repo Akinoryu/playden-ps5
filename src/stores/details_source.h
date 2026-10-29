@@ -32,8 +32,9 @@ class DetailsSource {
   // without updates checks nothing and answers false.
   virtual bool CheckInstalled(const std::vector<GameId>&, std::uint64_t) { return false; }
   virtual steam::InstalledCheck CheckProgress() { return {}; }
-  // The exact size of one install choice (steam::MeasuredSize); a store without it answers nothing.
-  virtual void Measure(const steam::SizeRequest&, std::uint64_t) {}
+  // The exact size of one install choice or update (steam::MeasuredSize); a store without it answers nothing.
+  // False when the request isn't queued (no answer will come).
+  virtual bool Measure(const steam::SizeRequest&, std::uint64_t) { return false; }
   virtual std::vector<steam::MeasuredSize> PumpMeasured() { return {}; }
   virtual void Shutdown() = 0;
 };

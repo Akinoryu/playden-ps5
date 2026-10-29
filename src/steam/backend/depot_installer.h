@@ -192,6 +192,8 @@ struct InstallMeasure {
   std::uint64_t install_bytes = 0;
   std::uint64_t download_bytes = 0;
   bool partial = false;  // a depot the account was refused is left out
+  // MeasureUpdate only: the changed files' bytes, staged beside the game until the update puts them in place.
+  std::uint64_t staged_bytes = 0;
 };
 
 // Downloads and assembles an app's depots into install_root. Safe to run again after any
@@ -225,6 +227,15 @@ class DepotInstaller {
   // written. A depot the account is refused is left out, as an install leaves it.
   InstallMeasure Measure(const StoredSession& session, std::uint32_t app_id, const std::vector<DepotInfo>& depots,
                          const std::string& branch, const std::atomic<bool>& cancel);
+  // What an update of the finished install at `install_root` to `depots` downloads: the files Run's update
+  // would stage (download_bytes: their chunks' compressed bytes; staged_bytes: their sizes), from the
+  // install's tree and the new manifests. install_bytes is the new version's size. An install without a tree
+  // (made before trees were kept) is taken to hold `installed` (the depots and manifests its record names, as
+  // the new selection asks for them): their merged files stand in for the tree, as Run's hashing would find
+  // them. kProtocol without either.
+  InstallMeasure MeasureUpdate(const StoredSession& session, std::uint32_t app_id, const std::vector<DepotInfo>& depots,
+                               const std::string& branch, const std::string& install_root, const std::atomic<bool>& cancel,
+                               const std::vector<DepotInfo>& installed = {});
 
   // Finishes an update whose files are all staged (phase replacing or deleting): renames them over the
   // game's, deletes the files the new version dropped and the folders that leaves empty (never anything
@@ -247,6 +258,11 @@ class DepotInstaller {
   static constexpr int kReraceLimit = 2;
 
  private:
+  // Measure's work: the merged manifests of `depots`, or what stopped it in `measure`.
+  std::optional<DepotMerge> MergedManifests(const StoredSession& session, std::uint32_t app_id,
+                                            const std::vector<DepotInfo>& depots, const std::string& branch,
+                                            const std::atomic<bool>& cancel, std::vector<DepotManifest>* manifests,
+                                            InstallMeasure* measure);
   InstallerHooks hooks_;
  public:
   void SetStats(std::function<void(const char*, const InstallStats&)> stats) { hooks_.stats = std::move(stats); }
