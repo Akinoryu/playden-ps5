@@ -1422,6 +1422,7 @@ private:
     void refresh_manage_games();
     void open_manage_games(ManageTab tab);
     void close_manage_games();
+    void show_manage_queue(GameId first);
     void switch_manage_tab(int delta);
     void manage_select_all();
     void ask_manage_uninstall();

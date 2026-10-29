@@ -1560,6 +1560,14 @@ void Simulation::open_manage_games(ManageTab tab) {
     state_.navigation.focus_key = manage_default_focus();
 }
 
+// A batch the screen queued: it closes on the Queue so the player sees it start, on the first game's job once
+// that is listed.
+void Simulation::show_manage_queue(GameId first) {
+    state_.navigation.route = Route::Downloads;
+    state_.navigation.settings_rail_focused = false;
+    state_.navigation.focus_key = "job-" + ToKey(first);
+}
+
 void Simulation::close_manage_games() {
     // Opened from the storage-full sign-in that has since gone through: Home, as a sign-in that works leads there.
     if (manage_return_route_ == Route::SignIn && state_.account().authentication == AuthState::SignedIn) {
@@ -1701,10 +1709,9 @@ void Simulation::queue_manage_updates(bool anyway) {
     if (live())
         for (const auto id : plan.games) pending_install_requests_.push_back({InstallRequestKind::Update, id});
     manage_tabs_[ManageTab::Updates].selected.clear();
-    close_manage_games();
+    show_manage_queue(plan.games.front());
     const auto* game = plan.games.size() == 1 ? find_game(state_, plan.games.front()) : nullptr;
-    const std::string detail = !live() ? "Fixture: nothing downloads"
-                             : plan.games.size() == 1 ? "Follow it in Queue" : "Follow them in Queue";
+    const std::string detail = !live() ? "Fixture: nothing downloads" : "";
     push_notice({"update-batch", game && !game->title.empty() ? game->title + " update queued"
                                                               : std::to_string(plan.games.size()) + " updates queued",
                  "", false, kLiveNoticeSeconds, false, detail});
@@ -1827,10 +1834,9 @@ void Simulation::queue_manage_moves() {
     if (live())
         for (const auto id : plan.games) pending_install_requests_.push_back({InstallRequestKind::Move, id, manage_move_volume_id_});
     manage_tabs_[ManageTab::Move].selected.clear();
-    close_manage_games();
+    show_manage_queue(plan.games.front());
     const auto* game = plan.games.size() == 1 ? find_game(state_, plan.games.front()) : nullptr;
-    const std::string detail = !live() ? "Fixture: nothing moves"
-                             : plan.games.size() == 1 ? "Follow it in Queue" : "Follow them in Queue";
+    const std::string detail = !live() ? "Fixture: nothing moves" : "";
     push_notice({"move-batch", game && !game->title.empty() ? game->title + " move queued"
                                                             : std::to_string(plan.games.size()) + " moves queued",
                  "", false, kLiveNoticeSeconds, false, detail});
@@ -9006,13 +9012,12 @@ void Simulation::activate() {
             close_modal();  // back to the list, which says so
             refresh_manage_games();
         } else {
-            // Queue follows the uninstalls: the screen closes, back to where it was opened.
+            // The screen closes on the Queue, which follows the uninstalls.
             state_.navigation.modals.clear();
-            close_manage_games();
+            show_manage_queue(started.front());
             const auto* game = started.size() == 1 ? find_game(state_, started.front()) : nullptr;
             push_notice({"uninstall-batch", "Uninstalling " + (game && !game->title.empty() ? game->title : kept_count(started.size())),
-                         "", false, kLiveNoticeSeconds, false,
-                         !live() ? "Fixture: nothing is uninstalled" : started.size() == 1 ? "Follow it in Queue" : "Follow them in Queue"});
+                         "", false, kLiveNoticeSeconds, false, !live() ? "Fixture: nothing is uninstalled" : ""});
         }
     } else if (action_name == "import-manage") {
         open_import_sheet();

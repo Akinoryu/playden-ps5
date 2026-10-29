@@ -1648,16 +1648,16 @@ void live_manage_update_selected(const std::filesystem::path& base) {
     check(requests.size() == 2 && requests[0].kind == InstallRequestKind::Update && requests[0].game_id == SteamId(10) &&
               requests[1].kind == InstallRequestKind::Update && requests[1].game_id == SteamId(20),
           "update selected: the batch queues each checked game's update in the list's order");
-    check(navigation.route == Route::Settings && navigation.focus_key == "settings-installed",
-          "update selected: the screen closes once they are queued");
+    check(navigation.route == Route::Downloads, "update selected: the screen closes on the Queue");
     const auto notice = std::find_if(model.state().notices.begin(), model.state().notices.end(),
                                      [](const auto& value) { return value.id == "update-batch"; });
-    check(notice != model.state().notices.end() && notice->message == "2 updates queued" && notice->detail == "Follow them in Queue",
+    check(notice != model.state().notices.end() && notice->message == "2 updates queued" && notice->detail.empty(),
           "update selected: the notice says how many");
 
     // Sorted by last played, the order follows; a game that started playing meanwhile is skipped.
     model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
                          {"usb", "USB Drive", true, 100 * gb, 50 * gb}}, "internal");
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
     activate(model, "settings-installed");
     model.action("r1");
     activate(model, "manage-sort");
@@ -1681,6 +1681,7 @@ void live_manage_update_selected(const std::filesystem::path& base) {
     model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {});
     model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
                          {"usb", "USB Drive", true, 100 * gb, 2 * gb}}, "internal");
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
     activate(model, "settings-installed");
     model.action("r1");
     model.action("triangle");
@@ -1688,7 +1689,7 @@ void live_manage_update_selected(const std::filesystem::path& base) {
     activate(model, "confirm-destructive");
     const auto anyway = model.TakeInstallRequests();
     check(std::any_of(anyway.begin(), anyway.end(), [](const auto& request) { return request.game_id == SteamId(30); }) &&
-              navigation.route == Route::Settings,
+              navigation.route == Route::Downloads,
           "update selected: Update anyway queues the games the drive may lack room for");
 }
 
@@ -1916,8 +1917,8 @@ void live_manage_move(const std::filesystem::path& base) {
           "move: each checked game is its own move, in the list's order");
     const auto notice = std::find_if(model.state().notices.begin(), model.state().notices.end(),
                                      [](const auto& value) { return value.id == "move-batch"; });
-    check(navigation.route == Route::Settings && notice != model.state().notices.end() && notice->message == "2 moves queued",
-          "move: the screen closes with a notice");
+    check(navigation.route == Route::Downloads && notice != model.state().notices.end() && notice->message == "2 moves queued",
+          "move: the screen closes on the Queue, with a notice");
 
     // The game page: Maintenance has Move to…, for installed Steam games only, and it queues the same move.
     check(model.action("details:20"), "move: game page");
@@ -2003,7 +2004,7 @@ void live_manage_queue_full(const std::filesystem::path& base) {
     queue(62);
     model.action("triangle");
     const auto moves = model.TakeInstallRequests();
-    check(moves.size() == 2 && moves[0].kind == InstallRequestKind::Move && navigation.route == Route::Settings,
+    check(moves.size() == 2 && moves[0].kind == InstallRequestKind::Move && navigation.route == Route::Downloads,
           "queue full: with room for both they go");
 }
 

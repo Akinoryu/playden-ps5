@@ -318,7 +318,7 @@ int main(int argc,char** argv) {
       assert(live.state().navigation.route == Route::ManageGames);
       assert(live.action("focus:manage-toggle-43") && live.action("cross"));
       capture_live("installed-games.png");
-      // A batch: the screen closes and Queue follows it; one game is uninstalled, the other stops on Cloud.
+      // A batch: the screen closes on the Queue; one game is uninstalled, the other stops on Cloud.
       assert(live.action("focus:manage-toggle-42") && live.action("cross"));
       assert(live.action("focus:manage-primary") && live.action("cross"));
       capture_live("installed-games-confirm.png");
@@ -326,10 +326,8 @@ int main(int argc,char** argv) {
       titled.uninstall_status="Removing PS5 title…";
       live.UpdateRuntime(RuntimeState::Ready, {titled, playing});
       live.UpdatePreparationQueue({std::nullopt, {}, {}, {}, {{SteamId(42), "Syncing saves…"}, {SteamId(43), ""}}});
-      capture_live("installed-games-queued.png");
-      live.action("l1");
-      live.action("l1");
       assert(live.state().navigation.route==Route::Downloads);
+      capture_live("installed-games-queued.png");
       capture_live("queue-uninstalls.png");
       live.NotifyUninstallStopped(SteamId(43), "Cloud saves could not be synced. Fix them in Saves, then try again.");
       live.UpdatePreparationQueue({std::nullopt, {}, {}, {}, {{SteamId(42), "Removing PS5 title…"}}});

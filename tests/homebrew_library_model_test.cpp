@@ -1697,18 +1697,18 @@ void live_storage_section_and_installed_games() {
                   return request.kind == InstallRequestKind::Uninstall && !request.delete_saves;
               }),
           "each checked game is uninstalled, keeping its saves");
-    // The list closes: Queue follows the uninstalls, and a notice says so.
-    check(model.state().navigation.modals.empty() && model.state().navigation.route == Route::Settings &&
-              model.state().navigation.focus_key == "settings-installed",
-          "the confirmed list closes back to Settings");
+    // The list closes on the Queue, which follows the uninstalls, and a notice says what started.
+    check(model.state().navigation.modals.empty() && model.state().navigation.route == Route::Downloads,
+          "the confirmed list closes on the Queue");
     check(!model.state().notices.empty() && model.state().notices.back().id == "uninstall-batch" &&
               model.state().notices.back().message == "Uninstalling 3 games" &&
-              model.state().notices.back().detail == "Follow them in Queue" && !model.state().notices.back().failure,
-          "a notice sends the player to Queue");
+              model.state().notices.back().detail.empty() && !model.state().notices.back().failure,
+          "a notice says what started");
     const auto notices = model.state().notices.size();
     model.UpdatePreparationQueue({std::nullopt, {}, {}, {}, {{SteamId(11), "Removing PS5 title…"}, {SteamId(10), ""}, {SteamId(12), ""}}});
     titled.uninstall_status = "Waiting to uninstall";
     model.UpdateRuntime(RuntimeState::Ready, {titled, running, preparing});
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
     activate(model, "settings-installed");
     check(!find_row(model, "manage-toggle-10")->enabled && find_row(model, "manage-toggle-10")->subtitle == "Waiting to uninstall",
           "a game waiting to uninstall says so and can't be chosen");
@@ -1746,7 +1746,7 @@ void live_storage_section_and_installed_games() {
     requests = model.TakeInstallRequests();
     check(requests.size() == 1 && requests[0].game_id == SteamId(12), "the stopped game is uninstalled again");
     check(model.state().navigation.modals.empty() && model.state().notices.back().message == "Uninstalling Gamma" &&
-              model.state().notices.back().detail == "Follow it in Queue", "one game's notice names it");
+              model.state().navigation.route == Route::Downloads, "one game's notice names it");
     check(model.state().ended_uninstalls.size() == 2 &&
               std::all_of(model.state().ended_uninstalls.begin(), model.state().ended_uninstalls.end(),
                           [](const auto& ended) { return ended.stopped.empty(); }),
@@ -1754,6 +1754,7 @@ void live_storage_section_and_installed_games() {
     model.UpdateInstalls({LiveInstallJob{SteamId(15), JobState::Queued, 0, gb, {}, "internal"}},
                          {{SteamId(13), 1 * gb, "internal"}, {SteamId(14), 2 * gb, "internal"}, {SteamId(15), 3 * gb, "internal"},
                           {SteamId(16), 4 * gb, "internal"}});
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
     activate(model, "settings-installed");
     check(!has_row(model, "manage-toggle-12"), "the uninstalled game leaves the list");
 
