@@ -19,8 +19,9 @@ StorageError PreferenceLoadError(PreferencesLoadStatus status) {
 }  // namespace
 
 PersistenceService::PersistenceService(PreferencesStore& preferences,
-                                       OrganizationRepository& organizations)
-    : preferences_(preferences), organizations_(organizations),
+                                       OrganizationRepository& organizations,
+                                       UpdateCheckRepository* updates)
+    : preferences_(preferences), organizations_(organizations), updates_(updates),
       worker_([this] { Run(); }) {}
 
 PersistenceService::~PersistenceService() { Shutdown(); }
@@ -33,7 +34,8 @@ bool PersistenceService::IsOrganization(Command command) {
 
 bool PersistenceService::IsLoad(Command command) {
   return command == Command::kLoadPreferences ||
-         command == Command::kLoadOrganization;
+         command == Command::kLoadOrganization ||
+         command == Command::kLoadUpdateCheck;
 }
 
 PersistenceRequestId PersistenceService::LoadPreferences() {
@@ -81,6 +83,25 @@ PersistenceRequestId PersistenceService::ClearOrganization(
   return Submit(std::move(job));
 }
 
+PersistenceRequestId PersistenceService::LoadUpdateCheck(std::uint64_t account) {
+  if (!updates_ || !account) return 0;
+  Job job;
+  job.command = Command::kLoadUpdateCheck;
+  job.account = account;
+  return Submit(std::move(job));
+}
+
+PersistenceRequestId PersistenceService::SaveUpdateCheck(std::uint64_t account, std::uint64_t revision,
+                                                         SavedUpdateCheck check) {
+  if (!updates_ || !account) return 0;
+  Job job;
+  job.command = Command::kSaveUpdateCheck;
+  job.account = account;
+  job.revision = revision;
+  job.update_check = std::move(check);
+  return Submit(std::move(job));
+}
+
 PersistenceRequestId PersistenceService::Submit(Job job) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (stopping_) return 0;
@@ -123,6 +144,18 @@ PersistenceRequestId PersistenceService::Submit(Job job) {
       job.request = ++next_request_;
       *found = std::move(job);
       organization_revision_ = found->revision;
+      wake_.notify_one();
+      return next_request_;
+    }
+  }
+
+  if (job.command == Command::kSaveUpdateCheck) {
+    const auto found = std::find_if(pending_.rbegin(), pending_.rend(), [&job](const Job& pending) {
+      return pending.command == Command::kSaveUpdateCheck && pending.account == job.account;
+    });
+    if (found != pending_.rend()) {
+      job.request = ++next_request_;
+      *found = std::move(job);
       wake_.notify_one();
       return next_request_;
     }
@@ -264,6 +297,10 @@ void PersistenceService::Run() {
         event.kind = PersistenceEventKind::kOrganizationLoaded;
       else if (failed.command == Command::kSaveOrganization)
         event.kind = PersistenceEventKind::kOrganizationSaved;
+      else if (failed.command == Command::kLoadUpdateCheck)
+        event.kind = PersistenceEventKind::kUpdateCheckLoaded;
+      else if (failed.command == Command::kSaveUpdateCheck)
+        event.kind = PersistenceEventKind::kUpdateCheckSaved;
       else
         event.kind = PersistenceEventKind::kOrganizationCleared;
       std::lock_guard<std::mutex> lock(mutex_);
@@ -272,7 +309,8 @@ void PersistenceService::Run() {
           failed.command == Command::kSaveOrganization)
         current = failed.account == organization_account_ &&
                   failed.generation == organization_generation_;
-      if (failed.command == Command::kLoadPreferences && stopping_) current = false;
+      if ((failed.command == Command::kLoadPreferences || failed.command == Command::kLoadUpdateCheck) && stopping_)
+        current = false;
       if (failed.command == Command::kClearOrganization) clear_barrier_ = false;
       if (current)
         PushEvent(std::move(event), failed.command == Command::kClearOrganization);
@@ -331,6 +369,26 @@ void PersistenceService::Execute(Job job) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (job.account == organization_account_ &&
         job.generation == organization_generation_) PushEvent(std::move(event));
+    return;
+  }
+
+  if (job.command == Command::kLoadUpdateCheck) {
+    const auto loaded = updates_->Load(job.account);
+    event.kind = PersistenceEventKind::kUpdateCheckLoaded;
+    event.error = loaded.ok() ? StorageError::kNone : loaded.error();
+    if (loaded.ok()) event.update_check = loaded.value();
+    else event.message = loaded.message();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!stopping_) PushEvent(std::move(event));
+    return;
+  }
+  if (job.command == Command::kSaveUpdateCheck) {
+    const auto saved = updates_->Save(job.account, job.update_check);
+    event.kind = PersistenceEventKind::kUpdateCheckSaved;
+    event.error = saved.ok() ? StorageError::kNone : saved.error();
+    if (!saved.ok()) event.message = saved.message();
+    std::lock_guard<std::mutex> lock(mutex_);
+    PushEvent(std::move(event));
     return;
   }
 

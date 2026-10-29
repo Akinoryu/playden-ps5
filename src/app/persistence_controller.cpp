@@ -77,12 +77,26 @@ void PersistenceController::BeginOrganizationLoad() {
   Report(kOrganizationLoad, "busy");
 }
 
-// Organization belongs to the device: store accounts coming and going leave it alone.
-void PersistenceController::Activate(std::uint64_t) {}
+// Organization belongs to the device: store accounts coming and going leave it alone. The update check is
+// the account's own.
+void PersistenceController::Activate(std::uint64_t account) {
+  if (shutting_down_ || !account || account == update_account_) return;
+  if (update_account_) Reset();
+  update_account_ = account;
+  submitted_update_revision_ = 0;
+  model_.BeginUpdateCheckLoad(account);
+  update_load_request_ = service_.LoadUpdateCheck(account);
+  // Nowhere to read it from: the account starts with no check.
+  if (!update_load_request_) model_.ApplyUpdateCheck(account, std::nullopt);
+}
 
 void PersistenceController::Reset() {
   if (shutting_down_) return;
   ObserveAndSave();
+  update_account_ = 0;
+  update_load_request_ = 0;
+  submitted_update_revision_ = 0;
+  model_.ResetUpdateCheck();
 }
 
 void PersistenceController::Tick() {
@@ -99,6 +113,8 @@ void PersistenceController::Retry() {
 
   if (organization_load_failed_) BeginOrganizationLoad();
   else submitted_organization_revision_ = 0;
+  // The update check's last save may have failed too.
+  submitted_update_revision_ = 0;
 }
 
 void PersistenceController::Clear() {
@@ -133,6 +149,20 @@ void PersistenceController::Apply(PersistenceEvent event) {
     model_.PreferencesSaveResult(event.revision, event.error);
     return;
   }
+  if (event.kind == PersistenceEventKind::kUpdateCheckLoaded) {
+    if (event.request_id != update_load_request_ || event.account_id != update_account_) return;
+    update_load_request_ = 0;
+    // A damaged file starts the account over; the next check writes a new one.
+    Report(kUpdateCheckLoad, event.error == StorageError::kNone ? std::string() : Failure(event.error, event.message));
+    model_.ApplyUpdateCheck(event.account_id, event.error == StorageError::kNone ? std::move(event.update_check)
+                                                                                 : std::nullopt);
+    return;
+  }
+  if (event.kind == PersistenceEventKind::kUpdateCheckSaved) {
+    Report(kUpdateCheckSave, event.error == StorageError::kNone ? std::string() : Failure(event.error, event.message));
+    model_.UpdateCheckSaveResult(event.account_id, event.revision, event.error);
+    return;
+  }
   if (event.kind == PersistenceEventKind::kOrganizationCleared) return;
   if (event.account_id != kDeviceOrganization ||
       event.account_generation != organization_generation_) return;
@@ -160,7 +190,7 @@ void PersistenceController::Apply(PersistenceEvent event) {
 
 void PersistenceController::Report(Channel channel, const std::string& failure) {
   static const char* const kNames[kChannels] = {"preferences load", "preferences save", "organization load",
-                                                "organization save"};
+                                                "organization save", "update check load", "update check save"};
   auto& last = reported_[channel];
   if (failure == last) return;
   if (log_) log_(failure.empty() ? std::string(kNames[channel]) + " works again"
@@ -169,6 +199,16 @@ void PersistenceController::Report(Channel channel, const std::string& failure) 
 }
 
 void PersistenceController::ObserveAndSave() {
+  if (update_account_ && !update_load_request_ && model_.UpdateCheckAccount() == update_account_ &&
+      model_.UpdateCheckDirty()) {
+    const auto revision = model_.UpdateCheckRevision();
+    if (revision != submitted_update_revision_) {
+      submitted_update_revision_ = revision;
+      if (!service_.SaveUpdateCheck(update_account_, revision, model_.ExportUpdateCheck()))
+        model_.UpdateCheckSaveResult(update_account_, revision, StorageError::kWriteFailed);
+    }
+  }
+
   if (!preferences_load_request_ && !preferences_load_failed_ &&
       model_.PreferencesDirty()) {
     const auto revision = model_.PreferencesRevision();

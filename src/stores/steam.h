@@ -85,6 +85,10 @@ class SteamDetailsSource final : public DetailsSource {
   }
   void Invalidate(std::uint64_t generation) override { service_.Invalidate(generation); }
   std::vector<GameDetails> Pump(std::size_t maximum) override { return service_.Pump(maximum); }
+  bool CheckInstalled(const std::vector<GameId>& ids, std::uint64_t generation) override {
+    return service_.CheckInstalled(ids, generation);
+  }
+  steam::InstalledCheck CheckProgress() override { return service_.CheckProgress(); }
   void Measure(const steam::SizeRequest& request, std::uint64_t generation) override {
     if (request.id.steam_app()) service_.Measure(request, generation);
   }

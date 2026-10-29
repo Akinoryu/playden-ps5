@@ -57,6 +57,7 @@ constexpr bool kOfferGoBack = true;
 
 constexpr std::uint64_t kTransferPerTick = 67'108'864;
 constexpr std::int64_t kFixtureClock = 1'760'000'000;
+constexpr std::int64_t kUpdateCheckInterval = 24 * 60 * 60;  // the screen checks again a day after the last full check
 constexpr int kLiveNoticeSeconds = 6;  // how long a live notification stays on screen
 constexpr std::size_t kOrganizationJournalEntries = 256;
 constexpr std::size_t kOrganizationJournalBytes = 256 * 1024;
@@ -144,6 +145,7 @@ std::string route_name(Route route) {
     case Route::Session: return "session";
     case Route::Saves: return "saves";
     case Route::SaveDetails: return "save-details";
+    case Route::ManageGames: return "manage-games";
     }
     return "home";
 }
@@ -509,10 +511,10 @@ std::string action_label(const std::string& key) {
         {"cloud-use-local", "Use console saves"}, {"cloud-confirm-account", "Use this account"},
         {"cloud-confirm-account-all", "Upload all"},
         {"saves-delete-confirm", "Delete saves"}, {"manage-saves", "Manage saves"}, {"saves-leftover-confirm", "Remove"}, {"saves-quit-anyway", "Play without syncing"},
-        {"install-confirm", "Install"}, {"install-version", "Version"}, {"install-language", "Language"}, {"install-dlc", "Includes"}, {"update-confirm", "Download and install"}, {"storage-picker", "Change storage"}, {"installed-close", "Close"},
+        {"install-confirm", "Install"}, {"install-version", "Version"}, {"install-language", "Language"}, {"install-dlc", "Includes"}, {"update-confirm", "Download and install"}, {"storage-picker", "Change storage"},
         {"value-edit", "Edit…"}, {"value-reset", "Reset to recipe"}, {"override-add", "Add an override…"},
         {"unlock-setting", "Change anyway"}, {"export-recipe", "Export as recipe"}, {"program-scan", "Looking for programs…"},
-        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"clear-shader-cache", "Clear shader cache"},
+        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"clear-shader-cache", "Clear shader cache"},
         {"section-compatibility", "Compatibility"}, {"section-advanced", "Advanced"}, {"heading-game", "Game"},
         {"heading-display", "Display"}, {"heading-controls", "Controls"}, {"heading-sound", "Sound"},
         {"heading-graphics", "Graphics"}, {"heading-windows", "Windows"},
@@ -555,6 +557,31 @@ std::string action_label(const std::string& key) {
     std::replace(title.begin(), title.end(), '-', ' ');
     if (!title.empty()) title.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(title.front())));
     return title;
+}
+
+// A move's job in Queue: its actions say "move", not "download". Empty for other actions.
+std::string move_action_label(const std::string& key) {
+    for (const auto& [prefix, label] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"job-pause-", "Pause move"}, {"job-resume-", "Resume move"}, {"job-retry-", "Retry move"},
+             {"job-cancel-", "Cancel move"}, {"job-now-", "Move now"}})
+        if (key.rfind(prefix, 0) == 0) return label;
+    return {};
+}
+
+// Cancel from Queue asks first. A move deletes only its copy: the game stays where it was.
+ModalEntry cancel_job_confirmation(const State& state, const Job* job, std::string opener) {
+    if (job && job->move) {
+        const auto label = [&state](const std::string& id) {
+            const auto found = std::find_if(state.volumes.begin(), state.volumes.end(), [&id](const Volume& volume) { return volume.id == id; });
+            return found == state.volumes.end() ? std::string("the other drive") : found->label;
+        };
+        ModalEntry confirmation{"confirmation", "Cancel the move?", std::move(opener), {"cancel", "confirm-destructive"}, 0, true};
+        confirmation.body = "The copy on " + label(job->volume_id) + " is deleted. The game stays on " + label(job->from_volume_id) + ".";
+        return confirmation;
+    }
+    ModalEntry confirmation{"confirmation", "Cancel download?", std::move(opener), {"cancel", "confirm-destructive"}, 0, true};
+    confirmation.body = "Stops the download and deletes what was downloaded so far. Installing it again starts from the beginning.";
+    return confirmation;
 }
 
 // Recreate bottle asks first, from Maintenance and for a setup an earlier kit left (Queue, the game page).
@@ -1426,18 +1453,32 @@ bool Simulation::leftover_queued(const std::string& title_id) const {
                        [&](const LiveLeftoverDelete& deletion) { return deletion.title_id == title_id && deletion.failure.empty(); });
 }
 
-std::vector<GameId> Simulation::installed_list() const {
+std::vector<GameId> Simulation::manage_list(ManageTab tab) const {
     struct Entry { GameId id; std::uint64_t bytes; std::optional<std::int64_t> played; std::string title; };
     std::vector<Entry> entries;
-    const auto add = [&](GameId id, std::uint64_t bytes) {
+    const bool updates = tab == ManageTab::Updates;
+    const auto found = manage_tabs_.find(tab);
+    const bool by_played = found != manage_tabs_.end() && found->second.by_played;
+    // Move: nothing to list without a second drive to move to.
+    if (tab == ManageTab::Move && move_volumes().size() < 2) return {};
+    for (const auto& installation : state_.installations) {
+        const auto id = installation.game_id;
+        std::uint64_t bytes = installation.installed_bytes;
+        // Move: imported games have their own Copy/Move into Playden.
+        if (tab == ManageTab::Move && id.store == Store::kLocal) continue;
+        // Updates: installed Steam games whose update or new DLC Steam told of; their size is the download.
+        if (updates) {
+            const auto update = state_.update_check.games.find(id);
+            if (!id.steam_app() || update == state_.update_check.games.end() || !update->second.available()) continue;
+            bytes = update->second.download_bytes;
+        }
         const auto* game = find_game(state_, id);
         entries.push_back({id, bytes, game ? game->last_played : std::nullopt,
                            game ? (game->folded_title.empty() ? game->title : game->folded_title) : ToKey(id)});
-    };
-    for (const auto& installation : state_.installations) add(installation.game_id, installation.installed_bytes);
+    }
     // As on macOS: largest first, or never played first and then the longest unplayed; ties by title.
-    std::sort(entries.begin(), entries.end(), [this](const Entry& left, const Entry& right) {
-        if (installed_by_played_) {
+    std::sort(entries.begin(), entries.end(), [by_played](const Entry& left, const Entry& right) {
+        if (by_played) {
             if (left.played.has_value() != right.played.has_value()) return !left.played.has_value();
             if (left.played && *left.played != *right.played) return *left.played < *right.played;
         } else if (left.bytes != right.bytes) {
@@ -1465,80 +1506,581 @@ std::string Simulation::installed_blocker(GameId id) const {
     return {};
 }
 
-// The list: Sort and Select all, the games, then the footer's Uninstall selected and Close.
-std::vector<std::string> Simulation::installed_manager_actions() const {
-    std::vector<std::string> actions = {"installed-sort", "installed-select-all"};
-    for (const auto id : installed_list()) actions.push_back("installed-toggle-" + ToKey(id));
-    actions.push_back("installed-selection-uninstall");
-    actions.push_back("installed-close");
-    return actions;
+std::string Simulation::manage_blocker(ManageTab tab, GameId id) const {
+    if (tab == ManageTab::Move) return move_blocker(id, manage_move_volume_id_);
+    auto blocker = installed_blocker(id);
+    if (!blocker.empty() || tab != ManageTab::Updates) return blocker;
+    if (update_locked(id)) return "In Queue";
+    if (const auto check = update_check(id); !check.allowed) return check.reason;
+    return {};
 }
 
-// Where a key of the Installed games list sits: 0 Sort and Select all, 1 the games, 2 the footer.
-static int installed_part(const std::string& key) {
-    if (key == "installed-sort" || key == "installed-select-all") return 0;
-    if (key.rfind("installed-toggle-", 0) == 0) return 1;
-    return 2;
+namespace {
+// The tabs L1/R1 go through, in order; the destructive one last.
+constexpr ManageTab kManageTabs[] = {ManageTab::Updates, ManageTab::Move, ManageTab::Uninstall};
+
+const Volume* volume_of(const State& state, const std::string& id) {
+    const auto found = std::find_if(state.volumes.begin(), state.volumes.end(), [&id](const Volume& volume) { return volume.id == id; });
+    return found == state.volumes.end() ? nullptr : &*found;
 }
 
-// The footer's buttons go side by side: Left/Right move between them, Up returns to the game the
-// focus left, and Down from the last game reaches them.
-void Simulation::move_installed_manager(int delta_x, int delta_y) {
-    auto& modal = state_.navigation.modals.back();
-    const auto& keys = modal.action_keys;
-    const int current = std::clamp(modal.focused_action, 0, static_cast<int>(keys.size()) - 1);
-    const int part = installed_part(keys[static_cast<std::size_t>(current)]);
-    int first_footer = static_cast<int>(keys.size());
-    for (int index = 0; index < static_cast<int>(keys.size()); ++index)
-        if (installed_part(keys[static_cast<std::size_t>(index)]) == 2) { first_footer = index; break; }
+// Where a row of Manage installed games sits: 0 the toolbar, 1 the games, 2 the footer, -1 not a stop.
+int manage_part(const ViewRow& row) {
+    if (row.key == "manage-move-to" || row.key == "manage-select-all" || row.key == "manage-sort" || row.key == "manage-check")
+        return 0;
+    if (row.key.rfind("manage-toggle-", 0) == 0) return 1;
+    if (row.key == "manage-primary") return 2;
+    return -1;
+}
+
+std::optional<std::uint64_t> volume_free(const Volume& volume) {
+    if (!volume.available || !volume.capacity_known) return std::nullopt;
+    const auto unused = volume.capacity_bytes - std::min(volume.used_bytes, volume.capacity_bytes);
+    return unused - std::min(volume.reserved_bytes, unused);
+}
+}  // namespace
+
+// The screen opens on `tab` with nothing checked but the updates; each tab keeps its own choices until it closes.
+void Simulation::open_manage_games(ManageTab tab) {
+    // Opening the screen checks Steam for updates once a day.
+    request_update_check(false);
+    manage_tabs_.clear();
+    manage_message_.clear();
+    manage_move_volume_id_.clear();
+    manage_return_focus_ = state_.navigation.focus_key;
+    manage_return_route_ = state_.navigation.route == Route::ManageGames ? manage_return_route_ : state_.navigation.route;
+    state_.navigation.route = Route::ManageGames;
+    state_.navigation.manage_tab = tab;
+    state_.navigation.settings_rail_focused = false;
+    choose_manage_move_volume();
+    state_.navigation.focus_key = manage_default_focus();
+}
+
+void Simulation::close_manage_games() {
+    // Opened from the storage-full sign-in that has since gone through: Home, as a sign-in that works leads there.
+    if (manage_return_route_ == Route::SignIn && state_.account().authentication == AuthState::SignedIn) {
+        state_.navigation.route = Route::Home;
+        state_.navigation.focus_key = game_key(state_.navigation.selected_game_id);
+        return;
+    }
+    state_.navigation.route = manage_return_route_;
+    state_.navigation.focus_key = manage_return_focus_.empty() ? "settings-installed" : manage_return_focus_;
+}
+
+// The first game, else the toolbar's first button that works: Check for updates on an empty Updates tab,
+// Sort while it checks (or with one drive on Move); never a button that is off.
+std::string Simulation::manage_default_focus() const {
+    const auto tab = state_.navigation.manage_tab;
+    const auto games = manage_list(tab);
+    if (!games.empty()) return "manage-toggle-" + ToKey(games.front());
+    if (tab == ManageTab::Updates && !state_.update_check.checking) return "manage-check";
+    if (tab == ManageTab::Move && move_volumes().size() >= 2) return "manage-move-to";
+    return "manage-sort";
+}
+
+// L1/R1 go round the tabs; each comes back with the row it had.
+void Simulation::switch_manage_tab(int delta) {
+    auto& navigation = state_.navigation;
+    manage_tabs_[navigation.manage_tab].focus = navigation.focus_key;
+    constexpr int count = static_cast<int>(std::size(kManageTabs));
+    const auto found = std::find(std::begin(kManageTabs), std::end(kManageTabs), navigation.manage_tab);
+    const int index = found == std::end(kManageTabs) ? 0 : static_cast<int>(found - std::begin(kManageTabs));
+    navigation.manage_tab = kManageTabs[((index + delta) % count + count) % count];
+    const auto& saved = manage_tabs_[navigation.manage_tab].focus;
+    navigation.focus_key = saved.empty() ? manage_default_focus() : saved;
+    manage_focus_index_ = 0;
+}
+
+// Square and the toolbar's button: check every game that can be picked, or clear them all.
+void Simulation::manage_select_all() {
+    auto& tab = manage_tabs_[state_.navigation.manage_tab];
+    std::vector<GameId> choosable;
+    for (const auto id : manage_list(state_.navigation.manage_tab))
+        if (manage_blocker(state_.navigation.manage_tab, id).empty()) choosable.push_back(id);
+    const bool all = !choosable.empty() && std::all_of(choosable.begin(), choosable.end(),
+                                                       [&tab](GameId id) { return tab.selected.contains(id); });
+    if (all) tab.selected.clear();
+    else tab.selected.insert(choosable.begin(), choosable.end());
+}
+
+// The Uninstall tab's action: the confirmation names the checked games and the space they free.
+void Simulation::ask_manage_uninstall() {
+    const auto& selected = manage_tabs_[ManageTab::Uninstall].selected;
+    if (selected.empty()) return;
+    std::vector<std::string> names;
+    std::uint64_t bytes = 0;
+    bool any_title = false, any_cloud = false, all_steam = true;
+    for (const auto id : manage_list(ManageTab::Uninstall)) {
+        if (!selected.contains(id)) continue;
+        any_cloud = any_cloud || Traits(id.store).cloud_saves;
+        all_steam = all_steam && id.store == Store::kSteam;
+        const auto* game = find_game(state_, id);
+        names.push_back(game && !game->title.empty() ? game->title : "Steam app " + ToKey(id));
+        if (const auto* installation = find_installation(state_, id)) bytes += installation->installed_bytes;
+        const auto runtime_game = state_.runtime_games.find(id);
+        any_title = any_title || (runtime_game != state_.runtime_games.end() && runtime_game->second.has_title);
+    }
+    // "A, B and C", or "A, B, C and 2 more".
+    std::string listed;
+    const auto shown = names.size() > 3 ? std::size_t{3} : names.size();
+    for (std::size_t index = 0; index < shown; ++index)
+        listed += (index == 0 ? "" : index + 1 == shown && names.size() <= 3 ? " and " : ", ") + names[index];
+    if (names.size() > 3) listed += " and " + std::to_string(names.size() - 3) + " more";
+    pending_destructive_action_ = "manage-uninstall";
+    uninstall_delete_saves_ = false;
+    ModalEntry confirmation{"confirmation", "Uninstall " + kept_count(names.size()) + "?", state_.navigation.focus_key,
+                            any_title ? std::vector<std::string>{"cancel", "uninstall-delete-saves", "confirm-destructive"}
+                                      : std::vector<std::string>{"cancel", "confirm-destructive"},
+                            0, true};
+    confirmation.body = listed + ". Frees about " + format_bytes(bytes) + ". ";
+    confirmation.body += any_title ? uninstall_batch_body_kept
+                       : all_steam ? "Their files are removed from this console. You can install them again from Steam."
+                                   : "Their files are removed from this console.";
+    if (any_cloud && state_.cloud_saves_auto)
+        confirmation.body += " Steam Cloud saves are synced first. If that fails for a game, that game stays installed and Queue says why.";
+    else if (any_cloud)
+        confirmation.body += " Automatic Cloud sync is off, so their saves are not synced first.";
+    open_modal(std::move(confirmation));
+}
+
+// Updates stage the changed files beside each game, so every drive needs room for its games' downloads.
+// Steam's estimate counts whole depots: it may ask for more room than the update uses, never less.
+Simulation::ManageUpdates Simulation::manage_updates() const {
+    ManageUpdates result;
+    const auto found = manage_tabs_.find(ManageTab::Updates);
+    if (found == manage_tabs_.end()) return result;
+    std::vector<std::pair<std::string, std::uint64_t>> needed;  // volume id, bytes
+    for (const auto id : manage_list(ManageTab::Updates)) {
+        if (!found->second.selected.contains(id) || !manage_blocker(ManageTab::Updates, id).empty()) continue;
+        const auto* installation = find_installation(state_, id);
+        const auto update = state_.update_check.games.find(id);
+        const std::uint64_t bytes = update == state_.update_check.games.end() ? 0 : update->second.download_bytes;
+        result.games.push_back(id);
+        result.bytes += bytes;
+        auto drive = std::find_if(needed.begin(), needed.end(), [&](const auto& entry) { return entry.first == installation->volume_id; });
+        if (drive == needed.end()) needed.emplace_back(installation->volume_id, bytes);
+        else drive->second += bytes;
+    }
+    // In the drives' order, as the top right lists them.
+    for (const auto& volume : state_.volumes) {
+        const auto drive = std::find_if(needed.begin(), needed.end(), [&](const auto& entry) { return entry.first == volume.id; });
+        const auto free = drive == needed.end() ? std::nullopt : volume_free(volume);
+        // Free space that can't be read is checked by the download itself.
+        if (!free) continue;
+        result.free.emplace_back(volume.label, *free);
+        if (drive->second > *free && result.short_drive.empty()) {
+            result.short_drive = volume.label;
+            result.short_bytes = drive->second - *free;
+        }
+    }
+    return result;
+}
+
+// The Updates tab's action: every checked game that can update now goes to the Queue in the list's order.
+// Steam's estimate counts whole depots, so a drive that looks short only warns: the player may go ahead.
+void Simulation::queue_manage_updates(bool anyway) {
+    const auto plan = manage_updates();
+    if (plan.games.empty()) return;
+    if (!plan.short_drive.empty() && !anyway) {
+        pending_destructive_action_ = "manage-update-anyway";
+        ModalEntry warning{"confirmation", "Update anyway?", state_.navigation.focus_key, {"cancel", "confirm-destructive"}, 0, true};
+        warning.body = "These updates may need " + format_bytes(plan.short_bytes) + " more on " + plan.short_drive +
+                       ". Steam's sizes count whole parts of each game, so an update usually downloads less. An update "
+                       "that runs out of room stops, and its game stays as it was.";
+        open_modal(std::move(warning));
+        return;
+    }
+    if (live() && !queue_fits(plan.games.size())) return;
+    if (live())
+        for (const auto id : plan.games) pending_install_requests_.push_back({InstallRequestKind::Update, id});
+    manage_tabs_[ManageTab::Updates].selected.clear();
+    close_manage_games();
+    const auto* game = plan.games.size() == 1 ? find_game(state_, plan.games.front()) : nullptr;
+    const std::string detail = !live() ? "Fixture: nothing downloads"
+                             : plan.games.size() == 1 ? "Follow it in Queue" : "Follow them in Queue";
+    push_notice({"update-batch", game && !game->title.empty() ? game->title + " update queued"
+                                                              : std::to_string(plan.games.size()) + " updates queued",
+                 "", false, kLiveNoticeSeconds, false, detail});
+}
+
+std::size_t Simulation::queue_room() const {
+    std::size_t used = live_job_states_.size();
+    for (const auto& request : pending_install_requests_)
+        if (request.kind == InstallRequestKind::Install || request.kind == InstallRequestKind::Update ||
+            request.kind == InstallRequestKind::Move)
+            ++used;
+    return used < kQueueJobLimit ? kQueueJobLimit - used : 0;
+}
+
+// A batch goes to the Queue whole or not at all: the games stay checked, and the alert says how many fit.
+bool Simulation::queue_fits(std::size_t count) {
+    const auto room = queue_room();
+    if (count <= room) return true;
+    show_alert("The Queue is full",
+               "The Queue holds " + std::to_string(kQueueJobLimit) + " games at a time" +
+                   (room == 0 ? std::string(". Try again once some finish.")
+                              : " and has room for " + std::to_string(room) + " more. Select fewer games, or try again once some finish."));
+    return false;
+}
+
+std::vector<const Volume*> Simulation::move_volumes() const {
+    std::vector<const Volume*> volumes;
+    for (const auto& volume : state_.volumes)
+        if (volume.available && volume.writable) volumes.push_back(&volume);
+    return volumes;
+}
+
+std::string Simulation::move_blocker(GameId id, const std::string& volume_id) const {
+    const auto* installation = find_installation(state_, id);
+    if (!installation) return "Not installed";
+    auto blocker = installed_blocker(id);
+    if (!blocker.empty()) return blocker;
+    const auto* from = volume_of(state_, installation->volume_id);
+    if (!installation->available || !from || !from->available) return "Drive disconnected";
+    if (installation->volume_id == volume_id) return "Already on " + from->label;
+    return {};
+}
+
+// The Move tab's drive when the screen opens, or when the chosen one goes: the usable drive with the most
+// free space (one whose free space is unknown comes last); ties go to the drives' order.
+void Simulation::choose_manage_move_volume() {
+    const auto volumes = move_volumes();
+    if (std::any_of(volumes.begin(), volumes.end(), [this](const Volume* volume) { return volume->id == manage_move_volume_id_; }))
+        return;
+    const Volume* best = nullptr;
+    std::optional<std::uint64_t> most;
+    for (const auto* volume : volumes) {
+        const auto free = volume_free(*volume);
+        if (!best || (free && (!most || *free > *most))) { best = volume; most = free; }
+    }
+    manage_move_volume_id_ = best ? best->id : std::string();
+}
+
+// The old copy stays until the new one is checked, so the destination needs room for every checked game,
+// with the margin the install service keeps.
+Simulation::ManageMoves Simulation::manage_moves() const {
+    ManageMoves result;
+    const auto found = manage_tabs_.find(ManageTab::Move);
+    if (found == manage_tabs_.end()) return result;
+    for (const auto id : manage_list(ManageTab::Move)) {
+        if (!found->second.selected.contains(id) || !move_blocker(id, manage_move_volume_id_).empty()) continue;
+        result.games.push_back(id);
+        if (const auto* installation = find_installation(state_, id)) result.bytes += installation->installed_bytes;
+    }
+    if (const auto* volume = volume_of(state_, manage_move_volume_id_)) result.free = volume_free(*volume);
+    result.short_of_space = result.free && !result.games.empty() && result.bytes + steam::kInstallSpaceMargin > *result.free;
+    return result;
+}
+
+// The Move tab's action: each checked game becomes its own move job in the Queue, in the list's order, or
+// none does when the destination hasn't room for them all.
+void Simulation::queue_manage_moves() {
+    const auto plan = manage_moves();
+    if (plan.games.empty()) return;
+    const auto* volume = volume_of(state_, manage_move_volume_id_);
+    const std::string label = volume ? volume->label : std::string("the drive");
+    if (plan.short_of_space) {
+        const auto needed = plan.bytes + steam::kInstallSpaceMargin - *plan.free;
+        show_alert("Not enough space on " + label,
+                   "These games need " + format_bytes(needed) + " more on " + label +
+                   ". Select fewer games or free up space, then try again.");
+        return;
+    }
+    if (live() && !queue_fits(plan.games.size())) return;
+    if (live())
+        for (const auto id : plan.games) pending_install_requests_.push_back({InstallRequestKind::Move, id, manage_move_volume_id_});
+    manage_tabs_[ManageTab::Move].selected.clear();
+    close_manage_games();
+    const auto* game = plan.games.size() == 1 ? find_game(state_, plan.games.front()) : nullptr;
+    const std::string detail = !live() ? "Fixture: nothing moves"
+                             : plan.games.size() == 1 ? "Follow it in Queue" : "Follow them in Queue";
+    push_notice({"move-batch", game && !game->title.empty() ? game->title + " move queued"
+                                                            : std::to_string(plan.games.size()) + " moves queued",
+                 "", false, kLiveNoticeSeconds, false, detail});
+}
+
+// The storage picker for a move: from the Move tab it picks the tab's drive; from a game's Maintenance
+// (`game` valid) choosing a drive queues that game's move.
+void Simulation::open_move_picker(GameId game) {
+    move_picker_game_ = game;
+    std::vector<std::string> actions;
+    int focus = -1;
+    for (const auto& volume : state_.volumes) {
+        const int index = static_cast<int>(actions.size());
+        actions.push_back("volume-" + volume.id);
+        if (focus >= 0) continue;
+        if (game.valid() ? move_blocker(game, volume.id).empty() && volume.available && volume.writable
+                         : volume.id == manage_move_volume_id_)
+            focus = index;
+    }
+    actions.push_back("cancel");
+    if (focus < 0) focus = static_cast<int>(actions.size()) - 1;
+    open_modal({"move-storage", "Move to", state_.navigation.focus_key, std::move(actions), focus, false});
+}
+
+void Simulation::choose_move_volume(const std::string& volume_id) {
+    const auto* volume = volume_of(state_, volume_id);
+    if (!volume || !volume->available || !volume->writable) return;
+    const auto game = move_picker_game_;
+    if (!game.valid()) {
+        manage_move_volume_id_ = volume_id;
+        close_modal();
+        state_.navigation.focus_key = "manage-move-to";
+        refresh_manage_games();
+        return;
+    }
+    if (!move_blocker(game, volume_id).empty()) return;
+    const auto* installation = find_installation(state_, game);
+    const auto free = volume_free(*volume);
+    if (installation && free && installation->installed_bytes + steam::kInstallSpaceMargin > *free) return;
+    if (live()) pending_install_requests_.push_back({InstallRequestKind::Move, game, volume_id});
+    // Back on the game's page, where Play says the game is moving.
+    while (!state_.navigation.modals.empty()) close_modal();
+    const auto* known = find_game(state_, game);
+    push_notice({"move-batch", (known && !known->title.empty() ? known->title : std::string("The game")) + " move queued", "",
+                 false, kLiveNoticeSeconds, false, live() ? "Follow it in Queue" : "Fixture: nothing moves"});
+}
+
+// The open screen follows the installs, jobs, runtime and update check: games that are gone or can't be
+// picked now leave the selections, and games new on Updates are checked.
+void Simulation::refresh_manage_games() {
+    if (state_.navigation.route != Route::ManageGames) return;
+    // A drive that went or became read-only is no longer the Move tab's destination.
+    choose_manage_move_volume();
+    for (const auto tab : kManageTabs) {
+        auto& state = manage_tabs_[tab];
+        const auto games = manage_list(tab);
+        const std::set<GameId> listed(games.begin(), games.end());
+        if (tab == ManageTab::Updates)
+            for (const auto id : games)
+                if (state.listed.insert(id).second) state.selected.insert(id);
+        std::erase_if(state.selected, [&](GameId id) { return !listed.contains(id) || !manage_blocker(tab, id).empty(); });
+    }
+}
+
+// Up and Down go from the toolbar to the games and the footer button; Left and Right move along the
+// toolbar. Up from the footer returns to the game the focus left.
+bool Simulation::move_manage(int delta_x, int delta_y) {
+    std::vector<int> toolbar, games;
+    int footer = -1;
+    for (int index = 0; index < static_cast<int>(view_.rows.size()); ++index) {
+        const int part = manage_part(view_.rows[static_cast<std::size_t>(index)]);
+        if (part == 0) toolbar.push_back(index);
+        else if (part == 1) games.push_back(index);
+        else if (part == 2) footer = index;
+    }
+    const int current = view_.focused_row;
+    const int part = current >= 0 && current < static_cast<int>(view_.rows.size())
+        ? manage_part(view_.rows[static_cast<std::size_t>(current)]) : -1;
+    auto& tab = manage_tabs_[state_.navigation.manage_tab];
     int target = current;
-    if (part == 2) {
-        if (delta_x != 0) target = std::clamp(current + (delta_x > 0 ? 1 : -1), first_footer, static_cast<int>(keys.size()) - 1);
-        else if (delta_y < 0 && first_footer > 0) {
-            const auto back = std::find(keys.begin(), keys.end(), installed_list_focus_);
-            target = back != keys.end() ? static_cast<int>(back - keys.begin()) : first_footer - 1;
+    if (part == 0) {
+        const auto at = static_cast<int>(std::find(toolbar.begin(), toolbar.end(), current) - toolbar.begin());
+        if (delta_x != 0) target = toolbar[static_cast<std::size_t>(std::clamp(at + (delta_x > 0 ? 1 : -1), 0, static_cast<int>(toolbar.size()) - 1))];
+        else if (delta_y > 0) target = !games.empty() ? games.front() : footer >= 0 ? footer : current;
+    } else if (part == 1 && delta_y != 0) {
+        const int at = static_cast<int>(std::find(games.begin(), games.end(), current) - games.begin());
+        const int last = static_cast<int>(games.size()) - 1;
+        int next = at + delta_y;
+        if (next > last) {
+            if (at == last && footer >= 0) { tab.list_focus = view_.rows[static_cast<std::size_t>(current)].key; target = footer; }
+            else target = games.back();
+        } else if (next < 0) {
+            target = at == 0 && !toolbar.empty() ? toolbar.front() : games.front();
+        } else {
+            target = games[static_cast<std::size_t>(next)];
         }
-    } else if (delta_y != 0) {
-        target = current + delta_y;
-        if (target >= first_footer) {
-            installed_list_focus_ = keys[static_cast<std::size_t>(current)];
-            target = current == first_footer - 1 ? first_footer : first_footer - 1;
-        }
-        target = std::clamp(target, 0, static_cast<int>(keys.size()) - 1);
+    } else if (part == 2 && delta_y < 0) {
+        const auto back = std::find_if(games.begin(), games.end(), [&](int index) {
+            return view_.rows[static_cast<std::size_t>(index)].key == tab.list_focus;
+        });
+        const auto fallback = std::find_if(toolbar.begin(), toolbar.end(), [&](int index) {
+            return view_.rows[static_cast<std::size_t>(index)].key == manage_default_focus();
+        });
+        target = back != games.end() ? *back : !games.empty() ? games.back() : fallback != toolbar.end() ? *fallback : current;
     }
-    modal.focused_action = target;
-    state_.navigation.focus_key = keys[static_cast<std::size_t>(target)];
+    if (target >= 0 && target < static_cast<int>(view_.rows.size())) {
+        state_.navigation.selected_index = target;
+        state_.navigation.focus_key = view_.rows[static_cast<std::size_t>(target)].key;
+    }
+    return true;
 }
 
-// The open Installed games list follows the installs, jobs and runtime: games that are gone or
-// can't be picked now leave the selection, and with no game left the list closes.
-void Simulation::refresh_installed_manager() {
-    std::erase_if(installed_selected_, [this](GameId id) { return !find_installation(state_, id) || !installed_blocker(id).empty(); });
-    auto& modals = state_.navigation.modals;
-    for (std::size_t index = 0; index < modals.size(); ++index) {
-        auto& modal = modals[index];
-        if (modal.id != "installed-games") continue;
-        auto actions = installed_manager_actions();
-        if (actions.size() == 4) {
-            if (index + 1 == modals.size()) close_modal();
-            break;
-        }
-        const auto focused = modal.action_keys[static_cast<std::size_t>(modal.focused_action)];
-        modal.action_keys = std::move(actions);
-        const auto found = std::find(modal.action_keys.begin(), modal.action_keys.end(), focused);
-        if (found != modal.action_keys.end()) {
-            modal.focused_action = static_cast<int>(found - modal.action_keys.begin());
-        } else {
-            // The focused game went away: the nearest game left takes the focus, else Close.
-            int first = -1, last = -1;
-            for (int key = 0; key < static_cast<int>(modal.action_keys.size()); ++key)
-                if (installed_part(modal.action_keys[static_cast<std::size_t>(key)]) == 1) { if (first < 0) first = key; last = key; }
-            const auto close = std::find(modal.action_keys.begin(), modal.action_keys.end(), "installed-close");
-            modal.focused_action = first >= 0 ? std::clamp(modal.focused_action, first, last)
-                                              : static_cast<int>(close - modal.action_keys.begin());
-        }
-        if (index + 1 == modals.size()) state_.navigation.focus_key = modal.action_keys[static_cast<std::size_t>(modal.focused_action)];
+// Manage installed games, fullscreen: the tabs, each drive's free space, the tab's toolbar, its games and
+// the footer with the selection and the tab's one action.
+void Simulation::build_manage_games_view() {
+    refresh_manage_games();
+    const auto current = state_.navigation.manage_tab;
+    const bool updates = current == ManageTab::Updates;
+    const bool moves = current == ManageTab::Move;
+    auto& tab = manage_tabs_[current];
+    const auto& check = state_.update_check;
+    const auto now = state_.clock_ticks;
+    auto row = [this](std::string key, RowKind kind, std::string title, std::string action) -> ViewRow& {
+        view_.rows.push_back({});
+        auto& result = view_.rows.back();
+        result.key = std::move(key); result.kind = kind; result.title = std::move(title); result.action = std::move(action);
+        return result;
+    };
+    for (const auto shown : kManageTabs) {
+        ViewRow item;
+        item.key = shown == ManageTab::Updates ? "manage-tab-updates" : shown == ManageTab::Move ? "manage-tab-move" : "manage-tab-uninstall";
+        item.title = shown == ManageTab::Updates ? "Updates" : shown == ManageTab::Move ? "Move" : "Uninstall";
+        item.selected = shown == current;
+        if (shown == ManageTab::Updates)
+            if (const auto count = manage_list(shown).size(); count > 0) item.value = std::to_string(count);
+        view_.tabs.push_back(std::move(item));
     }
+    for (const auto& volume : state_.volumes)
+        if (const auto free = volume.writable ? volume_free(volume) : std::nullopt)
+            view_.aside += (view_.aside.empty() ? "" : " · ") + volume.label + " " + (*free ? format_bytes(*free) : "0 GB") + " free";
+
+    const auto games = manage_list(current);
+    view_.title = updates ? "Update games" : moves ? "Move games" : "Uninstall games";
+    const auto* destination = moves ? volume_of(state_, manage_move_volume_id_) : nullptr;
+    if (moves) {
+        view_.subtitle = "Saves, settings and the PS5 title go with the game · it can't be played while it moves";
+    } else if (!updates) {
+        view_.subtitle = !manage_message_.empty() ? manage_message_ : "Saves and settings are kept · free up space on your drives";
+    } else if (check.checking) {
+        view_.subtitle = check.total > 0 ? "Checking Steam · " + std::to_string(std::min(check.answered, check.total)) + " of " +
+                                               std::to_string(check.total)
+                                         : "Checking Steam…";
+    } else if (check.failed) {
+        const auto when = check.checked_at > 0 ? time_ago(now, check.checked_at) : std::string();
+        view_.subtitle = "Couldn't check Steam" + (when.empty() ? std::string() : " · last checked " + when);
+    } else if (check.checked_at > 0) {
+        const auto when = time_ago(now, check.checked_at);
+        view_.subtitle = (when.empty() ? std::string("Checked") : "Checked " + when) + " · only games with an update or new DLC";
+    } else {
+        view_.subtitle = "Not checked yet";
+    }
+
+    std::size_t choosable = 0, chosen = 0;
+    for (const auto id : games)
+        if (manage_blocker(current, id).empty()) {
+            ++choosable;
+            chosen += tab.selected.contains(id) ? 1 : 0;
+        }
+    const std::string select_title = choosable > 0 && chosen == choosable ? "Clear selection" : "Select all";
+    if (moves) {
+        // Only the destination is chosen: each game moves from the drive it is on.
+        auto& move_to = row("manage-move-to", RowKind::Action, "Move to", "manage-move-to");
+        move_to.enabled = move_volumes().size() >= 2;
+        move_to.value = !move_to.enabled ? "No other drive" : destination ? destination->label : "No drive";
+    }
+    row("manage-select-all", RowKind::Action, select_title, "manage-select-all").enabled = choosable > 0;
+    auto& sort = row("manage-sort", RowKind::Action, "Sort", "manage-sort");
+    sort.value = tab.by_played ? "Last played" : updates ? "Download size" : "Size";
+    if (updates) {
+        auto& button = row("manage-check", RowKind::Action, check.checking ? "Checking…" : "Check for updates", "manage-check");
+        button.enabled = !check.checking;
+        button.selected = check.checking;
+        if (check.checking && check.total > 0)
+            button.progress = std::clamp(static_cast<float>(check.answered) / static_cast<float>(check.total), 0.0F, 1.0F);
+    }
+
+    std::uint64_t bytes = 0;
+    for (const auto id : games) {
+        const auto* game = find_game(state_, id);
+        const auto* installation = find_installation(state_, id);
+        const auto update = updates ? check.games.find(id) : check.games.end();
+        auto& item = row("manage-toggle-" + ToKey(id), RowKind::Toggle,
+                         game && !game->title.empty() ? game->title : "Steam app " + ToKey(id), "manage-toggle-" + ToKey(id));
+        item.game_id = id;
+        item.selected = tab.selected.contains(id);
+        const std::uint64_t size = update != check.games.end() ? update->second.download_bytes
+                                   : installation ? installation->installed_bytes : 0;
+        item.value = size > 0 ? format_bytes(size) : updates ? "Unknown" : std::string();
+        if (item.selected) bytes += size;
+        // The last-played column.
+        const auto runtime = state_.runtime_games.find(id);
+        const bool playing = runtime != state_.runtime_games.end() &&
+                             (runtime->second.activity == TitleActivity::Running || runtime->second.play_status == "Playing");
+        const auto when = game && game->last_played ? time_ago(now, *game->last_played) : std::string();
+        item.badge = playing ? "Playing now" : !game || !game->last_played ? "Never" : when.empty() ? "Played" : when;
+        const auto blocker = manage_blocker(current, id);
+        if (!blocker.empty()) {
+            item.subtitle = blocker != "Playing" ? blocker
+                          : updates ? "Playing: close it to update" : moves ? "Playing: close it to move" : "Playing: close it to uninstall";
+            item.enabled = false;
+        } else if (const auto* stopped = updates || moves ? nullptr : uninstall_stop(id)) {
+            // Its uninstall stopped: the reason stays until it goes again or is dismissed in Queue.
+            item.subtitle = "Stopped: " + stopped->stopped;
+            item.tone = "problem";
+        } else if (update != check.games.end()) {
+            const auto& found = update->second;
+            item.subtitle = std::string(found.newer && found.new_dlc ? "Update and new DLC" : found.new_dlc ? "New DLC" : "Update") +
+                            (installation && installation->installed_bytes ? " · " + format_bytes(installation->installed_bytes) + " installed" : "");
+            item.tone = "update";
+        } else if (installation) {
+            const auto volume = std::find_if(state_.volumes.begin(), state_.volumes.end(),
+                                             [&](const Volume& candidate) { return candidate.id == installation->volume_id; });
+            item.subtitle = volume != state_.volumes.end() ? volume->label : std::string();
+        }
+    }
+    if (updates && check.checking) {
+        row("manage-more", RowKind::Status, "More games show up here as Steam answers.", "").enabled = false;
+    } else if (games.empty()) {
+        auto& empty = row("manage-empty", RowKind::Status, "", "");
+        empty.enabled = false;
+        if (moves && move_volumes().size() < 2) {
+            // Moving needs a second drive; the tab stays so L1/R1 always go round the same tabs.
+            empty.title = "Only one drive";
+            empty.subtitle = "Connect a USB drive or an M.2 SSD to move games between drives.";
+        } else if (moves) {
+            empty.title = "Nothing to move";
+            empty.subtitle = "Games installed from Steam can move here. Imported games use Copy or Move into Playden.";
+        } else if (!updates) {
+            empty.title = "Nothing installed";
+        } else if (check.failed) {
+            empty.title = "Couldn't check";
+            empty.subtitle = "Steam didn't answer. Check for updates to try again.";
+        } else if (check.checked_at == 0) {
+            empty.title = "Not checked";
+            empty.subtitle = "Check for updates to ask Steam about your installed games.";
+        } else {
+            empty.title = "Up to date";
+            empty.subtitle = "Every installed game is up to date.";
+        }
+    }
+
+    const auto count = tab.selected.size();
+    auto& primary = row("manage-primary", RowKind::Action,
+                        std::string(updates ? "Update" : moves ? "Move" : "Uninstall") +
+                            (count > 0 ? " " + std::to_string(count) : std::string()),
+                        updates ? "manage-update" : moves ? "manage-move" : "manage-uninstall");
+    primary.enabled = count > 0;
+    primary.dangerous = !updates && !moves;
+    if (count == 0) {
+        view_.footer = updates ? "Select games to update" : moves ? "Select games to move" : "Select games to uninstall";
+    } else if (moves) {
+        // "2 selected · 99.1 GB to USB Drive · 311 GB free after", or what more the drive needs.
+        const auto plan = manage_moves();
+        const std::string label = destination ? destination->label : std::string("the drive");
+        view_.footer = std::to_string(count) + " selected · " + format_bytes(plan.bytes) + " to " + label;
+        if (plan.short_of_space)
+            view_.footer += " · " + format_bytes(plan.bytes + steam::kInstallSpaceMargin - *plan.free) + " more needed on " + label;
+        else if (plan.free)
+            view_.footer += " · " + (*plan.free > plan.bytes ? format_bytes(*plan.free - plan.bytes) : std::string("0 GB")) + " free after";
+    } else if (!updates) {
+        view_.footer = std::to_string(count) + " selected · frees " + format_bytes(bytes);
+    } else {
+        view_.footer = std::to_string(count) + " selected · " + (bytes ? format_bytes(bytes) : std::string("Size unknown")) + " to download";
+        // Each drive's free space, or the drive that may lack room for its games: Update warns when pressed.
+        const auto plan = manage_updates();
+        if (!plan.short_drive.empty()) {
+            view_.footer += " · may need " + format_bytes(plan.short_bytes) + " more on " + plan.short_drive;
+        } else {
+            std::string free_words;
+            for (const auto& [label, free] : plan.free)
+                free_words += (free_words.empty() ? " · " : ", ") + (free ? format_bytes(free) : std::string("0 GB")) + " free on " + label;
+            view_.footer += free_words;
+        }
+    }
+    view_.legends = {"Cross Select", "Square " + select_title,
+                     updates ? "Triangle Update selected" : moves ? "Triangle Move selected" : "Triangle Uninstall selected",
+                     "L1/R1 Switch tab", "Circle Close"};
 }
 
 std::vector<GameId> Simulation::TakeKeptDeleteRequests() {
@@ -1605,8 +2147,23 @@ void Simulation::NotifyUninstallStopped(GameId id, const std::string& reason) {
     rebuild_view();
 }
 
+void Simulation::NotifyMoveRefused(GameId id, const std::string& reason) {
+    const auto* game = find_game(state_, id);
+    push_notice({"move-" + ToKey(id), "Can't move", "", false, kLiveNoticeSeconds * 2, true,
+                 (game ? game->title : std::string("A game")) + " · " + reason, false});
+    rebuild_view();
+}
+
+void Simulation::NotifyUpdateRefused(GameId id, const std::string& reason) {
+    const auto* game = find_game(state_, id);
+    push_notice({"update-" + ToKey(id), "Can't update", "", false, kLiveNoticeSeconds * 2, true,
+                 (game ? game->title : std::string("A game")) + " · " + reason, false});
+    rebuild_view();
+}
+
 void Simulation::NotifyUninstallFinished(GameId id) {
     end_uninstall(id, {});
+    set_saved_update(id, {});
     batch_uninstalls_.erase(id);
     rebuild_view();
 }
@@ -2029,7 +2586,7 @@ void Simulation::UpdateRuntime(RuntimeState runtime, const std::vector<LiveRunti
     }
     show_ready_prompt();
     open_settings_after_prepare();
-    refresh_installed_manager();
+    refresh_manage_games();
     rebuild_view();
 }
 
@@ -2148,20 +2705,34 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
         };
         for (const auto& [id, previous] : live_job_states_) {
             if (job_states.contains(id) || !installed_ids.contains(id)) continue;
+            if (live_move_jobs_.contains(id)) {
+                // Canceled, the game stays where it was; moved, it is on its new drive.
+                const auto game = std::find_if(installed.begin(), installed.end(), [id](const LiveInstalledGame& value) {
+                    return value.game_id == id;
+                });
+                const auto moving = std::find_if(state_.jobs.begin(), state_.jobs.end(), [id](const Job& job) {
+                    return job.game_id == id && job.move;
+                });
+                if (game != installed.end() && moving != state_.jobs.end() && game->volume_id == moving->volume_id)
+                    push_notice({"install-" + ToKey(id), "Move complete", "", false, kLiveNoticeSeconds, false, title(id)});
+                continue;
+            }
             const bool update = live_update_jobs_.contains(id);
             if (update && canceled_updates_.erase(id)) continue;
             push_notice({"install-" + ToKey(id), update ? "Update complete" : "Download complete", "", false, kLiveNoticeSeconds,
                          false, title(id)});
             // What Steam said about the update is answered: the details page asks again.
-            if (update)
+            if (update) {
                 if (auto* game = const_cast<Game*>(find_game(state_, id))) game->update = {};
+                set_saved_update(id, {});
+            }
         }
         for (const auto& job : jobs) {
             const auto previous = live_job_states_.find(job.game_id);
             if (job.state != JobState::Failed || (previous != live_job_states_.end() && previous->second == JobState::Failed)) continue;
             // The queue carries on with the next game and Downloads keeps the failure with Resume, so the
             // player is told in a corner instead of a dialog that stops what they are doing.
-            push_notice({"install-" + ToKey(job.game_id), job.update ? "Update failed" : "Download failed", "", false,
+            push_notice({"install-" + ToKey(job.game_id), job.move ? "Move failed" : job.update ? "Update failed" : "Download failed", "", false,
                          kLiveNoticeSeconds * 2, true,
                          title(job.game_id) + (job.failure.empty() ? std::string() : " · " + job.failure), false});
         }
@@ -2172,12 +2743,20 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
             push_notice({"install-" + ToKey(id), "Game uninstalled", "", false, kLiveNoticeSeconds, false, title(id)});
         }
     }
+    // An uninstalled game leaves the update list.
+    if (live_installs_seen_)
+        for (const auto& id : live_installed_ids_)
+            if (!installed_ids.contains(id) && !job_states.contains(id)) set_saved_update(id, {});
     for (auto it = pending_uninstalls_.begin(); it != pending_uninstalls_.end();)
         it = installed_ids.contains(*it) ? std::next(it) : pending_uninstalls_.erase(it);
     live_installs_seen_ = true;
     live_job_states_ = std::move(job_states);
     live_update_jobs_.clear();
-    for (const auto& job : jobs) if (job.update) live_update_jobs_.insert(job.game_id);
+    live_move_jobs_.clear();
+    for (const auto& job : jobs) {
+        if (job.update) live_update_jobs_.insert(job.game_id);
+        if (job.move) live_move_jobs_.insert(job.game_id);
+    }
     std::erase_if(canceled_updates_, [this](GameId id) { return !live_update_jobs_.contains(id); });
     live_installed_ids_ = std::move(installed_ids);
     std::vector<Job> projected;
@@ -2207,6 +2786,22 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
             if (live_job.state == JobState::Downloading && live_job.checking_files) job.state_text = "Checking files";
             else if (live_job.state == JobState::Downloading && live_job.applying) job.state_text = "Applying";
         }
+        // A move reads "Moving to <drive> · <step>" while it runs.
+        job.move = live_job.move;
+        job.from_volume_id = live_job.from_volume_id;
+        if (live_job.move) {
+            const auto* to = find_volume(state_, live_job.volume_id);
+            job.stage_text = "Moving to " + (to ? to->label : std::string("another drive"));
+            if (live_job.state == JobState::Downloading) {
+                using Step = LiveInstallJob::MoveStep;
+                switch (live_job.move_step) {
+                case Step::Copying: job.state_text = "Copying"; break;
+                case Step::Verifying: job.state_text = "Checking the copy"; break;
+                case Step::Switching: job.state_text = "Switching to the copy"; break;
+                case Step::DeletingOld: job.state_text = "Deleting the old copy"; break;
+                }
+            }
+        }
         projected.push_back(std::move(job));
     }
     // Finished downloads follow the queue, newest first, until the player dismisses them.
@@ -2228,12 +2823,16 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
     std::vector<Installation> installations;
     for (const auto& game : installed)
         installations.push_back({game.game_id, game.volume_id, game.install_bytes, game.available,
-                                 state_.runtime_games.count(game.game_id) && state_.runtime_games.at(game.game_id).ready, false});
+                                 state_.runtime_games.count(game.game_id) && state_.runtime_games.at(game.game_id).ready, false,
+                                 game.finished_at});
     state_.jobs = std::move(projected);
     sync_self_update_job();
     state_.installations = std::move(installations);
     apply_live_volume_usage();
-    refresh_installed_manager();
+    refresh_manage_games();
+    // With nothing installed the screen has nothing to manage: back to where it was opened.
+    if (state_.navigation.route == Route::ManageGames && state_.installations.empty() && state_.navigation.modals.empty())
+        close_manage_games();
     rebuild_view();
 }
 
@@ -2453,6 +3052,9 @@ void Simulation::UpdateAccount(AccountUpdate update) {
     } else if (update.authentication == AuthState::Failed && update.restoring && beyond_steam()) {
         // Another store's games are there to play: a Steam restore that failed doesn't take the screen.
         if (state_.navigation.route == Route::Startup || state_.navigation.route == Route::SignIn) leave_steam_sign_in();
+    } else if (update.authentication == AuthState::Failed && state_.navigation.route == Route::ManageGames &&
+               manage_return_route_ == Route::SignIn) {
+        // The storage-full sign-in opened Manage installed games: a retry that fails again leaves it open.
     } else if (update.authentication == AuthState::Waiting || update.authentication == AuthState::Expired || update.authentication == AuthState::Failed) {
         state_.navigation.route = Route::SignIn;
         auto& form = state_.sign_in;
@@ -2632,13 +3234,24 @@ Simulation::UpdateCheck Simulation::update_check(GameId id) const {
 }
 
 bool Simulation::update_locked(GameId id) const {
-    return std::any_of(state_.jobs.begin(), state_.jobs.end(), [id](const Job& job) { return job.game_id == id && job.locked; });
+    return std::any_of(state_.jobs.begin(), state_.jobs.end(), [id](const Job& job) {
+        return job.game_id == id && (job.locked || (job.move && job.state == JobState::Downloading));
+    });
 }
+
+namespace {
+// What Play says while the game's update or move holds it.
+std::string held_play_text(const State& state, GameId id) {
+    const bool move = std::any_of(state.jobs.begin(), state.jobs.end(), [id](const Job& job) { return job.game_id == id && job.move; });
+    return move ? "Moving…" : "Finishing the update…";
+}
+}  // namespace
 
 bool Simulation::UpdateAppDetails(GameId id, std::optional<std::uint64_t> download_bytes,
                                   std::optional<std::uint64_t> install_bytes,
                                   std::optional<bool> windows_installable, std::vector<std::string> languages,
-                                  std::uint32_t dlc_count, std::vector<GameVersion> versions, GameUpdate update) {
+                                  std::uint32_t dlc_count, std::vector<GameVersion> versions, GameUpdate update,
+                                  bool updates_known) {
     if (!live()) return false;
     // New details may name other files (a newer build): the game's exact sizes are checked again.
     const auto of_game = [id](const auto& key) { return std::get<0>(key) == id; };
@@ -2647,6 +3260,9 @@ bool Simulation::UpdateAppDetails(GameId id, std::optional<std::uint64_t> downlo
     std::erase_if(measured_sizes_, [id](const auto& entry) { return std::get<0>(entry.first) == id; });
     const auto game = std::find_if(state_.games.begin(), state_.games.end(),
                                    [id](const Game& candidate) { return candidate.id == id; });
+    // An installed game's update, from its page or the check, is what the update list saves. Before the
+    // licenses are read every game answers "no update": that would empty the list.
+    if (updates_known) set_saved_update(id, update);
     if (game == state_.games.end()) return false;
     game->download_bytes = download_bytes;
     game->install_bytes = install_bytes;
@@ -3249,6 +3865,116 @@ void Simulation::OrganizationSaveResult(std::uint64_t account, std::uint64_t rev
     rebuild_view();
 }
 
+void Simulation::BeginUpdateCheckLoad(std::uint64_t account) {
+    if (!live() || account == update_check_account_) return;
+    ResetUpdateCheck();
+    update_check_account_ = account;
+}
+
+void Simulation::ApplyUpdateCheck(std::uint64_t account, std::optional<playden::SavedUpdateCheck> saved) {
+    if (!live() || account == 0 || account != update_check_account_ || state_.update_check.loaded) return;
+    auto& check = state_.update_check;
+    check.loaded = true;
+    if (saved) {
+        check.checked_at = saved->checked_at;
+        for (const auto& [id, game] : saved->games) check.games[id] = {game.newer, game.new_dlc, game.download_bytes};
+    }
+    update_check_saved_revision_ = update_check_revision_;
+    // Pages opened before the file was read answered for now: they win.
+    for (const auto& [id, update] : std::exchange(update_check_early_, {})) set_saved_update(id, update);
+    if (const auto waiting = std::exchange(update_check_waiting_, std::nullopt)) request_update_check(*waiting);
+    rebuild_view();
+}
+
+void Simulation::ResetUpdateCheck() {
+    update_check_account_ = 0;
+    state_.update_check = {};
+    update_check_requested_ = false;
+    update_check_waiting_.reset();
+    update_check_early_.clear();
+    update_check_saved_revision_ = update_check_revision_;
+}
+
+bool Simulation::UpdateCheckDirty() const noexcept {
+    return update_check_account_ != 0 && state_.update_check.loaded && update_check_revision_ > update_check_saved_revision_;
+}
+
+playden::SavedUpdateCheck Simulation::ExportUpdateCheck() const {
+    playden::SavedUpdateCheck saved;
+    saved.checked_at = state_.update_check.checked_at;
+    for (const auto& [id, update] : state_.update_check.games)
+        saved.games[id] = {update.newer, update.new_dlc, update.download_bytes};
+    return saved;
+}
+
+void Simulation::UpdateCheckSaveResult(std::uint64_t account, std::uint64_t revision, playden::StorageError error) {
+    if (!live() || account != update_check_account_ || error != playden::StorageError::kNone) return;
+    update_check_saved_revision_ = std::max(update_check_saved_revision_, std::min(revision, update_check_revision_));
+}
+
+bool Simulation::TakeUpdateCheckRequest() { return std::exchange(update_check_requested_, false); }
+
+void Simulation::UpdateCheckProgress(std::size_t asked, std::size_t answered, std::size_t total) {
+    auto& check = state_.update_check;
+    if (!live() || !check.checking) return;
+    if (check.asked == asked && check.answered == answered && check.total == total) return;
+    check.asked = asked;
+    check.answered = answered;
+    check.total = total;
+    rebuild_view();
+}
+
+void Simulation::FinishUpdateCheck(bool failed) {
+    auto& check = state_.update_check;
+    if (!live() || !check.checking) return;
+    check.checking = false;
+    check.failed = failed;
+    // Only a check that reached every game moves the day on; a failed one leaves the saved results.
+    if (!failed && state_.clock_ticks > 0) {
+        check.checked_at = state_.clock_ticks;
+        ++update_check_revision_;
+    }
+    rebuild_view();
+}
+
+void Simulation::request_update_check(bool forced) {
+    if (!live() || update_check_account_ == 0) return;
+    auto& check = state_.update_check;
+    if (check.checking || update_check_requested_) return;
+    if (!check.loaded) {
+        update_check_waiting_ = forced || update_check_waiting_.value_or(false);
+        return;
+    }
+    if (!forced) {
+        const auto now = state_.clock_ticks;
+        if (now <= 0) return;  // no wall clock yet: the day can't be told
+        // A check saved "in the future" (the clock was set back) counts as old.
+        if (check.checked_at > 0 && now >= check.checked_at && now - check.checked_at < kUpdateCheckInterval) return;
+    }
+    update_check_requested_ = true;
+    check.checking = true;
+    check.failed = false;
+    check.asked = check.answered = check.total = 0;
+    rebuild_view();
+}
+
+void Simulation::set_saved_update(GameId id, const GameUpdate& update) {
+    if (!live() || !id.steam_app()) return;
+    if (!state_.update_check.loaded) {
+        if (update_check_account_) update_check_early_[id] = update;
+        return;
+    }
+    auto& games = state_.update_check.games;
+    if (update.available()) {
+        const auto found = games.find(id);
+        if (found != games.end() && found->second == update) return;
+        games[id] = update;
+    } else if (!games.erase(id)) {
+        return;
+    }
+    ++update_check_revision_;
+}
+
 void Simulation::PreferencesSaveResult(std::uint64_t revision, playden::StorageError error) {
     if (!live() || revision > preferences_revision_) return;
     if (error == playden::StorageError::kNone) {
@@ -3820,6 +4546,96 @@ bool Simulation::scenario(const std::string& name) {
             state_.cloud[state_.games[6 % state_.games.size()].id].queued = true;
             state_.navigation.focus_key = "saves-sync-all";
         }
+    } else if (name.rfind("manage-", 0) == 0) {
+        // Manage installed games as in its mockup: Updates found, checking, or empty (up to date, never checked,
+        // Steam unreachable), the updates without room on the console's drive, the Move tab to the USB drive
+        // (with and without room), the Uninstall tab with a game running, and the Settings rows that open it.
+        static const std::set<std::string> known = {"manage-updates", "manage-updates-checking", "manage-uninstall",
+                                                    "manage-updates-current", "manage-updates-unchecked", "manage-updates-failed",
+                                                    "manage-updates-no-room", "manage-settings", "manage-move",
+                                                    "manage-move-no-room"};
+        if (!known.contains(name) || state_.games.size() < 6) return false;
+        manage_fixture_ = true;
+        state_.account().authentication = AuthState::SignedIn;
+        state_.navigation.modals.clear();
+        state_.navigation.route = Route::Settings;
+        state_.navigation.focus_key = "settings-storage";
+        state_.clock_ticks = 1'800'000'000;
+        const std::int64_t now = state_.clock_ticks;
+        constexpr std::int64_t day = 86'400;
+        state_.jobs.clear();
+        state_.runtime_games.clear();
+        state_.installations.clear();
+        state_.update_check = {};
+        state_.update_check.loaded = true;
+        struct Seed { std::uint64_t bytes; const char* volume; std::int64_t played; std::uint64_t download; bool newer; bool dlc; };
+        const std::vector<Seed> seeds = {
+            {71'300'000'000, "internal", now - 2 * day, 2'100'000'000, true, false},
+            {27'800'000'000, "internal", now - 14 * day, 0, false, false},
+            {11'800'000'000, "external", now - 120 * day, 0, false, false},
+            {7'600'000'000, "internal", now - 3600, 0, false, false},
+            {3'900'000'000, "internal", now - 5 * day, 120'000'000, false, true},
+            {1'000'000'000, "external", 0, 48'000'000, true, false},
+        };
+        for (std::size_t index = 0; index < seeds.size(); ++index) {
+            auto& game = state_.games[index];
+            const auto& seed = seeds[index];
+            state_.installations.push_back({game.id, seed.volume, seed.bytes, true, true, true});
+            game.last_played = seed.played > 0 ? std::optional<std::int64_t>(seed.played) : std::nullopt;
+            if (seed.download > 0) state_.update_check.games[game.id] = {seed.newer, seed.dlc, seed.download};
+        }
+        // The fourth game is running: it can't be uninstalled now.
+        LiveRuntimeGame running;
+        running.game_id = state_.games[3].id;
+        running.status = "Ready";
+        running.ready = true;
+        running.play_status = "Playing";
+        state_.runtime_games[running.game_id] = running;
+        state_.update_check.checked_at = now - 2 * 3600;
+        // 82 GB free on the console's drive as in the mockup, or 1 GB: short of its games' 2.2 GB of updates.
+        if (auto* volume = find_volume(state_, "internal"); volume && volume->capacity_bytes > 82'000'000'000) {
+            volume->used_bytes = volume->capacity_bytes - (name == "manage-updates-no-room" ? 1'000'000'000 : 82'000'000'000);
+            volume->reserved_bytes = 0;
+        }
+        if (name == "manage-updates-checking") {
+            // Two games have answered so far.
+            state_.update_check.games.erase(state_.games[5].id);
+            state_.update_check.checking = true;
+            state_.update_check.asked = 32;
+            state_.update_check.answered = 24;
+            state_.update_check.total = 40;
+        } else if (name == "manage-updates-current") {
+            state_.update_check.games.clear();
+        } else if (name == "manage-updates-unchecked") {
+            state_.update_check.games.clear();
+            state_.update_check.checked_at = 0;
+        } else if (name == "manage-updates-failed") {
+            state_.update_check.games.clear();
+            state_.update_check.checked_at = 0;
+            state_.update_check.failed = true;
+        }
+        // Settings with both ways in: Storage's Manage installed games and Updates' Game updates.
+        if (name == "manage-settings") {
+            state_.navigation.focus_key = "settings-game-updates";
+        } else {
+            open_manage_games(name == "manage-uninstall" ? ManageTab::Uninstall
+                              : name.rfind("manage-move", 0) == 0 ? ManageTab::Move : ManageTab::Updates);
+            refresh_manage_games();
+        }
+        if (name.rfind("manage-move", 0) == 0) {
+            // To the USB drive with 410 GB free, or 50 GB: short of the two checked games.
+            if (auto* volume = find_volume(state_, "external"); volume && volume->capacity_bytes > 410'000'000'000) {
+                volume->used_bytes = volume->capacity_bytes - (name == "manage-move-no-room" ? 50'000'000'000 : 410'000'000'000);
+                volume->reserved_bytes = 0;
+            }
+            manage_move_volume_id_ = "external";
+            manage_tabs_[ManageTab::Move].selected = {state_.games[0].id, state_.games[1].id};
+            state_.navigation.focus_key = "manage-toggle-" + ToKey(state_.games[1].id);
+        }
+        if (name == "manage-uninstall") {
+            manage_tabs_[ManageTab::Uninstall].selected = {state_.games[1].id, state_.games[2].id};
+            state_.navigation.focus_key = "manage-toggle-" + ToKey(state_.games[2].id);
+        }
     } else if (name.rfind("queue-", 0) == 0) {
         // Queue in the states of its mockup: each workflow empty, one game, or one running and three waiting,
         // with or without finished entries.
@@ -4006,6 +4822,36 @@ bool Simulation::scenario(const std::string& name) {
         update(GameId::Steam(900001), 0, JobState::Downloading, 1'240'000'000, 1'240'000'000, "Applying", true);
         update(GameId::Steam(900002), 1, JobState::Queued, 312'000'000, 0, "", false);
         update(GameId::Steam(900003), 2, JobState::Paused, 2'100'000'000, 640'000'000, "", false);
+        state_.navigation.focus_key = "queue-downloads";
+    } else if (name == "moving") {
+        // Queue with moves to another drive: one copying (Play waits for it), one switching its title to the copy
+        // (it must finish), one queued.
+        state_.account().authentication = AuthState::SignedIn;
+        state_.navigation.route = Route::Downloads;
+        state_.navigation.modals.clear();
+        state_.jobs.clear();
+        const auto* to = find_volume(state_, "external");
+        const auto move = [&](GameId id, int order, JobState job_state, std::uint64_t total, std::uint64_t done,
+                              std::string step, bool locked) {
+            Job item;
+            item.id = "move-" + ToKey(id);
+            item.game_id = id;
+            item.queue_order = order;
+            item.state = job_state;
+            item.total_bytes = total;
+            item.completed_bytes = done;
+            item.volume_id = "external";
+            item.from_volume_id = "internal";
+            item.move = true;
+            item.locked = locked;
+            item.stage_text = "Moving to " + (to ? to->label : std::string("another drive"));
+            item.state_text = std::move(step);
+            if (job_state == JobState::Downloading && !locked) { item.bytes_per_second = 11'000'000; item.eta_seconds = 5'400; }
+            state_.jobs.push_back(std::move(item));
+        };
+        move(GameId::Steam(900001), 0, JobState::Downloading, 71'300'000'000, 12'800'000'000, "Copying", false);
+        move(GameId::Steam(900002), 1, JobState::Downloading, 4'100'000'000, 4'100'000'000, "Switching to the copy", true);
+        move(GameId::Steam(900003), 2, JobState::Queued, 2'100'000'000, 0, "", false);
         state_.navigation.focus_key = "queue-downloads";
     } else if (name == "install-ready" || name == "unknown-size" || name == "insufficient-space") {
         state_.navigation.route = Route::Details;
@@ -4397,18 +5243,15 @@ void Simulation::rebuild_view() {
         if (modal.id == "install-language")
             view_.subtitle = "For this game only. New downloads of other games stay in " +
                              playden::steam::LanguageName(state_.content_language) + ".";
+        if (modal.id == "move-storage") {
+            const auto* installation = move_picker_game_.valid() ? find_installation(state_, move_picker_game_) : nullptr;
+            view_.subtitle = installation && installation->installed_bytes
+                ? format_bytes(installation->installed_bytes) + " moves there, with its saves, settings and PS5 title."
+                : "Each game moves from the drive it is on.";
+        }
         if (modal.id == "storage" && live() && picking_install_volume_) {
             const auto* fallback = find_volume(state_, selected_volume_id_);
             view_.subtitle = "For this game only." + (fallback ? " Other games still install to " + fallback->label + "." : std::string());
-        }
-        if (modal.id == "installed-games") {
-            view_.subtitle = !installed_message_.empty() ? installed_message_
-                : "Choose games to uninstall. Their saves and settings are kept unless you choose to delete them.";
-            std::uint64_t bytes = 0;
-            for (const auto& installation : state_.installations)
-                if (installed_selected_.contains(installation.game_id)) bytes += installation.installed_bytes;
-            view_.footer = installed_selected_.empty() ? std::string("Select games to uninstall")
-                : std::to_string(installed_selected_.size()) + " selected · " + format_bytes(bytes);
         }
         if (modal.id == "import-games")
             view_.subtitle = state_.import_candidates.empty() ? kImportEmptyText
@@ -4452,6 +5295,10 @@ void Simulation::rebuild_view() {
         for (const auto& action_key : modal.action_keys) {
             auto& item = row(action_key, RowKind::Action, action_label(action_key), action_key);
             item.dangerous = modal.destructive && action_key != "cancel";
+            if (modal.id == "job-actions")
+                if (const auto label = move_action_label(action_key); !label.empty())
+                    if (const auto* job = find_job(state_, action_key.substr(action_key.find('-', 4) + 1)); job && job->move)
+                        item.title = label;
             if (modal.id == "download-server") {
                 if (action_key == "download-server-fastest") {
                     item.title = "Fastest";
@@ -4801,6 +5648,26 @@ void Simulation::rebuild_view() {
                 item.subtitle = "Settings shared through prospero-win-profiles. Waits for the shared recipe index.";
                 item.value = "Not available yet";
                 item.enabled = false;
+            } else if (modal.id == "game-maintenance" && action_key == "game-move") {
+                // The game's move to another drive: the same Queue job as the Move tab's.
+                const auto* installation = find_installation(state_, settings_game);
+                const auto* here = installation ? volume_of(state_, installation->volume_id) : nullptr;
+                item.subtitle = "Saves, settings and the PS5 title go with the game.";
+                item.badge = "Game must be closed";
+                if (here) item.value = here->label;
+                const auto blocker = move_blocker(settings_game, {});
+                const auto* game = find_game(state_, settings_game);
+                const std::string title = game && !game->title.empty() ? game->title : "the game";
+                // Opening Maintenance asks the console whether the game runs; the row waits for the answer.
+                const auto runtime_game = state_.runtime_games.find(settings_game);
+                const bool asking = live() && runtime_game != state_.runtime_games.end() &&
+                                    runtime_game->second.activity == TitleActivity::Unknown;
+                item.enabled = blocker.empty() && !asking && move_volumes().size() >= 2;
+                if (blocker.empty() && asking) item.subtitle = "Checking whether " + title + " is running…";
+                else if (blocker == "Playing") item.subtitle = "Quit " + title + " to move it.";
+                else if (blocker == "In Queue") item.subtitle = "Wait for its job in Queue to finish.";
+                else if (!blocker.empty()) item.subtitle = blocker + ".";
+                else if (!item.enabled) item.subtitle = "Connect another drive to move the game.";
             } else if (modal.id == "game-maintenance" && action_key.rfind("maintenance-", 0) == 0) {
                 const auto runtime_game = state_.runtime_games.find(settings_game);
                 const LiveRuntimeGame* runtime = live() && runtime_game != state_.runtime_games.end() ? &runtime_game->second : nullptr;
@@ -4887,59 +5754,29 @@ void Simulation::rebuild_view() {
                         else if (import_from_drop)
                             item.subtitle = volume->id == kImportDropVolume ? "Instant · moves the folder" : "Copies, then frees the drop folder";
                         else item.subtitle = volume->id == selected_volume_id_ ? "Default · Available" : "Available";
+                    } else if (modal.id == "move-storage") {
+                        // A move's drive: the Move tab's choice, or for one game where it can go and why not.
+                        item.selected = !move_picker_game_.valid() && volume->id == manage_move_volume_id_;
+                        if (item.selected && item.enabled) item.subtitle = "Current choice";
+                        if (move_picker_game_.valid() && item.enabled) {
+                            const auto* installation = find_installation(state_, move_picker_game_);
+                            const auto free = volume_free(*volume);
+                            if (installation && installation->volume_id == volume->id) {
+                                item.enabled = false;
+                                item.subtitle = "The game is here";
+                            } else if (installation && free && installation->installed_bytes + steam::kInstallSpaceMargin > *free) {
+                                item.enabled = false;
+                                item.subtitle = "Not enough space";
+                                item.tone = "warn";
+                            }
+                        }
+                        if (!volume->available || !volume->writable) item.tone = "warn";
                     }
                 }
             }
             else if (action_key == "quit-to-home") item.dangerous = true;  // the dialog's primary action
             else if (action_key == "saves-delete-confirm" || action_key == "saves-leftover-confirm") item.dangerous = true;
             else if (action_key == "refresh-library") item.enabled = !state_.library_loading && !state_.library_syncing;
-            else if (action_key == "installed-sort") {
-                item.title = "Sort by";
-                item.value = installed_by_played_ ? "Last played" : "Size";
-            }
-            else if (action_key == "installed-select-all") {
-                std::size_t choosable = 0, chosen = 0;
-                for (const auto id : installed_list())
-                    if (find_installation(state_, id) && installed_blocker(id).empty()) {
-                        ++choosable;
-                        chosen += installed_selected_.contains(id) ? 1 : 0;
-                    }
-                item.title = choosable > 0 && chosen == choosable ? "Clear selection" : "Select all";
-                item.enabled = choosable > 0;
-            }
-            else if (action_key.rfind("installed-toggle-", 0) == 0) {
-                const auto id = key_id(std::string_view(action_key).substr(17));
-                const auto* game = find_game(state_, id);
-                const auto* installation = find_installation(state_, id);
-                item.kind = RowKind::Toggle;
-                item.game_id = id;
-                item.title = game && !game->title.empty() ? game->title : "Steam app " + ToKey(id);
-                item.selected = installed_selected_.contains(id);
-                item.value = installation ? format_bytes(installation->installed_bytes) : std::string();
-                const auto blocker = installed_blocker(id);
-                if (!blocker.empty()) {
-                    item.subtitle = blocker;
-                    item.enabled = false;
-                } else if (const auto* stopped = uninstall_stop(id)) {
-                    // Its uninstall stopped: the reason stays until it goes again or is dismissed in Queue.
-                    item.subtitle = "Stopped: " + stopped->stopped;
-                    item.tone = "problem";
-                } else {
-                    const auto when = game && game->last_played ? time_ago(state_.clock_ticks, *game->last_played) : std::string();
-                    item.subtitle = !game || !game->last_played ? "Never played" : when.empty() ? "Played" : "Played " + when;
-                    // With games on more than one drive, each row names its drive.
-                    std::set<std::string> drives;
-                    for (const auto& other : state_.installations) drives.insert(other.volume_id);
-                    if (drives.size() > 1 && installation)
-                        if (const auto* volume = find_volume(state_, installation->volume_id))
-                            item.subtitle = volume->label + " · " + item.subtitle;
-                }
-            }
-            else if (action_key == "installed-selection-uninstall") {
-                item.title = "Uninstall selected";
-                item.dangerous = true;
-                item.enabled = !installed_selected_.empty();
-            }
             else if (modal.id == "import-games" && action_key == "import-look") {
                 item.title = state_.import_scanning ? "Looking for games…" : "Look for games";
                 if (state_.import_scanning) { item.kind = RowKind::Status; item.enabled = false; }
@@ -5186,7 +6023,7 @@ void Simulation::rebuild_view() {
         else if (modal.id == "install-language") view_.legends = {"Cross Use this language", "L1/R1 Jump", "Circle Back"};
         else if (modal.id == "install-version") view_.legends = {"Cross Use this version", "L1/R1 Jump", "Circle Back"};
         else if (modal.id == "import-storage") view_.legends = {"Cross Import here", "Circle Back"};
-        else if (modal.id == "installed-games") view_.legends = {"Cross Select", "Triangle Uninstall", "Circle Close"};
+        else if (modal.id == "move-storage") view_.legends = {move_picker_game_.valid() ? "Cross Move here" : "Cross Choose", "Circle Back"};
         else if (!modal.setting_id.empty()) view_.legends = {"Cross Select", "Triangle Reset", "L1/R1 Jump", "Circle Back"};
     } else if (state_.navigation.route == Route::Startup && state_.root_access_missing) {
         auto problem = describe_startup_problem(state_.root_access_detail, state_.root_access_granted);
@@ -5421,7 +6258,7 @@ void Simulation::rebuild_view() {
             if (installed && game && update_locked(game->id)) {
                 primary.enabled = false;
                 primary.action.clear();
-                primary.value = "Finishing the update…";
+                primary.value = held_play_text(state_, game->id);
             }
             update_rows();
         }
@@ -5514,7 +6351,7 @@ void Simulation::rebuild_view() {
                         if (!uninstalling && update_locked(game->id)) {
                             play.title = "Play";
                             play.action.clear();
-                            play.value = "Finishing the update…";
+                            play.value = held_play_text(state_, game->id);
                             play.progress = 0.0F;
                             play.enabled = false;
                         }
@@ -5851,6 +6688,8 @@ void Simulation::rebuild_view() {
         }
         if (view_.rows.empty()) row("saves-nothing", RowKind::Status, "Nothing to do", "").enabled = false;
         view_.legends = {"Cross Select", "Circle Back"};
+    } else if (state_.navigation.route == Route::ManageGames) {
+        build_manage_games_view();
     } else if (state_.navigation.route == Route::Settings) {
         view_.title = "Settings";
         if (live()) view_.subtitle = state_.account().error;
@@ -5896,17 +6735,18 @@ void Simulation::rebuild_view() {
             storage.subtitle = "Where new games are installed";
             if (state_.volumes.empty()) { storage.kind = RowKind::Status; storage.action.clear(); storage.enabled = false; storage.subtitle = "Storage is unavailable"; }
         }
-        if (live()) {
-            // Installed games: one row that opens the list, sorted by size or last played, where
-            // the player picks games to uninstall together.
-            auto& installed = add("settings-installed", RowKind::Action, "Installed games", "installed-manage");
-            installed.subtitle = "Uninstall games you no longer play to free up space";
+        if (live() || manage_fixture_) {
+            // Manage installed games: opens on Uninstall; the saved check's updates are counted here too.
+            auto& installed = add("settings-installed", RowKind::Action, "Manage installed games", "installed-manage");
+            installed.subtitle = "Update games, move them to another drive, or uninstall the ones you no longer play";
             if (state_.installations.empty()) {
                 installed.kind = RowKind::Status; installed.action.clear(); installed.enabled = false; installed.value = "None";
             } else {
                 std::uint64_t bytes = 0;
                 for (const auto& item : state_.installations) bytes += item.installed_bytes;
                 installed.value = kept_count(state_.installations.size()) + " · " + format_bytes(bytes);
+                if (const auto updates = manage_list(ManageTab::Updates).size(); updates > 0)
+                    installed.value += " · " + std::to_string(updates) + (updates == 1 ? " update" : " updates");
             }
         }
         if (live()) {
@@ -6019,6 +6859,35 @@ void Simulation::rebuild_view() {
             auto& note = add("settings-beta-wait", RowKind::Status, "You have a beta", "");
             note.subtitle = "Playden moves to the next stable version when it is out.";
             note.enabled = false;
+        }
+        if (live() || manage_fixture_) {
+            // Game updates: the saved check, read without going online; opening the screen checks once a day.
+            auto& item = add("settings-game-updates", RowKind::Action, "Game updates", "game-updates-manage");
+            const auto& check = state_.update_check;
+            const auto when = check.checked_at > 0 ? time_ago(state_.clock_ticks, check.checked_at) : std::string();
+            const auto updates = manage_list(ManageTab::Updates);
+            item.subtitle = check.checked_at > 0 ? (when.empty() ? std::string("Checked") : "Checked " + when)
+                                                 : "Steam is checked once a day when you open it";
+            if (state_.installations.empty()) {
+                item.kind = RowKind::Status; item.action.clear(); item.enabled = false; item.value = "None";
+                item.subtitle = "No games installed";
+            } else if (!check.loaded) {
+                item.value.clear();
+            } else if (check.checking) {
+                item.value = check.total > 0 ? "Checking " + std::to_string(std::min(check.answered, check.total)) + " of " +
+                                                   std::to_string(check.total) + "…"
+                                             : "Checking…";
+            } else if (check.failed) {
+                item.value = "Couldn't check";
+                item.subtitle = "Steam didn't answer" + (when.empty() ? std::string() : " · last checked " + when);
+            } else if (!updates.empty()) {
+                std::uint64_t bytes = 0;
+                for (const auto id : updates) bytes += check.games.at(id).download_bytes;
+                item.value = std::to_string(updates.size()) + (updates.size() == 1 ? " update" : " updates") +
+                             (bytes > 0 ? " · " + format_bytes(bytes) : std::string());
+            } else {
+                item.value = check.checked_at > 0 ? "Up to date" : "Not checked";
+            }
         }
         // The kit-only install, while it has something to offer or say.
         if (live()) {
@@ -6199,6 +7068,48 @@ void Simulation::rebuild_view() {
             focused = view_.rows.begin() + best;
         }
     }
+    // Manage installed games: a toolbar button that turned off under the focus (Check for updates, once it
+    // checks) hands it to the nearest one that works, else as below.
+    if (focused != view_.rows.end() && !has_overlay && state_.navigation.route == Route::ManageGames &&
+        manage_part(*focused) == 0 && !focused->enabled) {
+        const int last = static_cast<int>(view_.rows.size()) - 1;
+        const int origin = static_cast<int>(std::distance(view_.rows.begin(), focused));
+        int best = -1;
+        for (int distance = 1; distance <= last && best < 0; ++distance)
+            for (const int candidate : {origin - distance, origin + distance})
+                if (candidate >= 0 && candidate <= last && manage_part(view_.rows[static_cast<std::size_t>(candidate)]) == 0 &&
+                    view_.rows[static_cast<std::size_t>(candidate)].enabled) {
+                    best = candidate;
+                    break;
+                }
+        focused = best >= 0 ? view_.rows.begin() + best : view_.rows.end();
+        if (best >= 0) {
+            state_.navigation.selected_index = best;
+            state_.navigation.focus_key = focused->key;
+        }
+    }
+    // Manage installed games: the focused game went away (uninstalled, or the tab changed). Focus the
+    // nearest game left, else the tab's first stop; never the footer.
+    if (focused == view_.rows.end() && !has_overlay && state_.navigation.route == Route::ManageGames) {
+        const int last = static_cast<int>(view_.rows.size()) - 1;
+        const int origin = std::clamp(manage_focus_index_, 0, std::max(0, last));
+        int best = -1;
+        for (int distance = 0; distance <= last && best < 0; ++distance)
+            for (const int candidate : {origin - distance, origin + distance})
+                if (candidate >= 0 && candidate <= last && view_.rows[static_cast<std::size_t>(candidate)].key.rfind("manage-toggle-", 0) == 0) {
+                    best = candidate;
+                    break;
+                }
+        const auto fallback = manage_default_focus();
+        if (best < 0)
+            for (int index = 0; index <= last; ++index)
+                if (view_.rows[static_cast<std::size_t>(index)].key == fallback) best = index;
+        if (best >= 0) {
+            state_.navigation.selected_index = best;
+            state_.navigation.focus_key = view_.rows[static_cast<std::size_t>(best)].key;
+            focused = view_.rows.begin() + best;
+        }
+    }
     if (focused != view_.rows.end()) view_.focused_row = static_cast<int>(std::distance(view_.rows.begin(), focused));
     else if (!view_.rows.empty() && !(state_.navigation.route == Route::Library && state_.navigation.library_rail_focused)
              && !(state_.navigation.route == Route::Home && !view_.shelves.empty())) {
@@ -6211,6 +7122,8 @@ void Simulation::rebuild_view() {
     }
     if (!has_overlay && state_.navigation.route == Route::Downloads && focused != view_.rows.end())
         queue_focus_index_ = view_.focused_row;
+    if (!has_overlay && state_.navigation.route == Route::ManageGames && focused != view_.rows.end())
+        manage_focus_index_ = view_.focused_row;
     if (!has_overlay && state_.navigation.route == Route::Settings && view_.focused_row >= 0 &&
         static_cast<std::size_t>(view_.focused_row) < view_.rows.size()) {
         settings_focus_index_ = view_.focused_row;
@@ -6232,6 +7145,7 @@ void Simulation::close_modal() {
     if (state_.navigation.modals.back().id == "import-storage" &&
         (state_.navigation.modals.size() < 2 || state_.navigation.modals[state_.navigation.modals.size() - 2].id != "import-choice"))
         import_choice_game_ = {};
+    if (state_.navigation.modals.back().id == "move-storage") move_picker_game_ = {};
     state_.navigation.modals.pop_back();
     state_.navigation.focus_key = opener;
 }
@@ -6663,6 +7577,8 @@ void Simulation::cancel() {
         cancelled_challenge_generation_ = challenge_generation_;
         state_.account().authentication = AuthState::Cancelled;
         leave_steam_sign_in();
+    } else if (state_.navigation.route == Route::ManageGames) {
+        close_manage_games();
     } else if (state_.navigation.route == Route::SaveDetails) {
         state_.navigation.route = Route::Saves;
         state_.navigation.focus_key = "save-" + ToKey(state_.navigation.save_id);
@@ -6698,7 +7614,6 @@ void Simulation::move(int delta_x, int delta_y) {
             state_.log_offset = std::clamp(state_.log_offset + delta, 0, std::max(0, static_cast<int>(state_.log_lines.size()) - 8));
             return;
         }
-        if (modal.id == "installed-games") { move_installed_manager(delta_x, delta_y); return; }
         if (modal.id == "import-games") { move_import_sheet(delta_y != 0 ? delta_y : delta_x); return; }
         const int delta = delta_y != 0 ? delta_y : delta_x;
         const int last = static_cast<int>(modal.action_keys.size()) - 1;
@@ -6752,6 +7667,7 @@ void Simulation::move_content(int delta_x, int delta_y) {
     if (move_browser(state_, delta_x, delta_y)) return;
     if (state_.navigation.route == Route::Settings && move_settings(delta_x, delta_y)) return;
     if (state_.navigation.route == Route::Saves && move_saves(delta_x, delta_y)) return;
+    if (state_.navigation.route == Route::ManageGames && move_manage(delta_x, delta_y)) return;
     const int columns = state_.navigation.route == Route::Library ? 6 : 1;
     const int delta = delta_y != 0 ? delta_y * columns : delta_x;
     if (view_.rows.empty()) return;
@@ -7319,6 +8235,10 @@ void Simulation::activate() {
             choose_import_volume(id);
             return;
         }
+        if (!state_.navigation.modals.empty() && state_.navigation.modals.back().id == "move-storage") {
+            choose_move_volume(id);
+            return;
+        }
         if (live() && picking_install_volume_) {
             const auto* volume = find_volume(state_, id);
             if (volume && volume->available) install_volume_id_ = id == selected_volume_id_ ? std::string() : id;
@@ -7413,14 +8333,15 @@ void Simulation::activate() {
             if (finished > 1) actions.push_back("job-clear-completed");
         }
         else if (job && job->state != JobState::Cancelled) actions.push_back("job-cancel-" + id);
-        // An update putting its files in place can't be paused or canceled: it finishes first.
+        // An update putting its files in place, or a move whose title may use the copy, can't be paused or canceled:
+        // it finishes first.
         if (job && job->locked)
             std::erase_if(actions, [](const std::string& action) {
                 return action.rfind("job-pause-", 0) == 0 || action.rfind("job-cancel-", 0) == 0;
             });
         actions.push_back("logs"); actions.push_back("cancel");
-        open_modal({"job-actions", job && job->update ? "Update actions" : "Download actions", selected.key, std::move(actions), 0,
-                    false});
+        open_modal({"job-actions", job && job->move ? "Move actions" : job && job->update ? "Update actions" : "Download actions",
+                    selected.key, std::move(actions), 0, false});
     } else if (action_name == "details-prepare-next") {
         prepare_next(selected.game_id);
         state_.navigation.focus_key = selected.key;
@@ -7798,9 +8719,7 @@ void Simulation::activate() {
         state_.jobs.erase(std::remove_if(state_.jobs.begin(), state_.jobs.end(), [&id](const Job& value) { return value.id == id && value.state == JobState::Downloaded; }), state_.jobs.end());
     } else if (action_name.rfind("job-cancel-", 0) == 0) {
         pending_destructive_action_ = action_name;
-        ModalEntry confirmation{"confirmation", "Cancel download?", selected.key, {"cancel", "confirm-destructive"}, 0, true};
-        confirmation.body = "Stops the download and deletes what was downloaded so far. Installing it again starts from the beginning.";
-        open_modal(std::move(confirmation));
+        open_modal(cancel_job_confirmation(state_, find_job(state_, action_name.substr(11)), selected.key));
     } else if (action_name == "verify") {
         const auto duplicate = std::find_if(state_.jobs.begin(), state_.jobs.end(), [this](const Job& job) {
             return job.game_id == state_.navigation.selected_game_id && job.kind == "verify"
@@ -7864,7 +8783,7 @@ void Simulation::activate() {
         // The dialog says what happens to the saves with the current choice.
         if (!state_.navigation.modals.empty()) {
             auto& body = state_.navigation.modals.back().body;
-            const bool batch = pending_destructive_action_ == "installed-selection-uninstall";
+            const bool batch = pending_destructive_action_ == "manage-uninstall";
             const std::string_view kept = batch ? uninstall_batch_body_kept
                 : state_.navigation.selected_game_id.store == Store::kLocal ? uninstall_body_kept_imported : uninstall_body_kept;
             const std::string_view deleted = batch ? uninstall_batch_body_deleted : uninstall_body_deleted;
@@ -7903,90 +8822,59 @@ void Simulation::activate() {
             state_.navigation.selected_game_id = game;
             open_game_settings();
         }
-    } else if (live() && action_name == "installed-manage") {
+    } else if ((live() || manage_fixture_) && (action_name == "installed-manage" || action_name == "game-updates-manage")) {
         if (state_.installations.empty()) return;
-        installed_selected_.clear();
-        installed_message_.clear();
-        installed_list_focus_.clear();
-        auto actions = installed_manager_actions();
-        // Focus starts on the first game; Sort and Select all are above it.
-        open_modal({"installed-games", "Installed games", state_.navigation.focus_key, std::move(actions), 2, false});
-    } else if (action_name == "installed-close") {
+        open_manage_games(action_name == "game-updates-manage" ? ManageTab::Updates : ManageTab::Uninstall);
+    } else if (action_name == "manage-sort") {
+        auto& tab = manage_tabs_[state_.navigation.manage_tab];
+        tab.by_played = !tab.by_played;
+    } else if (action_name == "manage-select-all") {
+        manage_select_all();
+    } else if (action_name.rfind("manage-toggle-", 0) == 0) {
+        const auto id = key_id(std::string_view(action_name).substr(14));
+        auto& selected = manage_tabs_[state_.navigation.manage_tab].selected;
+        if (find_installation(state_, id) && manage_blocker(state_.navigation.manage_tab, id).empty() && !selected.erase(id))
+            selected.insert(id);
+    } else if (action_name == "manage-check") {
+        request_update_check(true);
+    } else if (action_name == "manage-uninstall") {
+        ask_manage_uninstall();
+    } else if (action_name == "manage-update") {
+        queue_manage_updates();
+    } else if (action_name == "manage-move") {
+        queue_manage_moves();
+    } else if (action_name == "manage-move-to") {
+        if (move_volumes().size() >= 2) open_move_picker({});
+    } else if (action_name == "confirm-destructive" && pending_destructive_action_ == "manage-update-anyway") {
+        pending_destructive_action_.clear();
         close_modal();
-    } else if (live() && action_name == "installed-sort") {
-        installed_by_played_ = !installed_by_played_;
-        refresh_installed_manager();
-    } else if (live() && action_name == "installed-select-all") {
-        std::vector<GameId> choosable;
-        for (const auto id : installed_list())
-            if (find_installation(state_, id) && installed_blocker(id).empty()) choosable.push_back(id);
-        const bool all = !choosable.empty() && std::all_of(choosable.begin(), choosable.end(),
-                                                           [this](GameId id) { return installed_selected_.contains(id); });
-        if (all) installed_selected_.clear();
-        else installed_selected_.insert(choosable.begin(), choosable.end());
-    } else if (live() && action_name.rfind("installed-toggle-", 0) == 0) {
-        const auto id = key_id(std::string_view(action_name).substr(17));
-        if (find_installation(state_, id) && installed_blocker(id).empty() && !installed_selected_.erase(id)) installed_selected_.insert(id);
-    } else if (live() && action_name == "installed-selection-uninstall") {
-        if (installed_selected_.empty()) return;
-        std::vector<std::string> names;
-        std::uint64_t bytes = 0;
-        bool any_title = false, any_cloud = false, all_steam = true;
-        for (const auto id : installed_list()) {
-            if (!installed_selected_.contains(id)) continue;
-            any_cloud = any_cloud || Traits(id.store).cloud_saves;
-            all_steam = all_steam && id.store == Store::kSteam;
-            const auto* game = find_game(state_, id);
-            names.push_back(game && !game->title.empty() ? game->title : "Steam app " + ToKey(id));
-            if (const auto* installation = find_installation(state_, id)) bytes += installation->installed_bytes;
-            const auto runtime_game = state_.runtime_games.find(id);
-            any_title = any_title || (runtime_game != state_.runtime_games.end() && runtime_game->second.has_title);
-        }
-        // "A, B and C", or "A, B, C and 2 more".
-        std::string listed;
-        const auto shown = names.size() > 3 ? std::size_t{3} : names.size();
-        for (std::size_t index = 0; index < shown; ++index)
-            listed += (index == 0 ? "" : index + 1 == shown && names.size() <= 3 ? " and " : ", ") + names[index];
-        if (names.size() > 3) listed += " and " + std::to_string(names.size() - 3) + " more";
-        pending_destructive_action_ = action_name;
-        uninstall_delete_saves_ = false;
-        ModalEntry confirmation{"confirmation", "Uninstall " + kept_count(names.size()) + "?", state_.navigation.focus_key,
-                                any_title ? std::vector<std::string>{"cancel", "uninstall-delete-saves", "confirm-destructive"}
-                                          : std::vector<std::string>{"cancel", "confirm-destructive"},
-                                0, true};
-        confirmation.body = listed + ". Frees about " + format_bytes(bytes) + ". ";
-        confirmation.body += any_title ? uninstall_batch_body_kept
-                           : all_steam ? "Their files are removed from this console. You can install them again from Steam."
-                                       : "Their files are removed from this console.";
-        if (any_cloud && state_.cloud_saves_auto)
-            confirmation.body += " Steam Cloud saves are synced first. If that fails for a game, that game stays installed and Queue says why.";
-        else if (any_cloud)
-            confirmation.body += " Automatic Cloud sync is off, so their saves are not synced first.";
-        open_modal(std::move(confirmation));
-    } else if (action_name == "confirm-destructive" && live() && pending_destructive_action_ == "installed-selection-uninstall") {
+        queue_manage_updates(true);
+    } else if (action_name == "confirm-destructive" && pending_destructive_action_ == "manage-uninstall") {
         // In the list's order (its current sort), which is the order they run in.
         std::vector<GameId> started;
-        installed_message_.clear();
-        for (const auto id : installed_list()) {
-            if (!installed_selected_.contains(id) || !installed_blocker(id).empty() || !find_installation(state_, id)) continue;
-            request_uninstall(id, uninstall_delete_saves_, true);
+        auto& selected = manage_tabs_[ManageTab::Uninstall].selected;
+        manage_message_.clear();
+        for (const auto id : manage_list(ManageTab::Uninstall)) {
+            if (!selected.contains(id) || !installed_blocker(id).empty() || !find_installation(state_, id)) continue;
+            if (live()) request_uninstall(id, uninstall_delete_saves_, true);
             started.push_back(id);
         }
-        installed_selected_.clear();
+        selected.clear();
         uninstall_delete_saves_ = false;
         pending_destructive_action_.clear();
         if (started.empty()) {
             // Every checked game started running or downloading while the dialog was open.
-            installed_message_ = "None of the selected games can be uninstalled now.";
+            manage_message_ = "None of the selected games can be uninstalled now.";
             close_modal();  // back to the list, which says so
-            refresh_installed_manager();
+            refresh_manage_games();
         } else {
-            // Queue follows the uninstalls: the list closes, back to Settings.
-            state_.navigation.focus_key = state_.navigation.modals.front().opener_focus_key;
+            // Queue follows the uninstalls: the screen closes, back to where it was opened.
             state_.navigation.modals.clear();
+            close_manage_games();
             const auto* game = started.size() == 1 ? find_game(state_, started.front()) : nullptr;
             push_notice({"uninstall-batch", "Uninstalling " + (game && !game->title.empty() ? game->title : kept_count(started.size())),
-                         "", false, kLiveNoticeSeconds, false, started.size() == 1 ? "Follow it in Queue" : "Follow them in Queue"});
+                         "", false, kLiveNoticeSeconds, false,
+                         !live() ? "Fixture: nothing is uninstalled" : started.size() == 1 ? "Follow it in Queue" : "Follow them in Queue"});
         }
     } else if (action_name == "import-manage") {
         open_import_sheet();
@@ -8275,6 +9163,9 @@ void Simulation::activate() {
         }
         // From Game actions it opens on top of that sheet, so Circle returns there.
         open_modal({"game-maintenance", "Maintenance", state_.navigation.focus_key, maintenance_actions(), 0, false});
+    } else if (action_name == "game-move") {
+        const auto game = state_.navigation.selected_game_id;
+        if (move_blocker(game, {}).empty() && move_volumes().size() >= 2) open_move_picker(game);
     } else if (action_name.rfind("maintenance-", 0) == 0) {
         const auto game = state_.navigation.selected_game_id;
         std::string refusal;
@@ -8697,6 +9588,10 @@ bool Simulation::action(const std::string& logical_action) {
             state_.library_loading = true;
             rebuild_view(); return true;
         }
+        if (logical_action == "update-check") {  // Check for updates
+            request_update_check(true);
+            return true;
+        }
         if (logical_action == "signout" || logical_action == "account-switch") {
             queue_service_action(logical_action == "signout" ? ServiceAction::SignOut : ServiceAction::SwitchAccount);
             state_.account().authentication = AuthState::SigningOut;
@@ -8788,7 +9683,7 @@ bool Simulation::action(const std::string& logical_action) {
     }
     if (logical_action.rfind("job:cancel:", 0) == 0) {
         const auto id = logical_action.substr(11); if (!find_job(state_, id)) return false;
-        pending_destructive_action_ = "job-cancel-" + id; open_modal({"confirmation", "Cancel download?", "job-" + id, {"cancel", "confirm-destructive"}, 0, true}); rebuild_view(); return true;
+        pending_destructive_action_ = "job-cancel-" + id; open_modal(cancel_job_confirmation(state_, find_job(state_, id), "job-" + id)); rebuild_view(); return true;
     }
     if (logical_action.rfind("job:fail:", 0) == 0) {
         const auto remainder = logical_action.substr(9); const auto separator = remainder.find(':'); if (separator == std::string::npos) return false;
@@ -8903,8 +9798,11 @@ bool Simulation::action(const std::string& logical_action) {
               state_.navigation.modals.back().id == "button-mapping" || state_.navigation.modals.back().id == "controller-tuning" ||
               !state_.navigation.modals.back().setting_id.empty()))
         move(0, logical_action == "l1" ? -5 : 5);  // L1/R1 jump five rows, as on macOS
-    else if (logical_action == "l1") change_route(-1);
-    else if (logical_action == "r1") change_route(1);
+    else if (logical_action == "l1" || logical_action == "r1") {
+        // Manage installed games: L1/R1 switch its tabs (not with a dialog open); elsewhere the main tabs.
+        if (state_.navigation.route != Route::ManageGames) change_route(logical_action == "l1" ? -1 : 1);
+        else if (!state_.editor.active && state_.navigation.modals.empty()) switch_manage_tab(logical_action == "l1" ? -1 : 1);
+    }
     else if (logical_action == "cross") activate();
     else if (logical_action == "circle") cancel();
     else if (logical_action == "triangle" && live() && !state_.editor.active && state_.navigation.modals.empty() &&
@@ -8912,25 +9810,12 @@ bool Simulation::action(const std::string& logical_action) {
         pending_cloud_requests_.push_back({state_.saves_job.kind == SavesJobKind::None ? CloudRequestKind::SyncAll
                                                                                      : CloudRequestKind::StopJob, {}});
     else if (logical_action == "search") { if (!state_.editor.active && state_.navigation.route == Route::Library && state_.navigation.modals.empty()) start_editor("Search", state_.library.query); }
-    else if (logical_action == "triangle" && !state_.editor.active && !state_.navigation.modals.empty() &&
-             state_.navigation.modals.back().id == "installed-games") {
-        // Triangle is Uninstall selected from anywhere in the list; the batch view has nothing to start.
-        auto& list = state_.navigation.modals.back();
-        const auto at = std::find(list.action_keys.begin(), list.action_keys.end(), "installed-selection-uninstall");
-        if (live() && at != list.action_keys.end() && !installed_selected_.empty()) {
-            const int was = list.focused_action;
-            const auto key = state_.navigation.focus_key;
-            list.focused_action = static_cast<int>(at - list.action_keys.begin());
-            state_.navigation.focus_key = *at;
-            rebuild_view();
-            activate();
-            // The dialog returns to the row the player was on.
-            auto& modals = state_.navigation.modals;
-            const auto list_at = std::find_if(modals.begin(), modals.end(), [](const ModalEntry& modal) { return modal.id == "installed-games"; });
-            if (list_at != modals.end()) list_at->focused_action = was;
-            if (modals.back().id == "confirmation") modals.back().opener_focus_key = key;
-            else state_.navigation.focus_key = key;
-        }
+    else if (logical_action == "triangle" && !state_.editor.active && state_.navigation.modals.empty() &&
+             state_.navigation.route == Route::ManageGames) {
+        // Triangle runs the open tab's action from anywhere on the screen; the dialog returns to the row.
+        if (state_.navigation.manage_tab == ManageTab::Uninstall) ask_manage_uninstall();
+        else if (state_.navigation.manage_tab == ManageTab::Move) queue_manage_moves();
+        else queue_manage_updates();
     }
     else if (logical_action == "triangle" && !state_.editor.active && !state_.navigation.modals.empty() &&
              (state_.navigation.modals.back().id == "game-settings" || state_.navigation.modals.back().id == "controller-tuning" ||
@@ -9013,6 +9898,8 @@ bool Simulation::action(const std::string& logical_action) {
             save_profile();
         } else if (live() && state_.navigation.modals.empty() && state_.navigation.route == Route::Saves) {
             ask_upload_all();
+        } else if (state_.navigation.modals.empty() && state_.navigation.route == Route::ManageGames) {
+            manage_select_all();
         }
     } else if (logical_action.rfind("inject:", 0) == 0) {
         auto injected = logical_action.substr(7);
@@ -9567,8 +10454,13 @@ std::vector<std::string> Simulation::details_context_actions() const {
 }
 
 std::vector<std::string> Simulation::maintenance_actions() const {
-    return {"maintenance-reset", "maintenance-update", "maintenance-repair", "maintenance-shader", "maintenance-backup",
-            "maintenance-recreate", "cancel"};
+    std::vector<std::string> actions{"maintenance-reset", "maintenance-update", "maintenance-repair", "maintenance-shader",
+                                     "maintenance-backup", "maintenance-recreate", "cancel"};
+    // An installed game can move to another drive; imported games have Copy or Move into Playden instead.
+    const auto id = state_.navigation.selected_game_id;
+    if (id.store != Store::kLocal && find_installation(state_, id))
+        actions.insert(actions.end() - 1, "game-move");
+    return actions;
 }
 
 bool Simulation::game_prepared(GameId id) const {

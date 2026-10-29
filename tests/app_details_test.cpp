@@ -133,6 +133,156 @@ void RefreshAsksAgainForOneGame() {
   assert(Await(service, 1)[0].account_generation == 2);
 }
 
+InstalledCheck AwaitCheck(AppDetailsService& service, std::vector<AppDetails>* answers = nullptr) {
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  for (;;) {
+    for (auto& details : service.Pump()) if (answers) answers->push_back(std::move(details));
+    const auto check = service.CheckProgress();
+    if (check.done()) return check;
+    assert(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(1ms);
+  }
+}
+
+// A check of 100 installed games asks Steam for each, past the 64 a request queue holds, answered games
+// included, and counts its progress as the answers are handed out.
+void InstalledCheckFeedsPastTheQueueLimit() {
+  Sessions sessions;
+  Source source;
+  AppDetailsService service(source, sessions);
+  service.Request(SteamId(1000), 1);
+  Await(service, 1);
+  std::vector<GameId> ids;
+  for (std::uint32_t app = 1000; app < 1100; ++app) ids.push_back(SteamId(app));
+  ids.push_back(SteamId(1000));  // twice: asked once
+  assert(service.CheckInstalled(ids, 1));
+  assert(!service.CheckInstalled(ids, 1));  // one at a time
+  const auto started = service.CheckProgress();
+  assert(started.total == 100 && started.account_generation == 1);
+  std::vector<AppDetails> answers;
+  const auto check = AwaitCheck(service, &answers);
+  assert(check.asked == 100 && check.answered == 100 && check.failed == 0);
+  assert(answers.size() == 100);
+  std::lock_guard<std::mutex> lock(source.mutex);
+  std::size_t asked = 0;
+  for (const auto& call : source.calls) {
+    assert(call.size() <= AppDetailsService::kBatch);
+    asked += call.size();
+  }
+  assert(asked == 101);  // the earlier request, then all 100 again
+}
+
+// A page opened while the check runs is asked in the next batch, ahead of the games the check has left.
+void PageGoesFirstWhileCheckRuns() {
+  Sessions sessions;
+  Source source;
+  source.block_fetch = true;
+  AppDetailsService service(source, sessions);
+  std::vector<GameId> ids;
+  for (std::uint32_t app = 100; app < 140; ++app) ids.push_back(SteamId(app));
+  assert(service.CheckInstalled(ids, 1));
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(source.mutex);
+      if (!source.calls.empty()) break;
+    }
+    assert(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(1ms);
+  }
+  service.Request(SteamId(620), 1, true);
+  service.Refresh(SteamId(130), 1, true);  // one the check hasn't asked yet: the page asks it now
+  source.block_fetch = false;
+  AwaitCheck(service);
+  std::lock_guard<std::mutex> lock(source.mutex);
+  assert(source.calls.size() >= 2 && source.calls[0].size() == AppDetailsService::kBatch);
+  assert(source.calls[1][0] == SteamId(130) && source.calls[1][1] == SteamId(620));
+}
+
+// A page's answer for a game, still waiting for Pump when a check starts, is not the check's: the check
+// counts the answer to its own question (here a failure), not the earlier one.
+void EarlierAnswerDoesNotCountForTheCheck() {
+  Sessions sessions;
+  Source source;
+  AppDetailsService service(source, sessions);
+  const auto calls = [&](std::size_t count) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(source.mutex);
+        if (source.calls.size() == count) return;
+      }
+      assert(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::sleep_for(1ms);
+    }
+  };
+  service.Request(SteamId(7), 1);
+  calls(1);
+  std::this_thread::sleep_for(20ms);  // the answer is queued, not pumped
+  // The check's question is asked and held until the earlier answer is handed out.
+  source.fail = true;
+  source.block_fetch = true;
+  assert(service.CheckInstalled({SteamId(7)}, 1));
+  calls(2);
+  std::vector<AppDetails> answers = service.Pump();
+  assert(answers.size() == 1 && answers[0].available && !service.CheckProgress().done());
+  source.block_fetch = false;
+  const auto check = AwaitCheck(service, &answers);
+  assert(check.answered == 1 && check.failed == 1);
+  assert(answers.size() == 2 && answers[0].available && answers[1].failed);
+}
+
+// Invalidate (another account, a new download language) drops a running check.
+void InvalidateCancelsTheCheck() {
+  Sessions sessions;
+  Source source;
+  source.block_fetch = true;
+  AppDetailsService service(source, sessions);
+  std::vector<GameId> ids;
+  for (std::uint32_t app = 100; app < 140; ++app) ids.push_back(SteamId(app));
+  assert(service.CheckInstalled(ids, 1));
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(source.mutex);
+      if (!source.calls.empty()) break;
+    }
+    assert(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(1ms);
+  }
+  service.Invalidate(2);
+  source.block_fetch = false;
+  std::this_thread::sleep_for(30ms);
+  assert(service.Pump().empty());
+  const auto check = service.CheckProgress();
+  assert(check.total == 0 && !check.done());
+  {
+    std::lock_guard<std::mutex> lock(source.mutex);
+    assert(source.calls.size() == 1);  // nothing more was asked
+  }
+  // The new account can start its own.
+  assert(service.CheckInstalled(ids, 2));
+  assert(AwaitCheck(service).account_generation == 2);
+}
+
+// Steam unreachable: the first batch gets nothing and the rest of the check fails without asking.
+void UnreachableSteamFailsTheCheck() {
+  Sessions sessions;
+  Source source;
+  source.fail = true;
+  AppDetailsService service(source, sessions);
+  std::vector<GameId> ids;
+  for (std::uint32_t app = 100; app < 140; ++app) ids.push_back(SteamId(app));
+  assert(service.CheckInstalled(ids, 1));
+  std::vector<AppDetails> answers;
+  const auto check = AwaitCheck(service, &answers);
+  assert(check.failed == 40 && check.answered == 40);
+  assert(answers.size() == AppDetailsService::kBatch);
+  for (const auto& details : answers) assert(details.failed && !details.available);
+  std::lock_guard<std::mutex> lock(source.mutex);
+  assert(source.calls.size() == 1);
+}
+
 void FailuresAreRetryable() {
   Sessions sessions;
   Source source;
@@ -587,6 +737,11 @@ int main() {
   SameGenerationInvalidateRefetches();
   RefreshAsksAgainForOneGame();
   FailuresAreRetryable();
+  InstalledCheckFeedsPastTheQueueLimit();
+  PageGoesFirstWhileCheckRuns();
+  EarlierAnswerDoesNotCountForTheCheck();
+  InvalidateCancelsTheCheck();
+  UnreachableSteamFailsTheCheck();
   AppInfoBecomesWindowsEstimate();
   DefaultBetaKeyIsThePublicBranch();
   OtherBranchOptionsAreCandidates();

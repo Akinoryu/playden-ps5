@@ -19,10 +19,11 @@ class PersistenceController {
 
   // Organization is device-wide (kDeviceOrganization): it loads at
   // construction and is saved whether or not a store account is signed in.
-  // A store account arriving changes nothing.
+  // A Steam account arriving loads its own update check.
   void Activate(std::uint64_t account_id);
 
-  // A store account left: saves pending edits; preferences and organization stay.
+  // A store account left: saves pending edits; preferences and organization stay, the account's update
+  // check leaves the model.
   void Reset();
   void Tick();
   void Retry();
@@ -46,7 +47,9 @@ class PersistenceController {
   void BeginPreferencesLoad();
   void BeginOrganizationLoad();
   void Apply(PersistenceEvent);
-  enum Channel { kPreferencesLoad, kPreferencesSave, kOrganizationLoad, kOrganizationSave, kChannels };
+  enum Channel {
+    kPreferencesLoad, kPreferencesSave, kOrganizationLoad, kOrganizationSave, kUpdateCheckLoad, kUpdateCheckSave, kChannels
+  };
   // failure: empty when the channel worked.
   void Report(Channel channel, const std::string& failure);
 
@@ -60,6 +63,9 @@ class PersistenceController {
   homebrew::PersistenceLoadToken organization_load_token_;
   std::uint64_t submitted_preferences_revision_ = 0;
   std::uint64_t submitted_organization_revision_ = 0;
+  std::uint64_t update_account_ = 0;  // the Steam account whose update check the model holds
+  PersistenceRequestId update_load_request_ = 0;
+  std::uint64_t submitted_update_revision_ = 0;
   std::optional<StorageError> clear_result_;
   bool preferences_load_failed_ = false;
   bool organization_load_failed_ = false;

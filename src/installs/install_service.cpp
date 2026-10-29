@@ -1,7 +1,9 @@
 #include "installs/install_service.h"
 #include "steam/install_volumes.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +18,10 @@ using steam::kInstallSpaceMargin;
 using steam::PendingInstallBytes;
 using steam::QueryVolumeSpace;
 using steam::VolumeSpaceSupported;
+
+namespace {
+bool ValidVolumeId(std::string_view id);
+}  // namespace
 
 std::vector<InstallRequest> ParseInstallRequests(const std::string& text) {
   std::vector<InstallRequest> requests;
@@ -68,10 +74,13 @@ std::vector<InstallRequest> ParseInstallRequests(const std::string& text) {
       continue;
     }
     if (id == "move") {
-      // move local-<uuid>: a drop-folder game into Playden's games folder on the console storage
+      // move local-<uuid>: a drop-folder game into Playden's games folder on the console storage;
+      // move <app id> <volume>: an installed game to another drive
       request.action = InstallRequest::Action::kMove;
       const auto game = ParseKey(token());
-      if (malformed || !game || game->store != Store::kLocal || !token().empty() || malformed) continue;
+      request.volume = std::string(token());
+      if (malformed || !game || !token().empty() || malformed) continue;
+      if (game->store == Store::kLocal ? !request.volume.empty() : !ValidVolumeId(request.volume)) continue;
       request.game = *game;
       requests.push_back(std::move(request));
       continue;
@@ -132,10 +141,14 @@ std::int64_t RateNowMs() {
 constexpr const char* kRecord = kInstallRecordName;
 constexpr const char* kJournal = ".playden-download";
 constexpr const char* kRegistry = ".playden-games";
+constexpr const char* kMoveJournal = ".playden-copy";  // stores::local::kCopyJournalDir
 constexpr const char* kDefaultVolume = ".playden-default-volume";
 constexpr const char* kDismissed = ".playden-downloads-dismissed";
 constexpr const char* kVolumeUnavailable = "The game's storage is not available.";
+constexpr const char* kQueueFull = "The Queue is full. Try again later.";
 constexpr const char* kInterrupted = "Interrupted. Resume to continue.";
+constexpr const char* kOldVolumeUnavailable = "The game's old drive is not connected. Connect it, then Resume to delete the old folder.";
+constexpr const char* kRegistryNotSaved = "Playden couldn't save the move on console storage. It tries again shortly.";
 
 // An update on disk that is putting its files in place: the game can't run until it finishes.
 bool UpdateLocked(const std::string& root) {
@@ -205,14 +218,20 @@ struct RegistryEntry {
   bool paused = false;  // "<id>\t<volume>\t0\tpaused": the player paused it, or it failed
   bool removing = false;  // "<id>\t<volume>\t<install bytes>\tremoving": uninstalled, folder not deleted yet
   bool update = false;    // "<id>\t<volume>\t<install bytes>\tupdate": installed, with an update job
+  // "<id>\t<volume>\t<install bytes>\tmove=<to>\tfrom=<from>": installed on <volume>, with a move job from
+  // <from> to <to>; once <volume> is <to>, only the old folder is left to delete.
+  std::string move_to;
+  std::string move_from;
   InstallOptions options;  // a job's "lang=<code>" and "branch=<name>" fields
+  std::int64_t finished_at = 0;  // "finished=<unix seconds>": a moved game's install time, older than its record
 };
 
 // One line per game: "<key>" (legacy, primary volume) or "<key>\t<volume id>\t<install bytes>",
 // followed by "\tpaused" for a job that should wait for Resume after a restart, or "\tremoving" for
 // an uninstall whose folder is not deleted yet, or "\tupdate" for an installed game with an update job
-// (then "\tpaused" is the update's), then a job's install options as "\tlang=<code>" and
-// "\tbranch=<name>" (none: the defaults). Fields after the install bytes may come in any order, and
+// (then "\tpaused" is the update's), or "\tmove=<volume>\tfrom=<volume>" for one with a move job, then a job's install options as "\tlang=<code>" and
+// "\tbranch=<name>" (none: the defaults), and "\tfinished=<unix seconds>" for a moved game's install time. Fields
+// after the install bytes may come in any order, and
 // unknown ones are skipped. The key is ToKey: a Steam game's app ID, "local-<uuid>" for an imported game.
 std::optional<RegistryEntry> ParseRegistryLine(std::string_view line) {
   RegistryEntry entry;
@@ -237,12 +256,23 @@ std::optional<RegistryEntry> ParseRegistryLine(std::string_view line) {
       const auto tab = fields.find('\t');
       const auto field = fields.substr(0, tab);
       fields = tab == std::string_view::npos ? std::string_view{} : fields.substr(tab + 1);
-      constexpr std::string_view kLanguage = "lang=", kBranch = "branch=";
+      constexpr std::string_view kLanguage = "lang=", kBranch = "branch=", kMove = "move=", kFrom = "from=",
+                                 kFinished = "finished=";
       if (field == "paused") entry.paused = true;
+      else if (field.substr(0, kMove.size()) == kMove && ValidVolumeId(field.substr(kMove.size())))
+        entry.move_to = std::string(field.substr(kMove.size()));
+      else if (field.substr(0, kFrom.size()) == kFrom && ValidVolumeId(field.substr(kFrom.size())))
+        entry.move_from = std::string(field.substr(kFrom.size()));
       else if (field == "removing") entry.removing = true;
       else if (field == "update") entry.update = true;
       else if (field.substr(0, kLanguage.size()) == kLanguage) entry.options.language = std::string(field.substr(kLanguage.size()));
       else if (field.substr(0, kBranch.size()) == kBranch) entry.options.branch = std::string(field.substr(kBranch.size()));
+      else if (field.substr(0, kFinished.size()) == kFinished) {
+        const auto value = field.substr(kFinished.size());
+        std::int64_t time = 0;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), time);
+        if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && time > 0) entry.finished_at = time;
+      }
     }
     entry.options = Registrable(std::move(entry.options));
   }
@@ -355,8 +385,47 @@ void InstallService::Scan() {
     }
     std::fclose(file);
   }
-  for (const auto& entry : entries) {
+  // A move comes back with its game: queued, or paused when the player paused it or it failed. One whose
+  // title may already name the copy (its switch marker), or that only has the old folder left to delete,
+  // must finish: it runs by itself and can't be canceled.
+  const auto restore_move = [this](const RegistryEntry& entry) {
+    if (entry.move_to.empty() || entry.move_to == entry.move_from || jobs_.size() >= kMaxJobs) return;
+    Job job;
+    job.view.id = entry.id;
+    job.view.kind = InstallJobKind::kMove;
+    job.view.volume_id = entry.move_to;
+    job.view.from_volume_id = entry.move_from.empty() ? entry.volume_id : entry.move_from;
+    // A line that doesn't say where the game came from, once it is at its destination, has no old folder to
+    // delete: the folder it names is the game's.
+    if (job.view.from_volume_id == job.view.volume_id) return;
+    // A destination that isn't there can't show whether the title already names the copy: the move stays
+    // locked until the drive is back and the job has run again.
+    const auto* to = FindVolume(entry.move_to);
+    job.view.locked = entry.volume_id == entry.move_to || !to || !to->available ||
+                      Exists(RootOn(entry.move_to, entry.id) + "/" + kMoveSwitchName);
+    if (job.view.locked || !entry.paused) {
+      job.view.state = InstallJobState::kQueued;
+    } else {
+      job.view.state = InstallJobState::kPaused;
+      job.view.failure = kInterrupted;
+    }
+    jobs_.push_back(job);
+  };
+  for (auto& entry : entries) {
     const auto* volume = FindVolume(entry.volume_id);
+    // A move that deleted the old folder before the registry named the copy: the game plays from the copy
+    // (complete, with its title following it or its journal gone), and the move only finishes.
+    if (!entry.move_to.empty() && entry.move_to != entry.volume_id && volume && volume->available &&
+        !Exists(RootOn(entry.volume_id, entry.id) + "/" + kRecord)) {
+      const auto* to = FindVolume(entry.move_to);
+      const auto copy = RootOn(entry.move_to, entry.id);
+      if (to && to->available && Exists(copy + "/" + kRecord) &&
+          (Exists(copy + "/" + kMoveSwitchName) || !Exists(copy + "/" + kMoveJournal))) {
+        if (entry.move_from.empty()) entry.move_from = entry.volume_id;
+        entry.volume_id = entry.move_to;
+        volume = to;
+      }
+    }
     if (entry.removing) {
       // An uninstall Playden stopped before the folder was gone carries on; one on an absent
       // drive waits for the drive.
@@ -368,16 +437,24 @@ void InstallService::Scan() {
     }
     if (!volume || !volume->available) {
       // Keep games on an absent drive listed so they come back when it does.
-      installed_.push_back({entry.id, entry.install_bytes, RootOn(entry.volume_id, entry.id), entry.volume_id, false});
+      installed_.push_back({entry.id, entry.install_bytes, RootOn(entry.volume_id, entry.id), entry.volume_id, false,
+                            entry.finished_at});
+      installed_.back().finished_kept = entry.finished_at > 0;
+      restore_move(entry);
       continue;
     }
     const auto root = RootOn(entry.volume_id, entry.id);
     // An update in progress is read first: its game stays installed, and its job comes back.
     const auto update = Exists(root + "/" + kRecord) ? ReadUpdateState(root) : std::nullopt;
     if (Exists(root + "/" + kRecord)) {
+      // A moved game's install time is the registry's: its record is the copy's.
       installed_.push_back({entry.id, RecordedBytes(root + "/" + kRecord), root, entry.volume_id, true,
-                            RecordTime(root + "/" + kRecord), ReadInstallRecord(root + "/" + kRecord)});
-      if ((update || entry.update) && jobs_.size() < kMaxJobs) {
+                            entry.finished_at > 0 ? entry.finished_at : RecordTime(root + "/" + kRecord),
+                            ReadInstallRecord(root + "/" + kRecord)});
+      installed_.back().finished_kept = entry.finished_at > 0;
+      if (!entry.move_to.empty()) {
+        restore_move(entry);
+      } else if ((update || entry.update) && jobs_.size() < kMaxJobs) {
         Job job;
         job.view.id = entry.id;
         job.view.kind = InstallJobKind::kUpdate;
@@ -420,6 +497,7 @@ void InstallService::Scan() {
       // listed as unavailable, so it comes back with its folder instead of being forgotten at
       // the next save.
       installed_.push_back({entry.id, entry.install_bytes, root, entry.volume_id, false});
+      restore_move(entry);
     }
   }
   std::sort(installed_.begin(), installed_.end(),
@@ -443,14 +521,14 @@ void InstallService::Scan() {
   ++revision_;
 }
 
-void InstallService::SaveRegistry() {
+bool InstallService::SaveRegistry(bool sync) {
   if (!default_volume_saved_) SaveDefaultVolume();
   const auto& primary = volumes_.front().games_root;
   mkdir(primary.c_str(), 0777);
   const auto path = primary + "/" + kRegistry;
   const auto temporary = path + ".tmp";
   FILE* registry = std::fopen(temporary.c_str(), "w");
-  if (!registry) return;
+  if (!registry) return false;
   const auto job_fields = [](const Job& job) {
     const bool waits = job.view.state == InstallJobState::kPaused || job.view.state == InstallJobState::kFailed;
     std::string fields = waits ? "\tpaused" : "";
@@ -461,21 +539,36 @@ void InstallService::SaveRegistry() {
   // An update job rides on its game's line, which stays an installed game's line for older versions.
   for (const auto& game : installed_) {
     std::string fields;
-    for (const auto& job : jobs_)
-      if (job.view.id == game.id && job.view.kind == InstallJobKind::kUpdate && !job.dropped)
-        fields = "\tupdate" + job_fields(job);
+    for (const auto& job : jobs_) {
+      if (job.view.id != game.id || job.dropped) continue;
+      if (job.view.kind == InstallJobKind::kUpdate) fields = "\tupdate" + job_fields(job);
+      if (job.view.kind == InstallJobKind::kMove)
+        fields = "\tmove=" + job.view.volume_id + "\tfrom=" + job.view.from_volume_id + job_fields(job);
+    }
+    if (game.finished_kept && game.finished_at > 0) fields += "\tfinished=" + std::to_string(game.finished_at);
     std::fprintf(registry, "%s\t%s\t%llu%s\n", ToKey(game.id).c_str(), game.volume_id.c_str(),
                  static_cast<unsigned long long>(game.install_bytes), fields.c_str());
   }
   for (const auto& job : jobs_) {
-    if (job.view.kind == InstallJobKind::kUpdate || job.dropped) continue;
+    if (job.view.kind != InstallJobKind::kInstall || job.dropped) continue;
     std::fprintf(registry, "%s\t%s\t0%s\n", ToKey(job.view.id).c_str(), job.view.volume_id.c_str(),
                  job_fields(job).c_str());
   }
   for (const auto& game : uninstalling_)
     std::fprintf(registry, "%s\t%s\t%llu\tremoving\n", ToKey(game.id).c_str(), game.volume_id.c_str(),
                  static_cast<unsigned long long>(game.install_bytes));
-  if (std::fclose(registry) == 0) std::rename(temporary.c_str(), path.c_str());
+  bool saved = std::fflush(registry) == 0 && !std::ferror(registry) && (!sync || ::fsync(::fileno(registry)) == 0);
+  saved = std::fclose(registry) == 0 && saved;
+  saved = saved && std::rename(temporary.c_str(), path.c_str()) == 0;
+  if (!saved) {
+    std::remove(temporary.c_str());
+    return false;
+  }
+  if (!sync) return true;
+  const int folder = ::open(primary.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  saved = folder >= 0 && ::fsync(folder) == 0;
+  if (folder >= 0) ::close(folder);
+  return saved;
 }
 
 void InstallService::SaveDefaultVolume() {
@@ -564,11 +657,14 @@ void InstallService::Install(GameId id, std::optional<std::uint64_t> estimated_b
   wake_.notify_all();
 }
 
-void InstallService::Update(GameId id, const InstallOptions& options, std::optional<std::uint64_t> estimated_bytes) {
+std::string InstallService::Update(GameId id, const InstallOptions& options, std::optional<std::uint64_t> estimated_bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (stopping_ || !id.valid() || !RunnerFor(id.store) || Find(id) || jobs_.size() >= kMaxJobs) return;
+  if (stopping_ || !id.valid() || !RunnerFor(id.store)) return "Playden can't update this game now.";
+  if (Find(id)) return "The game is already in the Queue.";
   const auto game = std::find_if(installed_.begin(), installed_.end(), [id](const InstalledGame& entry) { return entry.id == id; });
-  if (game == installed_.end() || !game->available) return;
+  if (game == installed_.end()) return "The game is not installed.";
+  if (!game->available) return kVolumeUnavailable;
+  if (jobs_.size() >= kMaxJobs) return kQueueFull;
   Job job;
   job.view.id = id;
   job.view.kind = InstallJobKind::kUpdate;
@@ -583,6 +679,7 @@ void InstallService::Update(GameId id, const InstallOptions& options, std::optio
   jobs_.push_back(job);
   Publish();
   wake_.notify_all();
+  return {};
 }
 
 // Held for its game: only the gate is asked next time, at Steam nothing. While the game runs it is asked again soon,
@@ -634,7 +731,60 @@ ApplyAnswer InstallService::MayApply(GameId id) {
 bool InstallService::Locked(GameId id) {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto* job = Find(id);
+  if (job && job->view.kind == InstallJobKind::kMove) return job->view.locked || job->view.state == InstallJobState::kRunning;
   return job && job->view.kind == InstallJobKind::kUpdate && job->view.locked;
+}
+
+std::optional<std::uint64_t> InstallService::FreeBytes(const std::string& path) const {
+  if (space_query_) return space_query_(path);
+  const auto space = QueryVolumeSpace(path);
+  return space ? std::optional<std::uint64_t>(space->free_bytes) : std::nullopt;
+}
+
+void InstallService::SetMoveRunner(MoveRunner* runner) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  mover_ = runner;
+  wake_.notify_all();
+}
+
+std::string InstallService::Move(GameId id, const std::string& volume_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (stopping_ || !mover_) return "Playden can't move games now.";
+  const auto game = std::find_if(installed_.begin(), installed_.end(), [id](const InstalledGame& entry) { return entry.id == id; });
+  if (game == installed_.end()) return "The game is not installed.";
+  if (std::any_of(uninstalling_.begin(), uninstalling_.end(), [id](const InstalledGame& entry) { return entry.id == id; }))
+    return "The game is being uninstalled.";
+  if (Find(id)) return "The game is already in the Queue.";
+  if (!game->available) return kVolumeUnavailable;
+  const auto* volume = FindVolume(volume_id);
+  if (!volume || !volume->available) return "The storage is disconnected.";
+  if (game->volume_id == volume_id) return "The game is already on " + volume->label + ".";
+  if (jobs_.size() >= kMaxJobs) return kQueueFull;
+  // The whole game, less what other jobs still need there: the old folder stays until the copy is checked.
+  const auto free = FreeBytes(volume->games_root);
+  if (free) {
+    auto available = *free;
+    for (const auto& pending : jobs_) {
+      if (pending.view.volume_id != volume_id || pending.cancel_requested || pending.view.state == InstallJobState::kFailed)
+        continue;
+      available -= std::min(available, PendingInstallBytes(pending.estimated_bytes, pending.view.held_bytes));
+    }
+    if (available < kInstallSpaceMargin || game->install_bytes > available - kInstallSpaceMargin)
+      return "Not enough free space on " + volume->label + " for this game.";
+  } else if (space_query_ || VolumeSpaceSupported()) {
+    return "Free space is unavailable. Check the storage and try again.";
+  }
+  Job job;
+  job.view.id = id;
+  job.view.kind = InstallJobKind::kMove;
+  job.view.volume_id = volume_id;
+  job.view.from_volume_id = game->volume_id;
+  job.view.total_bytes = game->install_bytes;
+  job.estimated_bytes = game->install_bytes;
+  jobs_.push_back(job);
+  Publish();
+  wake_.notify_all();
+  return {};
 }
 
 // Sets the job's volume and estimate; a volume that is absent or short of space fails the job.
@@ -642,17 +792,17 @@ bool InstallService::Admit(Job& job, const std::string& target, std::optional<st
   job.view.volume_id = target;
   job.estimated_bytes = estimated_bytes;
   const auto* volume = FindVolume(target);
-  const auto space = volume && volume->available ? QueryVolumeSpace(volume->games_root) : std::nullopt;
+  const auto space = volume && volume->available ? FreeBytes(volume->games_root) : std::nullopt;
   if (!volume || !volume->available) {
     job.view.state = InstallJobState::kFailed;
     job.view.failure = "The storage is disconnected.";
   } else if (!space) {
-    if (VolumeSpaceSupported()) {
+    if (space_query_ || VolumeSpaceSupported()) {
       job.view.state = InstallJobState::kFailed;
       job.view.failure = "Free space is unavailable. Check the storage and try again.";
     }
   } else {
-    auto available = space->free_bytes;
+    auto available = *space;
     // Free space already counts what other downloads have written; reserve only the rest.
     for (const auto& pending : jobs_) {
       if (pending.view.volume_id != target || pending.cancel_requested ||
@@ -744,6 +894,26 @@ void InstallService::Cancel(GameId id) {
   auto* job = Find(id);
   // An update that is putting its files in place can't stop half way.
   if (!job || job->view.locked || job->dropped) return;
+  if (job->view.kind == InstallJobKind::kMove) {
+    // The game stays where it plays from: a move that has only the old folder left to delete is forgotten
+    // (the switch marker locks one whose title may name the copy); otherwise its partial copy goes.
+    const auto game = std::find_if(installed_.begin(), installed_.end(), [id](const InstalledGame& entry) { return entry.id == id; });
+    const bool moved = game != installed_.end() && game->volume_id == job->view.volume_id;
+    job->cancel_requested = !moved;
+    if (active_ == id) {
+      active_cancel_.store(true);
+    } else {
+      const auto* volume = FindVolume(job->view.volume_id);
+      const auto root = !moved && volume && volume->available ? RootOn(job->view.volume_id, id) : std::string();
+      auto from = RootOn(job->view.from_volume_id, id);
+      jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(), [id](const Job& entry) { return entry.view.id == id; }),
+                  jobs_.end());
+      if (!root.empty()) QueueRemoval({id.store, root, std::nullopt, std::nullopt, false, true, std::move(from)});
+    }
+    Publish();
+    wake_.notify_all();
+    return;
+  }
   job->cancel_requested = true;
   if (active_ == id) {
     active_cancel_.store(true);
@@ -768,6 +938,8 @@ void InstallService::Uninstall(GameId id) {
   // drive is only forgotten: whatever its path names now isn't this install, so nothing is removed.
   const auto* volume = FindVolume(found->volume_id);
   if (!found->available && (!volume || !volume->available)) return;
+  // A moving game finishes or cancels its move first.
+  if (const auto* job = Find(id); job && job->view.kind == InstallJobKind::kMove) return;
   const auto game = *found;
   installed_.erase(found);
   // Its update goes with it: a running one stops and is forgotten, and the uninstall deletes its files too.
@@ -880,6 +1052,8 @@ void InstallService::Run() {
     std::string next_games_root;
     InstallOptions next_options;
     bool next_update = false;
+    bool next_move = false, next_finishing = false;
+    std::string next_from_root, next_volume;
     std::optional<Removal> removal;
     {
       std::unique_lock<std::mutex> lock(mutex_);
@@ -894,6 +1068,7 @@ void InstallService::Run() {
         bool ready = false;
         for (const auto& job : jobs_) {
           if (job.view.state != InstallJobState::kQueued) continue;
+          if (job.view.kind == InstallJobKind::kMove && !mover_) continue;  // moves wait for their runner
           if (job.not_before <= now) { ready = true; break; }
           if (!earliest || job.not_before < *earliest) earliest = job.not_before;
         }
@@ -909,6 +1084,41 @@ void InstallService::Run() {
         for (auto& job : jobs_) {
           if (job.view.state != InstallJobState::kQueued || job.not_before > now) continue;
           const auto* volume = FindVolume(job.view.volume_id);
+          if (job.view.kind == InstallJobKind::kMove) {
+            if (!mover_) continue;
+            const auto* from = FindVolume(job.view.from_volume_id);
+            const auto game = std::find_if(installed_.begin(), installed_.end(),
+                                           [&](const InstalledGame& entry) { return entry.id == job.view.id; });
+            const bool finishing = game != installed_.end() && game->volume_id == job.view.volume_id;
+            if (!volume || !volume->available || !from || !from->available) {
+              job.view.state = InstallJobState::kFailed;
+              job.view.failure = kVolumeUnavailable;
+              // The game plays from its copy already: only the old folder waits for its drive, and Play doesn't.
+              if (finishing) {
+                job.view.locked = false;
+                if (volume && volume->available) job.view.failure = kOldVolumeUnavailable;
+              }
+              Publish();
+              continue;
+            }
+            job.view.state = InstallJobState::kRunning;
+            if (job.waiting) { job.waiting = false; job.view.failure.clear(); }
+            job.rate.Reset();
+            job.view.bytes_per_second.reset(); job.view.eta_seconds.reset(); job.view.server_name.clear();
+            job.view.step = InstallStep::kStarting;
+            job.view.step_since = std::chrono::steady_clock::now();
+            next = job.view.id;
+            next_move = true;
+            next_finishing = finishing;
+            next_root = RootOn(job.view.volume_id, job.view.id);
+            next_from_root = RootOn(job.view.from_volume_id, job.view.id);
+            next_games_root = volume->games_root;
+            next_volume = job.view.volume_id;
+            active_ = next;
+            active_cancel_.store(false);
+            Publish();
+            break;
+          }
           runner = RunnerFor(job.view.id.store);
           if (!runner) {
             // A store without a runner can't install; its job in the registry waits as failed.
@@ -944,7 +1154,14 @@ void InstallService::Run() {
     }
     if (removal) {
       std::string failure;
-      if (auto* remover = RunnerFor(removal->store)) {
+      MoveRunner* mover = nullptr;
+      if (removal->move) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        mover = mover_;
+      }
+      if (removal->move) {
+        if (mover) mover->Discard(removal->from, removal->root);
+      } else if (auto* remover = RunnerFor(removal->store)) {
         if (removal->forget) remover->Forget(*removal->forget);
         else if (removal->update) remover->DiscardUpdate(removal->root);
         else failure = remover->Remove(removal->root);
@@ -971,6 +1188,10 @@ void InstallService::Run() {
       continue;
     }
     if (!next) continue;
+    if (next_move) {
+      RunMove(*next, next_from_root, next_root, next_volume, next_finishing);
+      continue;
+    }
 
     // An update that waited for its game to close asks the gate first; the game still running, it waits
     // again without asking Steam anything.
@@ -1072,6 +1293,7 @@ void InstallService::Run() {
           if (game.id != *next) continue;
           game.install_bytes = result.install_bytes;
           game.finished_at = WallNow();
+          game.finished_kept = false;
           game.update_bytes = downloaded;
           game.record = ReadInstallRecord(next_root + "/" + kRecord);
         }
@@ -1128,6 +1350,200 @@ void InstallService::Run() {
     if (remove_files) runner->Remove(next_root);
     if (discard_update) runner->DiscardUpdate(next_root);
   }
+}
+
+// A move canceled while it waited for the game's gate or the folder check, before any copy ran: it goes, and
+// so does a copy left by an earlier run (the caller discards it once unlocked). False when there is none.
+bool InstallService::DropCanceledMove(GameId id, const std::string& to) {
+  const auto* job = Find(id);
+  if (!job || !job->cancel_requested || Exists(to + "/" + kMoveSwitchName)) return false;
+  jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(), [id](const Job& entry) { return entry.view.id == id; }), jobs_.end());
+  return true;
+}
+
+// A move the worker took. Play waits from here (Locked: the job runs), and a game that runs or starts holds
+// the move as it holds an update's apply, so its files don't change while they are copied.
+void InstallService::RunMove(GameId id, const std::string& from, const std::string& to, const std::string& volume_id,
+                             bool finishing) {
+  MoveRunner* mover = nullptr;
+  std::string games_root;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mover = mover_;
+    if (const auto* volume = FindVolume(volume_id)) games_root = volume->games_root;
+    // Never a move onto the game's own folder: Finish would delete it.
+    if (from == to) {
+      active_.reset();
+      if (auto* job = Find(id)) {
+        ClearWait(*job);
+        job->view.state = InstallJobState::kFailed;
+        job->view.failure = "The game is already on this drive.";
+        job->view.locked = false;
+      }
+      Publish();
+      return;
+    }
+  }
+  if (!finishing) {
+    if (const auto answer = AskApplyGate(id); answer != ApplyAnswer::kApply) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      active_.reset();
+      if (DropCanceledMove(id, to)) {
+        Publish();
+        lock.unlock();
+        mover->Discard(from, to);
+        return;
+      }
+      if (auto* job = Find(id); job && job->view.state == InstallJobState::kRunning) {
+        job->view.state = InstallJobState::kQueued;
+        job->view.failure = InstallRunner::kWaitingForGame;
+        job->waiting = true;
+        job->game_unknown = answer == ApplyAnswer::kUnknown;
+        job->retry_delay = WaitForGame(*job);
+        job->not_before = std::chrono::steady_clock::now() + job->retry_delay;
+      }
+      Publish();
+      return;
+    }
+    // The destination's folder may have been made over FTP and not be writable by the app user.
+    if (const auto unwritable = folder_check_ ? folder_check_(games_root) : std::string(); !unwritable.empty()) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      active_.reset();
+      if (DropCanceledMove(id, to)) {
+        Publish();
+        lock.unlock();
+        mover->Discard(from, to);
+        return;
+      }
+      if (auto* job = Find(id); job && job->view.state == InstallJobState::kRunning) {
+        ClearWait(*job);
+        job->view.state = InstallJobState::kFailed;
+        job->view.failure = unwritable;
+      }
+      Publish();
+      return;
+    }
+  }
+  const auto progress = [this, id](std::uint64_t done, std::uint64_t total, std::uint64_t held) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (auto* job = Find(id)) {
+      job->retry_delay = std::chrono::milliseconds{0};
+      if (job->view.state == InstallJobState::kRunning) job->rate.Record(done, RateNowMs());
+      job->view.done_bytes = done;
+      job->view.total_bytes = total;
+      job->view.held_bytes = held;  // what the copy holds is no longer reserved
+      ++revision_;
+    }
+  };
+  const auto step = [this, id](InstallStep step) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto* job = Find(id);
+    if (!job || job->view.step == step) return;
+    job->view.step = step;
+    job->view.step_since = std::chrono::steady_clock::now();
+    // From the switch on the title may name the copy: the move can't stop half way.
+    if (step == InstallStep::kSwitching && !job->view.locked) job->view.locked = true;
+    ++revision_;
+  };
+  InstallRunner::Result result;
+  if (finishing) result.ok = true;
+  else result = mover->Copy(id, from, to, volume_id, active_cancel_, progress, step);
+
+  bool discard = false, finish = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto* job = Find(id);
+    const bool switching = Exists(to + "/" + kMoveSwitchName);
+    if (!job) {
+      active_.reset();
+    } else if (result.ok) {
+      // The title follows the copy: the game is listed there from now on, and the move must finish.
+      for (auto& game : installed_) {
+        if (game.id != id) continue;
+        game.volume_id = volume_id;
+        game.root = to;
+        game.available = true;
+        if (!finishing) {
+          if (result.install_bytes > 0) game.install_bytes = result.install_bytes;
+          game.record = ReadInstallRecord(to + "/" + kRecord);
+          // The copied record is newer, but the game was installed when it was: it keeps its time (Home's
+          // Recently installed, Completed), and the registry keeps it from now on.
+          if (game.finished_at > 0) {
+            game.finished_kept = true;
+          } else {
+            // Its time unknown, the copy's stands for it: Completed doesn't list it for that.
+            game.finished_at = RecordTime(to + "/" + kRecord);
+            if (game.finished_at > 0) {
+              dismissed_.emplace_back(id, game.finished_at);
+              SaveDismissed();
+            }
+          }
+        }
+      }
+      job->view.locked = true;
+      job->cancel_requested = false;
+      job->view.step = InstallStep::kDeletingOld;
+      job->view.step_since = std::chrono::steady_clock::now();
+      job->view.done_bytes = job->view.total_bytes;
+      // The old folder goes only once the registry on the storage names the copy: a restart would
+      // otherwise look for the game in a folder that is gone.
+      finish = SaveRegistry(true);
+      if (!finish) {
+        active_.reset();
+        job->view.state = InstallJobState::kQueued;
+        job->view.failure = kRegistryNotSaved;
+        job->waiting = true;
+        job->retry_delay = job->retry_delay.count() == 0 ? first_retry_ : std::min(job->retry_delay * 2, most_retry_);
+        job->not_before = std::chrono::steady_clock::now() + job->retry_delay;
+      }
+    } else if (job->cancel_requested && !switching) {
+      jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(), [id](const Job& entry) { return entry.view.id == id; }),
+                  jobs_.end());
+      discard = true;
+      active_.reset();
+    } else {
+      active_.reset();
+      job->cancel_requested = false;
+      job->view.locked = switching;
+      job->rate.Reset(); job->view.bytes_per_second.reset(); job->view.eta_seconds.reset();
+      if (job->view.state == InstallJobState::kRunning && result.canceled && (stopping_ || switching)) {
+        // Playden is closing, or the title may already name the copy: it carries on by itself.
+        job->view.state = InstallJobState::kQueued;
+      } else if (job->view.state == InstallJobState::kRunning && !result.ok && !result.canceled && result.retry_later) {
+        // The title runs or the runtime is busy: the copy stays and the switch is tried again after a wait.
+        job->view.state = InstallJobState::kQueued;
+        job->view.failure = result.waiting.empty() ? kWaiting : result.waiting;
+        job->waiting = true;
+        job->retry_delay = job->retry_delay.count() == 0 ? first_retry_ : std::min(job->retry_delay * 2, most_retry_);
+        job->not_before = std::chrono::steady_clock::now() + job->retry_delay;
+      } else if (job->view.state == InstallJobState::kRunning) {
+        // A Pause or Resume that arrived while the run was stopping already chose the state.
+        ClearWait(*job);
+        job->view.state = result.canceled ? (switching ? InstallJobState::kQueued : InstallJobState::kPaused)
+                                          : InstallJobState::kFailed;
+        job->view.failure = result.canceled ? std::string() : result.failure;
+      }
+    }
+    // A move that saved the registry on the storage isn't saved over it again.
+    if (finish) ++revision_;
+    else Publish();
+  }
+  if (discard) mover->Discard(from, to);
+  if (!finish) return;
+  const auto failure = mover->Finish(from, to);
+  std::lock_guard<std::mutex> lock(mutex_);
+  active_.reset();
+  if (failure.empty()) {
+    jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(), [id](const Job& entry) { return entry.view.id == id; }),
+                jobs_.end());
+  } else if (auto* job = Find(id)) {
+    // The game plays from the copy; only the old folder is left. Resume tries again, Cancel leaves it.
+    ClearWait(*job);
+    job->view.state = InstallJobState::kFailed;
+    job->view.failure = failure;
+    job->view.locked = false;
+  }
+  Publish();
 }
 
 }  // namespace playden::installs

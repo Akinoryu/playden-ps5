@@ -138,6 +138,8 @@ void LibraryController::TickSteam(LibraryEvent& event) {
     if(!awaiting_fresh) request_=0;
     return;
   }
+  // Only a load that read the account's licenses can tell which games have updates.
+  if(!cached && event.licenses_read) { licenses_generation_=model_.state().account_generation;++licenses_read_; }
   if(cached && !offline_) Loading();
   else {
     const char* warning=event.cache_error!=StorageError::kNone ? "Library loaded, but saving failed. Retry to save."

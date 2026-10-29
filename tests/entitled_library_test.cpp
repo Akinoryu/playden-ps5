@@ -64,6 +64,27 @@ void DatesMergeIntoOwnedGames() {
   assert(result.games[0].added_at_unix_seconds == 1500000000u);
   // App 99 is licensed but not in the owned list; app 20 has no license date.
   assert(!result.games[1].added_at_unix_seconds);
+  assert(result.licenses_read);
+}
+
+// The licenses go to size estimates and update checks for the account that read them only.
+void LicensesBelongToTheirAccount() {
+  Owned owned;
+  Acquisitions acquisitions;
+  acquisitions.result.owned_apps = {10};
+  acquisitions.result.owned_depots = {11};
+  LicensedDepots licensed;
+  EntitledLibraryBackend backend(owned, acquisitions);
+  backend.SetLicensedDepots(&licensed);
+  std::atomic<bool> cancel{false};
+  assert(backend.Fetch(Session(), cancel).licenses_read);
+  assert(licensed.Get(123) && licensed.Get(123)->depots == std::set<std::uint32_t>{11});
+  // Another account whose license read fails has none: the first account's don't stand in.
+  acquisitions.result = {CmError::kNetwork, {}};
+  auto other = Session();
+  other.steam_id = 456;
+  assert(!backend.Fetch(other, cancel).licenses_read);
+  assert(!licensed.Get(456));
 }
 
 void CmFailureIsNeverFatal() {
@@ -76,6 +97,7 @@ void CmFailureIsNeverFatal() {
   assert(result.error == LibraryError::kNone && result.games.size() == 2);
   assert(!result.games[0].added_at_unix_seconds && !result.games[1].added_at_unix_seconds);
   assert(backend.last_acquisition_error() == CmError::kRejected);
+  assert(!result.licenses_read);  // the games are listed, but what they own is unknown
 }
 
 
@@ -543,6 +565,7 @@ int main() {
   LicensedFreeGamesAreAdded();
   LicensedDemosAreAddedAndMarked();
   DatesMergeIntoOwnedGames();
+  LicensesBelongToTheirAccount();
   CmFailureIsNeverFatal();
   OwnedFailureStopsTheCmSession();
   CancelReachesARunningCmSession();

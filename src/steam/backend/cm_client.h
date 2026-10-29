@@ -72,17 +72,20 @@ class LicensedDepots {
     std::set<std::uint32_t> apps;
     std::set<std::uint32_t> depots;
   };
-  void Set(const AcquisitionResult& result) {
+  void Set(std::uint64_t account, const AcquisitionResult& result) {
     std::lock_guard<std::mutex> lock(mutex_);
+    account_ = account;
     grant_ = Grant{result.owned_apps, result.owned_depots};
   }
-  std::optional<Grant> Get() const {
+  // None until a load of this account read its licenses: another account's never stand in for them.
+  std::optional<Grant> Get(std::uint64_t account) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return grant_;
+    return account == account_ ? grant_ : std::nullopt;
   }
 
  private:
   mutable std::mutex mutex_;
+  std::uint64_t account_ = 0;
   std::optional<Grant> grant_;
 };
 

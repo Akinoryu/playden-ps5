@@ -239,9 +239,10 @@ class Controller {
   // was queued tells a new refusal from an old one.
   std::set<GameId> downloading_;
   std::set<GameId> updating_;  // the install jobs that are updates of installed games
+  std::set<GameId> moving_;    // the install jobs that move installed games to another drive
   // Installed games whose update finished: their Steam details (launch options, update state) are asked again.
   std::set<GameId> refresh_details_;
-  bool library_loading_ = false;  // the library refresh last seen running
+  std::uint64_t licenses_read_ = 0;  // app::LibraryController::LicensesRead last seen
   std::vector<GameId> auto_prepare_;  // in the order their downloads (copies, imports) finished
   std::set<GameId> refresh_asked_;  // updated games whose setup for the new files was asked for (TickRuntime)
   std::optional<GameId> prepare_next_pending_;  // Prepare next on a game not in the runtime's queue yet
@@ -355,6 +356,8 @@ class Controller {
   std::optional<std::chrono::steady_clock::time_point> licenses_notice_at_;  // when a license check starts showing
   std::optional<GameId> requested_detail_;
   std::uint64_t requested_generation_ = 0;
+  bool update_check_running_ = false;  // an installed-games update check the details service runs
+  std::vector<GameId> update_check_ids_;  // its games, to start it again after a language change
   // The download language app details were last asked for: sizes follow it, so a change asks again.
   std::string requested_language_;
   bool reissue_after_language_ = false;

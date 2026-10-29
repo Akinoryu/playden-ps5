@@ -4,6 +4,7 @@
 #include "steam/backend/depot_installer.h"
 #include "stores/local/drop_folder_access.h"
 #include "stores/local/scanner.h"
+#include "stores/local/source_walk.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -21,8 +22,6 @@ namespace playden::stores::local {
 namespace {
 
 constexpr const char* kRecord = ".playden-install.json";  // DepotInstaller::kInstallRecord
-constexpr int kOpenFolder = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
-constexpr int kOpenFile = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
 
 bool Exists(const std::string& path) {
   struct stat info {};
@@ -33,17 +32,6 @@ std::optional<std::uint64_t> FileSize(const std::string& path) {
   struct stat info {};
   if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) return std::nullopt;
   return info.st_size > 0 ? static_cast<std::uint64_t>(info.st_size) : 0;
-}
-
-std::vector<std::string> Split(const std::string& path) {
-  std::vector<std::string> parts;
-  std::size_t start = 0;
-  for (;;) {
-    const auto slash = path.find('/', start);
-    parts.push_back(path.substr(start, slash == std::string::npos ? std::string::npos : slash - start));
-    if (slash == std::string::npos) return parts;
-    start = slash + 1;
-  }
 }
 
 bool SameTime(const struct stat& info, const CopyFile& file) {
@@ -61,76 +49,6 @@ bool AsPlanned(const struct stat& info, const CopyFile& file) {
   return S_ISREG(info.st_mode) && info.st_size >= 0 && static_cast<std::uint64_t>(info.st_size) == file.bytes &&
          SameTime(info, file);
 }
-
-// Opens the plan's files from the game folder, one walk step at a time (platform/directory_walk.h):
-// the folders of the current file stay open, so files in the same folder open in one step.
-class SourceWalk {
- public:
-  explicit SourceWalk(std::string source) : source_(std::move(source)) {}
-  ~SourceWalk() {
-    for (auto& level : chain_) ::close(level.fd);
-    if (root_.fd >= 0) ::close(root_.fd);
-  }
-  SourceWalk(const SourceWalk&) = delete;
-  SourceWalk& operator=(const SourceWalk&) = delete;
-
-  // A descriptor for the file, or -1 with errno.
-  int OpenFile(const std::string& relative) {
-    if (root_.fd < 0) {
-      root_.fd = platform::OpenDirectoryWalk(source_);
-      if (root_.fd < 0) return -1;
-    }
-    const auto parts = Split(relative);
-    std::size_t common = 0;
-    while (common < chain_.size() && common + 1 < parts.size() && chain_[common].name == parts[common]) ++common;
-    while (chain_.size() > common) {
-      ::close(chain_.back().fd);
-      chain_.pop_back();
-    }
-    for (std::size_t index = common; index + 1 < parts.size(); ++index) {
-      Level& parent = chain_.empty() ? root_ : chain_.back();
-      const int fd = platform::OpenWalkChild(parent.fd, parts[index].c_str(), kOpenFolder, Listed(parent, parts[index]));
-      if (fd < 0) return -1;
-      chain_.push_back(Level{parts[index], fd, {}, false});
-    }
-    Level& folder = chain_.empty() ? root_ : chain_.back();
-    return platform::OpenWalkChildUnprivileged(folder.fd, parts.back().c_str(), kOpenFile, Listed(folder, parts.back()));
-  }
-
- private:
-  struct Level {
-    std::string name;
-    int fd = -1;
-    std::unordered_map<std::string, std::uint64_t> listed;
-    bool listed_read = false;
-  };
-  // A walk by path checks each step against its folder's listing; the listing is read once per
-  // folder instead of once per file (0: the walk reads it itself).
-  std::uint64_t Listed(Level& level, const std::string& name) {
-#if defined(PLAYDEN_WALK_BY_PATH)
-    if (!level.listed_read) {
-      level.listed_read = true;
-      const int listing_fd = ::dup(level.fd);
-      DIR* listing = listing_fd >= 0 ? ::fdopendir(listing_fd) : nullptr;
-      if (!listing && listing_fd >= 0) ::close(listing_fd);
-      if (listing) {
-        while (const auto* entry = ::readdir(listing)) level.listed[entry->d_name] = entry->d_fileno;
-        ::closedir(listing);
-      }
-    }
-    const auto found = level.listed.find(name);
-    return found == level.listed.end() ? 0 : found->second;
-#else
-    (void)level;
-    (void)name;
-    return 0;
-#endif
-  }
-
-  std::string source_;
-  Level root_;
-  std::vector<Level> chain_;
-};
 
 enum class CopyStatus { kOk, kChanged, kCanceled, kReadFailed, kWriteFailed, kNoSpace };
 

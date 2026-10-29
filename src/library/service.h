@@ -27,6 +27,8 @@ struct LibraryEvent {
   std::uint64_t retrieved_at_unix_seconds = 0;
   bool cache_available = false;
   StorageError cache_error = StorageError::kNone;
+  // kComplete: this load read the account's licenses too (never for a cached library).
+  bool licenses_read = false;
 };
 
 // A single worker owns session, network, and cache IO. Dependencies outlive the

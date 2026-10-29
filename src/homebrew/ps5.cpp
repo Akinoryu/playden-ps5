@@ -7,6 +7,7 @@
 #include "homebrew/store_art.hpp"
 #include "homebrew/controller.hpp"
 #include "steam/install_volumes.h"
+#include "installs/game_move.h"
 #include "stores/local/copy_runner.h"
 #include "stores/local/library_source.h"
 #include "app/diagnostic_log.h"
@@ -372,7 +373,9 @@ int main() {
             content_language = saved.content_language;
         }
         playden::OrganizationStore organization(library_storage);
-        playden::app::PersistenceService persistence(preferences,organization);
+        // Each Steam account's last update check, next to its library cache.
+        playden::UpdateCheckStore update_checks(library_storage);
+        playden::app::PersistenceService persistence(preferences,organization,&update_checks);
         playden::steam::CmClient details_cm(paths.trust_store, library_storage);
         details_cm.SetOwner("details");
         details_cm.SetSharedSession(steam_cm);
@@ -722,9 +725,44 @@ int main() {
             copy_options.as_root = [](const std::function<bool()>& work) { return playden::ps5::WithRoot(work); };
             copy_runner = std::make_unique<playden::stores::local::LocalCopyRunner>(*imports, std::move(copy_options));
         }
+        // Moving installed games between drives: the game's PS5 title follows the copy under its publication
+        // lease (RuntimeHost::Relocate), as for an imported game's copy.
+        playden::installs::GameMoveOptions move_options;
+        move_options.log = [](const std::string& line) { playden::app::AppendLogLine(log_root, "install.log", line); };
+        move_options.hold_effective_uid = playden::ps5::HoldEffectiveUid;
+        move_options.relocate = [host = runtime_host.get()](const playden::installs::GameRelocation& relocation) {
+            using Move = playden::installs::GameRelocationResult;
+            using Runtime = playden::homebrew::RuntimeRelocationResult;
+            Move answer;
+            if (!host) {
+                answer.outcome = Move::Outcome::kBusy;
+                answer.message = "The runtime services are unavailable.";
+                return answer;
+            }
+            // Without its number the game's title can't be found: nothing moves yet.
+            const auto number = host->RuntimeNumberFor(relocation.game);
+            if (!number) {
+                answer.outcome = Move::Outcome::kBusy;
+                answer.message = "Playden is busy with this game. Try again in a moment.";
+                return answer;
+            }
+            playden::homebrew::RuntimeRelocation request;
+            request.runtime_number = *number;
+            request.to = relocation.to;
+            request.volume_id = relocation.volume_id;
+            request.move_files = relocation.move_files;
+            const auto result = host->Relocate(std::move(request), std::chrono::minutes(2));
+            answer.outcome = result.outcome == Runtime::Outcome::kDone   ? Move::Outcome::kDone
+                             : result.outcome == Runtime::Outcome::kBusy ? Move::Outcome::kBusy
+                                                                         : Move::Outcome::kFailed;
+            answer.message = result.message;
+            return answer;
+        };
+        playden::installs::GameMover game_mover(std::move(move_options));
         playden::installs::InstallService::Runners install_runners{{playden::Store::kSteam, &install_runner}};
         if (copy_runner) install_runners[playden::Store::kLocal] = copy_runner.get();
         playden::steam::InstallService installs(std::move(install_runners), std::move(install_volumes));
+        installs.SetMoveRunner(&game_mover);
         // Installed games' records, for their updates. Set before the controller asks for details; its
         // Shutdown joins the details worker before the install service stops.
         details_source.SetInstalled([&installs](std::uint32_t app) -> std::optional<playden::installs::InstalledRecord> {
@@ -985,6 +1023,12 @@ int main() {
                     if (request.action == Action::kCopy) {
                         action = "copy";
                         simulation.RequestImport({ImportRequestKind::CopyIntoPlayden, game, request.volume, {}, {}});
+                    } else if (request.action == Action::kMove && game.store != playden::Store::kLocal) {
+                        // An installed game to another drive.
+                        const auto refused = installs.Move(game, request.volume);
+                        action = refused.empty() ? "move-installed" : "move-refused";
+                        if (!refused.empty())
+                            playden::app::AppendLogLine(log_root, "install.log", "install-request move refused: " + refused);
                     } else if (request.action == Action::kMove) {
                         action = "move";
                         simulation.RequestImport({ImportRequestKind::MoveIntoPlayden, game, {}, {}, {}});

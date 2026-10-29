@@ -1213,7 +1213,12 @@ void Controller::TickRuntime() {
       gate_blocked_.insert(id);
     }
     if (installs_ && installs_->Locked(id)) {
-      model_.NotifyPlayStopped(id, "The game's update is putting its files in place. Play once it finishes.");
+      const auto snapshot = installs_->Snapshot();
+      const bool moving = std::any_of(snapshot.jobs.begin(), snapshot.jobs.end(), [id](const steam::InstallJobView& job) {
+        return job.id == id && job.kind == steam::InstallJobKind::kMove;
+      });
+      model_.NotifyPlayStopped(id, moving ? "The game is moving to another drive. Play once the move finishes."
+                                          : "The game's update is putting its files in place. Play once it finishes.");
       continue;
     }
     play_queued_.insert(id);
@@ -1520,6 +1525,16 @@ void Controller::BeginUninstall(GameId id, bool delete_saves) {
   const auto* location = LocationOf(id);
   const bool external = location && !location->managed();
   if (external && !(id.store == Store::kLocal && local_)) return;
+  // A moving game finishes or cancels its move first: the install service refuses its uninstall.
+  if (installs_) {
+    const auto snapshot = installs_->Snapshot();
+    if (std::any_of(snapshot.jobs.begin(), snapshot.jobs.end(), [id](const steam::InstallJobView& job) {
+          return job.id == id && job.kind == steam::InstallJobKind::kMove;
+        })) {
+      StopUninstall(id, "The game is moving to another drive. Wait for the move, or cancel it in the Queue.");
+      return;
+    }
+  }
   if (external) delete_saves = false;
   if (!runtime_ && external) { local_->Remove(id.value); return; }
   // Without the runtime there is no PS5 title to remove: the download goes as before.
@@ -1962,6 +1977,8 @@ void Controller::TickDownloadServers() {
   model_.ApplyLiveDownloadServers(live);
   shown_download_servers_ = std::move(live);
 }
+// The model checks a batch against the Queue's size before asking for it.
+static_assert(kQueueJobLimit == steam::InstallService::kMaxJobs);
 void Controller::TickInstalls() {
   if (!installs_) {
     ProjectLocations({});
@@ -1987,9 +2004,14 @@ void Controller::TickInstalls() {
       case InstallRequestKind::Update: {
         // The record's branch and language select. Nothing is reserved up front: the details' estimate counts
         // whole depots, and the update checks the room its changed files need before it downloads them.
-        installs_->Update(request.game_id, {});
+        if (const auto refused = installs_->Update(request.game_id, {}); !refused.empty())
+          model_.NotifyUpdateRefused(request.game_id, refused);
         break;
       }
+      case InstallRequestKind::Move:
+        if (const auto refused = installs_->Move(request.game_id, request.volume_id); !refused.empty())
+          model_.NotifyMoveRefused(request.game_id, refused);
+        break;
       case InstallRequestKind::Pause: installs_->Pause(request.game_id); break;
       case InstallRequestKind::Resume: installs_->Resume(request.game_id); break;
       case InstallRequestKind::DownloadNow: installs_->DownloadNow(request.game_id); break;
@@ -2014,13 +2036,16 @@ void Controller::TickInstalls() {
     if (volume.available) drives_present_.insert(volume.id);
   ProjectLocations(snapshot.installed);
   // A download that finished in this session is prepared next, so the game is ready to play.
-  std::set<GameId> downloading, updating;
+  std::set<GameId> downloading, updating, moving;
   for (const auto& job : snapshot.jobs) {
     downloading.insert(job.id);
     if (job.kind == steam::InstallJobKind::kUpdate) updating.insert(job.id);
+    if (job.kind == steam::InstallJobKind::kMove) moving.insert(job.id);
   }
   for (const auto id : downloading_) {
     if (downloading.count(id) || !game_roots_.count(id)) continue;
+    // A move that ended leaves the game prepared as it was: its title followed the copy (RuntimeHost::Relocate).
+    if (moving_.count(id)) continue;
     // An update that ended (finished or canceled) leaves the game prepared as it was: Play publishes its
     // settings again and puts Playden's Steam files back over the new ones; one that changed the files first
     // has its launch made again from them. Steam's details for it (the launch options that uses, whether more
@@ -2048,6 +2073,7 @@ void Controller::TickInstalls() {
   }
   downloading_ = std::move(downloading);
   updating_ = std::move(updating);
+  moving_ = std::move(moving);
   if (!snapshot.volumes.empty()) saves_root_ = snapshot.volumes.front().games_root + "/.playden-saves";
   // Free space changes outside Playden too, so volumes refresh every few seconds as well.
   const auto now = std::chrono::steady_clock::now();
@@ -2091,15 +2117,27 @@ void Controller::TickInstalls() {
       case steam::InstallJobState::kFailed: state = JobState::Failed; break;
     }
     const bool update = job.kind == steam::InstallJobKind::kUpdate;
+    const bool move = job.kind == steam::InstallJobKind::kMove;
     const bool running = job.state == steam::InstallJobState::kRunning;
-    jobs.push_back({job.id, state, job.done_bytes, job.total_bytes, job.failure, job.volume_id,
-                    job.bytes_per_second, job.eta_seconds, job.held_bytes, checking_licenses,
-                    state == JobState::Downloading ? job.server_name : std::string(), update, job.locked,
-                    update && running && job.step == steam::InstallStep::kCheckingFiles,
-                    update && running && (job.step == steam::InstallStep::kApplying || job.locked)});
+    LiveInstallJob live{job.id, state, job.done_bytes, job.total_bytes, job.failure, job.volume_id,
+                        job.bytes_per_second, job.eta_seconds, job.held_bytes, checking_licenses,
+                        state == JobState::Downloading ? job.server_name : std::string(), update, job.locked,
+                        update && running && job.step == steam::InstallStep::kCheckingFiles,
+                        update && running && (job.step == steam::InstallStep::kApplying || job.locked)};
+    if (move) {
+      using Step = LiveInstallJob::MoveStep;
+      live.move = true;
+      live.from_volume_id = job.from_volume_id;
+      live.move_step = job.step == steam::InstallStep::kVerifying   ? Step::Verifying
+                       : job.step == steam::InstallStep::kSwitching ? Step::Switching
+                       : job.step == steam::InstallStep::kDeletingOld ? Step::DeletingOld
+                                                                      : Step::Copying;
+    }
+    jobs.push_back(std::move(live));
   }
   std::vector<LiveInstalledGame> installed;
-  for (const auto& game : snapshot.installed) installed.push_back({game.id, game.install_bytes, game.volume_id, game.available});
+  for (const auto& game : snapshot.installed)
+    installed.push_back({game.id, game.install_bytes, game.volume_id, game.available, game.finished_at});
   std::vector<LiveCompletedDownload> completed;
   for (const auto& finished : snapshot.completed)
     completed.push_back({finished.id, finished.install_bytes, finished.volume_id, finished.finished_at, finished.update_bytes});
@@ -2119,8 +2157,9 @@ void Controller::TickStoreDetails() {
 }
 void Controller::TickAppDetails() {
   if (!app_details_) {
-    // Nothing measures sizes: Steam's figures stand.
+    // Nothing measures sizes: Steam's figures stand. Nothing checks for updates either.
     for (const auto& check : model_.TakeSizeChecks()) model_.UpdateMeasuredSize(check, false, false, {});
+    if (model_.TakeUpdateCheckRequest()) model_.FinishUpdateCheck(true);
     return;
   }
   const auto& state = model_.state();
@@ -2138,6 +2177,8 @@ void Controller::TickAppDetails() {
     prepare_after_details_.clear();
     requested_language_ = state.content_language;
     reissue_after_language_ = false;
+    // Another account: its check, if any, starts over when its screen asks.
+    if (std::exchange(update_check_running_, false)) model_.FinishUpdateCheck(true);
   } else if (state.content_language != requested_language_) {
     // Sizes count the depots of the download language. The details worker reads the language when
     // a fetch starts and the host passes the new one on after this tick, so ask again next tick.
@@ -2150,6 +2191,11 @@ void Controller::TickAppDetails() {
   } else if (reissue_after_language_) {
     reissue_after_language_ = false;
     for (const auto& id : prepare_after_details_) app_details_->Request(id, generation);
+    // Download sizes follow the language: a running update check starts again in the new one.
+    if (update_check_running_ && !app_details_->CheckInstalled(update_check_ids_, generation)) {
+      update_check_running_ = false;
+      model_.FinishUpdateCheck(true);
+    }
   }
   if (state.account().authentication == AuthState::SignedIn) {
     // A finished update: the game's details are asked again (they were answered for the old content).
@@ -2161,11 +2207,35 @@ void Controller::TickAppDetails() {
     }
     // Updates are checked for the game whose page is open, never the whole library. A library refresh reads the
     // licenses (DLC bought since): that page is checked again.
-    const bool loading = state.library_loading;
-    if (library_loading_ && !loading && state.navigation.detail_id && game_roots_.count(*state.navigation.detail_id))
+    const auto read = library_ ? library_->LicensesRead() : 0;
+    if (read != licenses_read_ && state.navigation.detail_id && game_roots_.count(*state.navigation.detail_id))
       if (auto* details = Details(state.navigation.detail_id->store); details && details == app_details_)
         details->Refresh(*state.navigation.detail_id, generation, true);
-    library_loading_ = loading;
+    licenses_read_ = read;
+  }
+  // The installed games' update check, when the model asks (the screen opened a day after the last one, or
+  // Check for updates). It runs behind any page's request and goes on when the screen closes. Signed in, it
+  // waits for the library refresh: before it reads the licenses every game would answer "no update" and the
+  // saved list would be emptied. With no refresh under way (it failed, or Steam refused it) the check can't
+  // run now: it ends as "Couldn't check", and the saved results stay.
+  const bool check_waits = state.account().authentication == AuthState::SignedIn &&
+                           (!library_ || library_->LicensesGeneration() != generation);
+  if (check_waits && (!library_ || !library_->Busy()) && model_.TakeUpdateCheckRequest()) model_.FinishUpdateCheck(true);
+  if (!check_waits && model_.TakeUpdateCheckRequest()) {
+    std::vector<GameId> ids;
+    for (const auto& [id, root] : game_roots_)
+      if (id.steam_app() && Details(id.store) == app_details_) ids.push_back(id);
+    if (state.account().authentication != AuthState::SignedIn) {
+      model_.FinishUpdateCheck(true);  // offline: "Couldn't check", the saved results stay
+    } else if (ids.empty()) {
+      model_.FinishUpdateCheck(false);  // nothing installed from Steam: up to date
+    } else if (app_details_->CheckInstalled(ids, generation)) {
+      update_check_running_ = true;
+      update_check_ids_ = std::move(ids);
+      model_.UpdateCheckProgress(0, 0, update_check_ids_.size());
+    } else {
+      model_.FinishUpdateCheck(true);
+    }
   }
   // Fetch Steam app info when the player opens a game's details while signed in, ahead of anything queued. An
   // installed game is asked again at each visit: Steam may have a newer version since.
@@ -2193,7 +2263,7 @@ void Controller::TickAppDetails() {
       }
       model_.UpdateAppDetails(details.id, details.download_bytes, details.install_bytes, details.windows_installable,
                               details.languages, details.dlc_count, std::move(versions),
-                              {details.update.newer, details.update.new_dlc, details.update.download_bytes});
+                              {details.update.newer, details.update.new_dlc, details.update.download_bytes}, !check_waits);
       if (details.launches_any_branch) launches_any_branch_.insert(details.id);
       else launches_any_branch_.erase(details.id);
       launch_options_[details.id] = details.launches;
@@ -2202,6 +2272,19 @@ void Controller::TickAppDetails() {
       launch_options_reason_[details.id] = details.reason.empty() ? "Steam details are unavailable right now." : details.reason;
     }
     if (prepare_after_details_.erase(details.id) && runtime_) SubmitPrepare(details.id);
+  }
+  if (update_check_running_) {
+    const auto check = app_details_->CheckProgress();
+    if (check.account_generation != generation || check.total == 0) {
+      update_check_running_ = false;  // dropped (Invalidate)
+      model_.FinishUpdateCheck(true);
+    } else {
+      model_.UpdateCheckProgress(check.asked, check.answered, check.total);
+      if (check.done()) {
+        update_check_running_ = false;
+        model_.FinishUpdateCheck(check.failed != 0);
+      }
+    }
   }
   // The install sheet's exact sizes: the chosen version and language, from their manifests.
   const bool signed_in = model_.state().account().authentication == AuthState::SignedIn;

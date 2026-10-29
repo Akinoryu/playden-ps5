@@ -322,6 +322,7 @@ void LibraryService::ExecuteRefresh(const Job& job) {
   event.retrieved_at_unix_seconds = snapshot.retrieved_at_unix_seconds;
   event.cache_available = cache_available;
   event.cache_error = cache_error;
+  event.licenses_read = result.licenses_read;
   std::lock_guard<std::mutex> lock(mutex_);
   if (!stopping_ && job.request == request_ && job.generation == generation_ &&
       !job.cancel->load()) PushEvent(std::move(event));

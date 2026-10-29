@@ -177,7 +177,7 @@ std::vector<AppDetails> CmAppDetailsSource::Fetch(const StoredSession& session,
     std::vector<AppInfo> dlc_apps;
     if (record && !record->depots.empty()) dlc_apps = FetchDlcApps(client_, session, id, found->second, cancel);
     if (cancel.load()) return {};
-    result.push_back(DetailsFromAppInfo(id, found->second, licensed_ ? licensed_->Get() : std::nullopt, language, record,
+    result.push_back(DetailsFromAppInfo(id, found->second, licensed_ ? licensed_->Get(session.steam_id) : std::nullopt, language, record,
                                         dlc_apps));
   }
   return result;
@@ -244,7 +244,7 @@ MeasuredSize CmAppDetailsSource::Measure(const StoredSession& session, const Siz
     log("failed", "why=canceled");
     return result;
   }
-  const auto depots = DepotsToMeasure(*app, buffer->second, licensed_ ? licensed_->Get() : std::nullopt,
+  const auto depots = DepotsToMeasure(*app, buffer->second, licensed_ ? licensed_->Get(session.steam_id) : std::nullopt,
                                       request.branch, language, dlc_apps);
   depot_count = depots.size();
   if (depots.empty()) {

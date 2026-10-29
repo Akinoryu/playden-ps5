@@ -145,7 +145,8 @@ LibraryResult EntitledLibraryBackend::Fetch(const StoredSession& session,
     if (probing) PublishFamilyLicenses(nullptr);
     return result;
   }
-  if (licensed_) licensed_->Set(acquisitions);
+  if (licensed_) licensed_->Set(session.steam_id, acquisitions);
+  result.licenses_read = true;
   for (auto& game : result.games) {
     const auto found = acquisitions.acquired_at.find(*game.id.steam_app());
     if (found != acquisitions.acquired_at.end()) game.added_at_unix_seconds = found->second;

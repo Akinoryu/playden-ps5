@@ -26,6 +26,7 @@ class FakeLibrarySource final : public stores::LibrarySource {
     event.account_generation = generation;
     event.error = fail ? steam::LibraryError::kPersistence : steam::LibraryError::kNone;
     if (!fail) event.games = games;
+    event.licenses_read = !fail;
     events_.push_back(std::move(event));
     return request_;
   }

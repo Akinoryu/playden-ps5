@@ -27,7 +27,7 @@ struct InstallRequest {
   std::uint32_t app = 0;  // a Steam game's app ID; 0 for other games
   GameId game;            // the game (kImport: none yet)
   // kImport: the drive (install volume id), the game's folder and the program, as LocalLibrarySource::Add takes them.
-  // kCopy: the install volume to copy to (empty: the default).
+  // kCopy: the install volume to copy to (empty: the default). kMove of an installed game: the volume to move to.
   std::string volume;
   std::string folder;
   std::string program;
@@ -39,6 +39,7 @@ struct InstallRequest {
 //   copy <local game> [volume]          copy an imported game playing in place into Playden (volume:
 //                                       an install volume id; default: the default volume)
 //   move <local game>                   move an imported game from the drop folder into Playden
+//   move <app id> <volume>              move an installed Steam game to another drive (an install volume id)
 //   import <volume> <folder> <program>  add a game playing in place (volume: internal, m2, extended,
 //                                       usb0, usb1; folder: a name in that drive's import folder, or a
 //                                       path from the drive's root; program: inside the folder)
@@ -57,12 +58,17 @@ struct InstallOptions {
 };
 
 enum class InstallJobState { kQueued, kRunning, kPaused, kFailed };
-// A job downloads a game (install) or brings an installed one to another version (update).
-enum class InstallJobKind { kInstall, kUpdate };
+// A job downloads a game (install), brings an installed one to another version (update) or moves an
+// installed one to another volume (move).
+enum class InstallJobKind { kInstall, kUpdate, kMove };
 // What a running job is doing. An update checks which installed files changed (kCheckingFiles: hashing
 // the files of an install that kept no file tree), downloads the changed ones beside the game, then puts
-// them in place (kApplying), when the game can't be played until the job finishes.
-enum class InstallStep { kStarting, kCheckingLicenses, kDownloading, kCheckingFiles, kApplying };
+// them in place (kApplying), when the game can't be played until the job finishes. A move copies the
+// game's folder (kCopying), checks the copy (kVerifying), has the game's PS5 title follow it
+// (kSwitching), then deletes the old folder (kDeletingOld).
+enum class InstallStep {
+  kStarting, kCheckingLicenses, kDownloading, kCheckingFiles, kApplying, kCopying, kVerifying, kSwitching, kDeletingOld
+};
 
 // What the apply gate says about putting an update's files in place now: go ahead, the game runs (or starts), or
 // the console didn't say.
@@ -82,8 +88,11 @@ struct InstallJobView {
   InstallJobKind kind = InstallJobKind::kInstall;
   InstallJobState state = InstallJobState::kQueued;
   // An update that is putting its files in place (or was, when Playden stopped): the game must not run
-  // until it finishes. Pause and Cancel are refused meanwhile.
+  // until it finishes. A move whose title is following the copy, or that is deleting the old folder:
+  // it must finish. Pause and Cancel are refused meanwhile.
   bool locked = false;
+  // A move: the volume the game leaves (volume_id is where it goes).
+  std::string from_volume_id;
   std::uint64_t done_bytes = 0;
   std::uint64_t total_bytes = 0;
   std::uint64_t held_bytes = 0;  // installed bytes already on disk (see PendingInstallBytes)
@@ -108,6 +117,8 @@ struct InstalledGame {
   std::optional<InstalledRecord> record;
   // An update that finished this session: what it downloaded (0 for an install, or after a restart).
   std::uint64_t update_bytes = 0;
+  // `finished_at` is older than the record: a move copied the record, and the registry keeps the time.
+  bool finished_kept = false;
 };
 
 // A recent finished download that Downloads lists after the queue until the player dismisses it.
@@ -192,6 +203,31 @@ class InstallRunner {
   virtual void Forget(const GameId& id) { (void)id; }
 };
 
+// A move's switch marker in its copy, written before the game's title is asked to follow the copy:
+// from then on the copy may be the folder the title names, so it is never deleted as a partial copy.
+inline constexpr const char* kMoveSwitchName = ".playden-copy/switch";
+
+// Moves installed games between volumes (InstallService::Move), for every store, on the service worker.
+class MoveRunner {
+ public:
+  virtual ~MoveRunner() = default;
+  // Copies the installed game at `from` to `to` (its folder on volume `volume_id`), checks the copy and
+  // has the game's PS5 title follow it. ok: the game plays from `to` (install_bytes from its record); the
+  // folder at `from` is still there. Called again after any interruption, it carries on from what is
+  // copied. Reports kCopying, kVerifying and kSwitching; a stop or failure before the title follows
+  // leaves the game playing from `from`. retry_later: the title runs or the runtime is busy.
+  virtual InstallRunner::Result Copy(const GameId& id, const std::string& from, const std::string& to,
+                                     const std::string& volume_id, const std::atomic<bool>& cancel,
+                                     const std::function<void(std::uint64_t done, std::uint64_t total, std::uint64_t held)>& progress,
+                                     const std::function<void(InstallStep)>& step) = 0;
+  // Once the service lists the game at `to`: deletes the old folder at `from`, then the copy's journal.
+  // Empty, or why not (a short sentence). Safe to run again.
+  virtual std::string Finish(const std::string& from, const std::string& to) = 0;
+  // A move canceled before its title followed the copy: deletes the partial copy at `to`, only when it is
+  // this move's copy of `from` (never a folder that was there before the move).
+  virtual std::string Discard(const std::string& from, const std::string& to) = 0;
+};
+
 // Install queue for real games under <volume games_root>/<key>. One install runs at a time; jobs
 // go to the runner of their game's store, and a store without one can't install.
 // Pause keeps the partial download for Resume; Cancel and Uninstall delete only Playden-managed
@@ -225,11 +261,25 @@ class InstallService {
   // install record says (its branch and language). The game stays installed and playable while the
   // update downloads; once the update puts its files in place, Locked is true until it finishes. A
   // game with a job, or that isn't installed and available, is not updated. `estimated_bytes` (the
-  // download) is reserved as for installs.
-  void Update(GameId id, const InstallOptions& options = {}, std::optional<std::uint64_t> estimated_bytes = std::nullopt);
-  // True while the game's update is putting files in place, also when Playden stopped during that:
-  // the game must not run then.
+  // download) is reserved as for installs. Empty when queued, or why not (a sentence for the player).
+  std::string Update(GameId id, const InstallOptions& options = {}, std::optional<std::uint64_t> estimated_bytes = std::nullopt);
+  // True while the game's update is putting files in place, also when Playden stopped during that, and
+  // while the game's move runs or must finish: the game must not run then.
   bool Locked(GameId id);
+  // Queues moving an installed game to `volume_id` (MoveRunner): each game is its own job, run in turn
+  // with the downloads. The game must be installed and available, on another volume, with no job and no
+  // uninstall, and the destination must have room for the whole game (checked again when the job
+  // starts): the old folder stays until the copy is checked and the title follows it. Uninstalls and
+  // updates of the game are refused while it moves; Cancel deletes the partial copy until the title
+  // follows it. Empty, or why not (a sentence for the player).
+  std::string Move(GameId id, const std::string& volume_id);
+  // Runs the moves; until it is set they wait. Set once, before or after the service starts.
+  void SetMoveRunner(MoveRunner* runner);
+  // The free bytes of the drive holding a folder (tests); empty: steam::QueryVolumeSpace. Set before
+  // the first Install or Move.
+  void SetSpaceQuery(std::function<std::optional<std::uint64_t>(const std::string& path)> free_bytes) {
+    space_query_ = std::move(free_bytes);
+  }
   // Pause and Cancel do nothing to an update that is putting its files in place. Cancel of an update
   // deletes only its downloads; the game stays as it was.
   void Pause(GameId id);
@@ -299,13 +349,23 @@ class InstallService {
     std::optional<GameId> forget;  // set: InstallRunner::Forget instead of deleting `root`
     std::optional<InstalledGame> game;  // an uninstall's folder; none for a canceled download
     bool update = false;  // a canceled update: InstallRunner::DiscardUpdate, the game stays
+    bool move = false;    // a canceled move: MoveRunner::Discard of its partial copy, the game stays
+    std::string from;     // a canceled move's game folder
   };
   void Run();
+  // A move job the worker took (RunMove): the game's folder at `from`, the copy at `to`.
+  void RunMove(GameId id, const std::string& from, const std::string& to, const std::string& volume_id,
+               bool finishing);
+  // Under the lock: drops a move canceled before its copy ran (RunMove discards the copy).
+  bool DropCanceledMove(GameId id, const std::string& to);
+  // Free bytes of the drive holding `path`: nothing when it can't be read.
+  std::optional<std::uint64_t> FreeBytes(const std::string& path) const;
   void Scan();
   void QueueRemoval(Removal removal);
   Job* Find(GameId id);
   void Publish();
-  void SaveRegistry();
+  // False when it wasn't saved. sync: the file and its folder are on the storage before it returns.
+  bool SaveRegistry(bool sync = false);
   void SaveDefaultVolume();
   void SaveDismissed();
   void Dismiss(GameId id);
@@ -325,6 +385,8 @@ class InstallService {
   ApplyAnswer MayApply(GameId id);
   std::chrono::milliseconds WaitForGame(const Job& job) const;
   ApplyAnswer AskApplyGate(GameId id);
+  MoveRunner* mover_ = nullptr;  // guarded by mutex_
+  std::function<std::optional<std::uint64_t>(const std::string&)> space_query_;
   std::vector<InstallVolume> volumes_;
   std::string default_volume_id_;
   bool default_volume_saved_ = true;

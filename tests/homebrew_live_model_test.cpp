@@ -1340,6 +1340,629 @@ void live_setup_asks_for_a_steam_program(const std::filesystem::path& base) {
 
 } // namespace
 
+// The installed games' update check: the list asks for one at most once a day (the wall clock), Check for
+// updates at once; results and the time are saved per account and survive a restart.
+void live_update_check(const std::filesystem::path& base) {
+    using playden::homebrew::GameUpdate;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t kAccount = 76561198000000001ull;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, std::to_string(kAccount), "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""}}, false, {},
+                               false, true, kNow}),
+          "update check: library delivered");
+    model.UpdateInstalls({}, {{SteamId(10), 1000, "internal"}, {SteamId(20), 2000, "internal"}});
+    const auto open_list = [&model] {
+        while (!model.state().navigation.modals.empty() || model.state().navigation.route == Route::ManageGames)
+            model.action("circle");
+        for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+        activate(model, "settings-installed");
+    };
+
+    // Before the account's saved check is read, opening the list waits for it.
+    model.BeginUpdateCheckLoad(kAccount);
+    open_list();
+    check(!model.TakeUpdateCheckRequest() && !model.state().update_check.checking,
+          "update check: nothing starts before the saved check is read");
+    playden::SavedUpdateCheck saved;
+    saved.checked_at = kNow - 23 * 60 * 60;
+    saved.games[SteamId(10)] = {true, false, 500};
+    model.ApplyUpdateCheck(kAccount, saved);
+    const auto& check_state = model.state().update_check;
+    check(check_state.loaded && check_state.checked_at == saved.checked_at && check_state.games.size() == 1 &&
+              check_state.games.at(SteamId(10)) == (GameUpdate{true, false, 500}),
+          "update check: the saved results are the list's");
+    check(!model.TakeUpdateCheckRequest() && !check_state.checking,
+          "update check: checked 23 hours ago, the list doesn't ask again");
+
+    // A day later, opening the list asks once.
+    model.SetWallClock(kNow + 2 * 60 * 60);
+    open_list();
+    check(check_state.checking && model.TakeUpdateCheckRequest() && !model.TakeUpdateCheckRequest(),
+          "update check: 25 hours later, opening the list asks Steam once");
+    open_list();
+    check(!model.TakeUpdateCheckRequest(), "update check: a running check isn't asked for again");
+    model.UpdateCheckProgress(8, 2, 2);
+    check(check_state.asked == 8 && check_state.answered == 2 && check_state.total == 2, "update check: progress shows");
+    // Answers replace what was saved: Portal is up to date now, Stray has new DLC.
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, {});
+    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, GameUpdate{false, true, 70});
+    model.FinishUpdateCheck(false);
+    check(!check_state.checking && !check_state.failed && check_state.checked_at == kNow + 2 * 60 * 60 &&
+              check_state.games.size() == 1 && check_state.games.at(SteamId(20)).new_dlc,
+          "update check: a finished check sets the time and the list");
+    check(model.UpdateCheckDirty(), "update check: the result is saved");
+    const auto exported = model.ExportUpdateCheck();
+    check(exported.checked_at == kNow + 2 * 60 * 60 && exported.games.size() == 1 && exported.games.count(SteamId(20)),
+          "update check: what is saved");
+    model.UpdateCheckSaveResult(kAccount, model.UpdateCheckRevision(), playden::StorageError::kNone);
+    check(!model.UpdateCheckDirty(), "update check: saved");
+
+    // Check for updates asks at once, even right after one.
+    check(model.action("update-check") && model.TakeUpdateCheckRequest(), "update check: the button always asks");
+    // Steam unreachable: the time and the saved results stay, and the list says it couldn't check.
+    model.FinishUpdateCheck(true);
+    check(check_state.failed && check_state.checked_at == kNow + 2 * 60 * 60 && check_state.games.count(SteamId(20)),
+          "update check: a failed check keeps the last results");
+    // A failed check doesn't count as the day's: the next open asks again only when it's due.
+    open_list();
+    check(!model.TakeUpdateCheckRequest(), "update check: the last full check is still recent");
+
+    // A finished update and an uninstall take games off the list.
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, GameUpdate{true, false, 5});
+    check(check_state.games.size() == 2, "update check: a game's page refreshes its entry");
+    playden::homebrew::LiveInstallJob job;
+    job.game_id = SteamId(10);
+    job.state = playden::homebrew::JobState::Downloading;
+    job.update = true;
+    model.UpdateInstalls({job}, {{SteamId(10), 1000, "internal"}, {SteamId(20), 2000, "internal"}});
+    model.UpdateInstalls({}, {{SteamId(10), 1000, "internal"}, {SteamId(20), 2000, "internal"}});
+    check(!check_state.games.count(SteamId(10)), "update check: a finished update leaves the list");
+    model.UpdateInstalls({}, {{SteamId(10), 1000, "internal"}});
+    check(check_state.games.empty(), "update check: an uninstalled game leaves the list");
+
+    // Another account starts from its own saved check; never checked asks on the first open.
+    model.ResetUpdateCheck();
+    check(!model.state().update_check.loaded && model.state().update_check.games.empty(),
+          "update check: an account leaving clears the list");
+    model.BeginUpdateCheckLoad(kAccount + 1);
+    model.ApplyUpdateCheck(kAccount + 1, std::nullopt);
+    check(model.state().update_check.loaded && model.state().update_check.checked_at == 0, "update check: never checked");
+    open_list();
+    check(model.TakeUpdateCheckRequest(), "update check: never checked, opening the list asks");
+    model.ApplyUpdateCheck(kAccount, saved);
+    check(model.state().update_check.games.empty(), "update check: another account's load is ignored");
+
+    // Without a wall clock, the day can't be told: opening doesn't ask.
+    auto unclocked = make_live(base / "unclocked");
+    unclocked.UpdateAccount({AuthState::SignedIn, std::to_string(kAccount), "Owner", {}, {}, false});
+    unclocked.BeginUpdateCheckLoad(kAccount);
+    unclocked.ApplyUpdateCheck(kAccount, std::nullopt);
+    check(unclocked.action("update-check") && unclocked.TakeUpdateCheckRequest(), "update check: the button works without a clock");
+    unclocked.FinishUpdateCheck(false);
+    check(unclocked.state().update_check.checked_at == 0, "update check: no clock, no time saved");
+}
+
+// Manage installed games: L1/R1 switch between Updates and Uninstall, each tab keeps its own selection and
+// focus, Updates lists only installed Steam games with an update (all checked), and says how the check went.
+void live_manage_games_tabs(const std::filesystem::path& base) {
+    using playden::homebrew::GameUpdate;
+    using playden::homebrew::ManageTab;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t kAccount = 76561198000000002ull;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, std::to_string(kAccount), "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""},
+                                {SteamId(30), "Tunic", "", "", ""}}, false, {}, false, true, kNow}),
+          "manage: library delivered");
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb}}, "internal");
+    model.UpdateInstalls({}, {{SteamId(10), 10 * gb, "internal"}, {SteamId(20), 20 * gb, "internal"},
+                              {SteamId(30), 30 * gb, "internal"}});
+    model.BeginUpdateCheckLoad(kAccount);
+    playden::SavedUpdateCheck saved;
+    saved.checked_at = kNow - 2 * 60 * 60;
+    saved.games[SteamId(10)] = {true, false, 2 * gb};
+    saved.games[SteamId(20)] = {false, true, 120'000'000};
+    model.ApplyUpdateCheck(kAccount, saved);
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+    activate(model, "settings-installed");
+    const auto& navigation = model.state().navigation;
+    check(navigation.route == Route::ManageGames && navigation.manage_tab == ManageTab::Uninstall,
+          "manage: Settings opens the Uninstall tab");
+    check(!model.TakeUpdateCheckRequest(), "manage: checked 2 hours ago, opening doesn't ask Steam");
+    const auto tab = [&model](const char* key) {
+        for (const auto& item : model.view().tabs) if (item.key == key) return item;
+        return playden::homebrew::ViewRow{};
+    };
+    check(model.view().tabs.size() == 3 && model.view().tabs[1].key == "manage-tab-move" && tab("manage-tab-updates").value == "2" &&
+              tab("manage-tab-uninstall").selected,
+          "manage: three tabs, Move in the middle, Updates counts its games");
+    check(model.view().aside == "Console storage 500.0 GB free", "manage: each drive's free space");
+    activate(model, "manage-toggle-30");
+    check(find_row(model, "manage-toggle-30")->selected && model.view().footer == "1 selected · frees 30.0 GB",
+          "manage: a game is checked on Uninstall");
+
+    // R1 (and L1, both ways round) switch tabs; Updates has its own list, all checked.
+    model.action("r1");
+    check(navigation.manage_tab == ManageTab::Updates, "manage: R1 wraps round to Updates");
+    check(!find_row(model, "manage-toggle-30") && find_row(model, "manage-toggle-10") && find_row(model, "manage-toggle-20"),
+          "manage: Updates lists only games with an update");
+    const auto* portal = find_row(model, "manage-toggle-10");
+    const auto* stray = find_row(model, "manage-toggle-20");
+    check(portal->selected && stray->selected, "manage: every update is checked to start with");
+    check(portal->value == "2.0 GB" && portal->subtitle == "Update · 10.0 GB installed" && stray->subtitle == "New DLC · 20.0 GB installed",
+          "manage: the size is the download, the note says what it brings");
+    check(model.view().title == "Update games" && model.view().subtitle == "Checked 2 h ago · only games with an update or new DLC",
+          "manage: Updates says when Steam was checked");
+    check(model.view().footer == "2 selected · 2.1 GB to download · 500.0 GB free on Console storage" &&
+              find_row(model, "manage-primary")->title == "Update 2",
+          "manage: the footer sums the downloads and the drive's free space");
+    check(navigation.focus_key == "manage-toggle-10", "manage: Updates opens on its first game");
+    model.action("square");
+    check(!find_row(model, "manage-toggle-10")->selected && !find_row(model, "manage-toggle-20")->selected,
+          "manage: Square clears the tab's selection");
+    model.action("down");
+    model.action("triangle");
+    check(model.state().navigation.modals.empty() && model.TakeInstallRequests().empty() &&
+              navigation.route == Route::ManageGames,
+          "manage: Triangle on Updates never uninstalls, and with nothing checked does nothing");
+    model.action("l1");
+    check(navigation.manage_tab == ManageTab::Uninstall && navigation.focus_key == "manage-toggle-30" &&
+              find_row(model, "manage-toggle-30")->selected && !find_row(model, "manage-toggle-10")->selected,
+          "manage: Uninstall comes back with its own selection and focus");
+    model.action("r1");
+    check(navigation.focus_key == "manage-toggle-20", "manage: Updates comes back on its row");
+    // With one drive there is nowhere to move to: the Move tab stays and says so.
+    model.action("r1");
+    const auto* only = find_row(model, "manage-empty");
+    check(navigation.manage_tab == ManageTab::Move && only && only->title == "Only one drive" && !find_row(model, "manage-toggle-10") &&
+              !find_row(model, "manage-move-to")->enabled && navigation.focus_key == "manage-sort",
+          "manage: Move with a single drive explains why it is empty, and the focus is on a button that works");
+    model.action("l1");
+
+    // Check for updates: the button waits while Steam answers, games show up checked as they do.
+    activate(model, "manage-check");
+    check(model.TakeUpdateCheckRequest(), "manage: Check for updates asks Steam");
+    model.UpdateCheckProgress(3, 1, 3);
+    check(model.view().subtitle == "Checking Steam · 1 of 3" && !find_row(model, "manage-check")->enabled &&
+              find_row(model, "manage-check")->title == "Checking…" && find_row(model, "manage-more"),
+          "manage: a running check shows its progress");
+    check(navigation.focus_key == "manage-sort", "manage: the focus leaves the button the check turned off");
+    model.UpdateAppDetails(SteamId(30), 1, 1, true, {}, 0, {}, GameUpdate{true, false, 500'000'000});
+    check(find_row(model, "manage-toggle-30") && find_row(model, "manage-toggle-30")->selected,
+          "manage: a game found while checking shows up checked");
+    check(navigation.focus_key == "manage-sort", "manage: a game found meanwhile doesn't take the focus");
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, {});
+    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, {});
+    model.FinishUpdateCheck(false);
+    check(!find_row(model, "manage-toggle-10") && find_row(model, "manage-toggle-30") &&
+              model.view().subtitle == "Checked just now · only games with an update or new DLC",
+          "manage: games without an update leave the list");
+    model.UpdateAppDetails(SteamId(30), 1, 1, true, {}, 0, {}, {});
+    const auto* empty = find_row(model, "manage-empty");
+    check(empty && empty->title == "Up to date" && navigation.focus_key == "manage-sort", "manage: nothing to update says so");
+    activate(model, "manage-check");
+    check(model.TakeUpdateCheckRequest(), "manage: the button asks again");
+    model.FinishUpdateCheck(true);
+    check(find_row(model, "manage-empty")->title == "Couldn't check" &&
+              model.view().subtitle.rfind("Couldn't check Steam · last checked", 0) == 0,
+          "manage: Steam unreachable says so");
+
+    // Circle closes back to the Settings row; the check is not the screen's to stop.
+    model.action("circle");
+    check(navigation.route == Route::Settings && navigation.focus_key == "settings-installed", "manage: Circle closes");
+
+    // Never checked: opening asks Steam at once, and Updates waits for the first answers.
+    model.ResetUpdateCheck();
+    model.BeginUpdateCheckLoad(kAccount + 1);
+    model.ApplyUpdateCheck(kAccount + 1, std::nullopt);
+    activate(model, "settings-installed");
+    check(model.TakeUpdateCheckRequest(), "manage: never checked, opening asks Steam");
+    model.action("r1");
+    check(model.view().subtitle == "Checking Steam…" && find_row(model, "manage-more") && !find_row(model, "manage-empty"),
+          "manage: the first check shows it is under way");
+    check(navigation.focus_key == "manage-sort" && find_row(model, "manage-sort")->enabled,
+          "manage: Updates opens on a button that works while it checks");
+    model.FinishUpdateCheck(true);
+    check(find_row(model, "manage-empty")->title == "Couldn't check" && model.view().subtitle == "Couldn't check Steam",
+          "manage: a first check that fails says so");
+}
+
+// Update selected: the checked games go to the Queue in the list's order, blocked games never do, and a
+// selection a drive hasn't room for is refused with the drive and the room missing.
+void live_manage_update_selected(const std::filesystem::path& base) {
+    using playden::homebrew::InstallRequestKind;
+    using playden::homebrew::ManageTab;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t kAccount = 76561198000000002ull;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, std::to_string(kAccount), "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""},
+                                {SteamId(30), "Tunic", "", "", ""}, {SteamId(40), "Celeste", "", "", ""}},
+                               false, {}, false, true, kNow}),
+          "update selected: library delivered");
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", true, 100 * gb, 2 * gb}}, "internal");
+    // Celeste is downloading already: it is listed but can't be picked.
+    playden::homebrew::LiveInstallJob job;
+    job.game_id = SteamId(40);
+    job.state = playden::homebrew::JobState::Queued;
+    job.update = true;
+    model.UpdateInstalls({job}, {{SteamId(10), 10 * gb, "internal"}, {SteamId(20), 20 * gb, "internal"},
+                                 {SteamId(30), 30 * gb, "usb"}, {SteamId(40), 40 * gb, "internal"}});
+    model.BeginUpdateCheckLoad(kAccount);
+    playden::SavedUpdateCheck saved;
+    saved.checked_at = kNow - 60 * 60;
+    saved.games[SteamId(10)] = {true, false, 2 * gb};
+    saved.games[SteamId(20)] = {false, true, 1 * gb};
+    saved.games[SteamId(30)] = {true, false, 3 * gb};
+    saved.games[SteamId(40)] = {true, false, 4 * gb};
+    model.ApplyUpdateCheck(kAccount, saved);
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+    activate(model, "settings-installed");
+    model.action("r1");
+    const auto& navigation = model.state().navigation;
+    check(navigation.route == Route::ManageGames && navigation.manage_tab == ManageTab::Updates, "update selected: Updates open");
+    const auto* celeste = find_row(model, "manage-toggle-40");
+    check(celeste && !celeste->enabled && !celeste->selected && celeste->subtitle == "In Queue",
+          "update selected: a game in the Queue is listed, not checked");
+    activate(model, "manage-toggle-40");
+    check(!find_row(model, "manage-toggle-40")->selected, "update selected: a game in the Queue can't be checked");
+
+    // Tunic's 3 GB estimate doesn't fit in the USB drive's 2 GB: Triangle warns first, and Cancel queues nothing.
+    check(model.view().footer == "3 selected · 6.0 GB to download · may need 1.0 GB more on USB Drive",
+          "update selected: the footer names the drive that may lack room");
+    model.action("triangle");
+    check(model.TakeInstallRequests().empty(), "update selected: the warning comes before anything is queued");
+    check(!navigation.modals.empty() && navigation.modals.back().title == "Update anyway?" &&
+              navigation.modals.back().body.find("may need 1.0 GB more on USB Drive") != std::string::npos,
+          "update selected: the warning names the drive and the room it may lack");
+    activate(model, "cancel");
+    check(navigation.route == Route::ManageGames && navigation.modals.empty() && model.TakeInstallRequests().empty(),
+          "update selected: Cancel returns to the list and queues nothing");
+
+    // With room on every drive the footer names each drive's free space.
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", true, 100 * gb, 50 * gb}}, "internal");
+    check(model.view().footer == "3 selected · 6.0 GB to download · 500.0 GB free on Console storage, 50.0 GB free on USB Drive",
+          "update selected: several drives each say their free space");
+    // The USB drive unplugged: Tunic can't update now, so it leaves the selection and the footer.
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", false, 100 * gb, 50 * gb}}, "internal");
+    const auto* tunic = find_row(model, "manage-toggle-30");
+    check(tunic && !tunic->enabled && !tunic->selected && tunic->subtitle == "Drive disconnected",
+          "update selected: a game on a disconnected drive can't be picked");
+    check(model.view().footer == "2 selected · 3.0 GB to download · 500.0 GB free on Console storage",
+          "update selected: the footer follows the selection");
+
+    // The footer button queues the checked games in the list's order (largest download first), then the
+    // screen closes back to Settings and the notice points to Queue.
+    activate(model, "manage-primary");
+    const auto requests = model.TakeInstallRequests();
+    check(requests.size() == 2 && requests[0].kind == InstallRequestKind::Update && requests[0].game_id == SteamId(10) &&
+              requests[1].kind == InstallRequestKind::Update && requests[1].game_id == SteamId(20),
+          "update selected: the batch queues each checked game's update in the list's order");
+    check(navigation.route == Route::Settings && navigation.focus_key == "settings-installed",
+          "update selected: the screen closes once they are queued");
+    const auto notice = std::find_if(model.state().notices.begin(), model.state().notices.end(),
+                                     [](const auto& value) { return value.id == "update-batch"; });
+    check(notice != model.state().notices.end() && notice->message == "2 updates queued" && notice->detail == "Follow them in Queue",
+          "update selected: the notice says how many");
+
+    // Sorted by last played, the order follows; a game that started playing meanwhile is skipped.
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", true, 100 * gb, 50 * gb}}, "internal");
+    activate(model, "settings-installed");
+    model.action("r1");
+    activate(model, "manage-sort");
+    check(find_row(model, "manage-toggle-10")->selected && find_row(model, "manage-toggle-30")->selected,
+          "update selected: a new visit checks every update again");
+    activate(model, "manage-toggle-30");
+    playden::homebrew::LiveRuntimeGame playing;
+    playing.game_id = SteamId(20);
+    playing.activity = playden::homebrew::TitleActivity::Running;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {playing});
+    check(!find_row(model, "manage-toggle-20")->enabled && find_row(model, "manage-toggle-20")->subtitle == "Playing: close it to update",
+          "update selected: a running game can't be updated");
+    model.action("triangle");
+    const auto one = model.TakeInstallRequests();
+    check(one.size() == 1 && one[0].game_id == SteamId(10), "update selected: a blocked game is skipped");
+    const auto single = std::find_if(model.state().notices.begin(), model.state().notices.end(),
+                                     [](const auto& value) { return value.id == "update-batch"; });
+    check(single != model.state().notices.end() && single->message == "Portal update queued", "update selected: one game is named");
+
+    // Short of room by Steam's estimate, Update anyway still queues Tunic on the USB drive.
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {});
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", true, 100 * gb, 2 * gb}}, "internal");
+    activate(model, "settings-installed");
+    model.action("r1");
+    model.action("triangle");
+    check(!navigation.modals.empty() && navigation.modals.back().title == "Update anyway?", "update selected: the warning opens");
+    activate(model, "confirm-destructive");
+    const auto anyway = model.TakeInstallRequests();
+    check(std::any_of(anyway.begin(), anyway.end(), [](const auto& request) { return request.game_id == SteamId(30); }) &&
+              navigation.route == Route::Settings,
+          "update selected: Update anyway queues the games the drive may lack room for");
+}
+
+// Settings: Storage's Manage installed games counts the saved check's updates and opens on Uninstall; Updates'
+// Game updates says how the check stands and opens on Updates. Both read the saved result without asking Steam.
+void live_settings_manage_rows(const std::filesystem::path& base) {
+    using playden::homebrew::ManageTab;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t kAccount = 76561198000000004ull;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, std::to_string(kAccount), "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""},
+                                {SteamId(30), "Tunic", "", "", ""}}, false, {}, false, true, kNow}),
+          "settings rows: library delivered");
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+    const auto value = [&model](const char* key) {
+        const auto* row = find_row(model, key);
+        return row ? row->value : std::string("(missing)");
+    };
+    const auto subtitle = [&model](const char* key) {
+        const auto* row = find_row(model, key);
+        return row ? row->subtitle : std::string("(missing)");
+    };
+
+    // Nothing installed: both rows say so and open nothing.
+    check(value("settings-installed") == "None" && !find_row(model, "settings-installed")->enabled &&
+              value("settings-game-updates") == "None" && !find_row(model, "settings-game-updates")->enabled,
+          "settings rows: nothing installed");
+
+    model.UpdateInstalls({}, {{SteamId(10), 10 * gb, "internal"}, {SteamId(20), 20 * gb, "internal"},
+                              {SteamId(30), 30 * gb, "internal"}});
+    check(find_row(model, "settings-installed")->title == "Manage installed games", "settings rows: the Storage row's name");
+    // Before the account's saved check is read, the row waits quietly.
+    model.BeginUpdateCheckLoad(kAccount);
+    check(value("settings-game-updates").empty(), "settings rows: no value before the saved check is read");
+    // Never checked.
+    model.ApplyUpdateCheck(kAccount, std::nullopt);
+    check(value("settings-installed") == "3 games · 60.0 GB" && value("settings-game-updates") == "Not checked",
+          "settings rows: never checked");
+    check(!model.TakeUpdateCheckRequest(), "settings rows: showing them doesn't ask Steam");
+
+    // Opening Game updates goes to the Updates tab and starts the day's check; Checking N of M follows it.
+    activate(model, "settings-game-updates");
+    check(model.state().navigation.route == Route::ManageGames && model.state().navigation.manage_tab == ManageTab::Updates,
+          "settings rows: Game updates opens the Updates tab");
+    check(model.TakeUpdateCheckRequest(), "settings rows: opening it starts a check when none is saved");
+    model.action("circle");
+    check(model.state().navigation.route == Route::Settings && model.state().navigation.focus_key == "settings-game-updates",
+          "settings rows: Circle comes back to the row");
+    check(value("settings-game-updates") == "Checking…", "settings rows: checking, nothing counted yet");
+    model.UpdateCheckProgress(32, 24, 40);
+    check(value("settings-game-updates") == "Checking 24 of 40…", "settings rows: checking with progress");
+
+    // Found: two updates and their download.
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 2'100'000'000});
+    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{false, true, 200'000'000});
+    model.FinishUpdateCheck(false);
+    check(value("settings-game-updates") == "2 updates · 2.3 GB" && subtitle("settings-game-updates") == "Checked just now",
+          "settings rows: updates found");
+    check(value("settings-installed") == "3 games · 60.0 GB · 2 updates", "settings rows: Storage counts the updates");
+    model.SetWallClock(kNow + 2 * 60 * 60);
+    check(subtitle("settings-game-updates") == "Checked 2 h ago", "settings rows: when it was checked");
+
+    // Opening Manage installed games goes to Uninstall; checked 2 hours ago, it doesn't ask again.
+    activate(model, "settings-installed");
+    check(model.state().navigation.route == Route::ManageGames && model.state().navigation.manage_tab == ManageTab::Uninstall,
+          "settings rows: Manage installed games opens the Uninstall tab");
+    check(!model.TakeUpdateCheckRequest(), "settings rows: a recent check isn't asked again");
+    model.action("circle");
+
+    // Steam unreachable: the row says so and the saved updates stay counted on Storage.
+    check(model.action("update-check") && model.TakeUpdateCheckRequest(), "settings rows: check again");
+    model.FinishUpdateCheck(true);
+    check(value("settings-game-updates") == "Couldn't check" &&
+              subtitle("settings-game-updates") == "Steam didn't answer · last checked 2 h ago",
+          "settings rows: couldn't check");
+    check(value("settings-installed") == "3 games · 60.0 GB · 2 updates", "settings rows: the last result is kept");
+
+    // Nothing new: Up to date, and Storage shows no update part.
+    model.action("update-check");
+    check(model.TakeUpdateCheckRequest(), "settings rows: checked again");
+    model.UpdateAppDetails(SteamId(10), 1, 1, true, {}, 0, {}, {});
+    model.UpdateAppDetails(SteamId(20), 1, 1, true, {}, 0, {}, {});
+    model.FinishUpdateCheck(false);
+    check(value("settings-game-updates") == "Up to date" && value("settings-installed") == "3 games · 60.0 GB",
+          "settings rows: up to date");
+
+    // One update is singular.
+    model.UpdateAppDetails(SteamId(30), 1, 1, true, {}, 0, {}, playden::homebrew::GameUpdate{true, false, 48'000'000});
+    check(value("settings-game-updates") == "1 update · 48 MB" && value("settings-installed") == "3 games · 60.0 GB · 1 update",
+          "settings rows: one update");
+}
+
+
+// Move: the checked games go to the chosen drive, each from where it is. Imported games aren't listed, games
+// already there or running can't be picked, a selection the drive hasn't room for is refused, and a game's
+// Maintenance queues the same move for that game.
+void live_manage_move(const std::filesystem::path& base) {
+    using playden::homebrew::InstallRequestKind;
+    using playden::homebrew::ManageTab;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, "76561198000000002", "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""},
+                                {SteamId(30), "Tunic", "", "", ""}, {SteamId(40), "Celeste", "", "", ""}},
+                               false, {}, false, true, kNow}),
+          "move: library delivered");
+    const auto imported = playden::GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 80 * gb},
+                         {"usb", "USB Drive", true, 1000 * gb, 100 * gb},
+                         {"archive", "Archive", true, 1000 * gb, 900 * gb, false}}, "internal");
+    model.UpdateInstalls({}, {{SteamId(10), 10 * gb, "internal"}, {SteamId(20), 20 * gb, "internal"},
+                              {SteamId(30), 30 * gb, "usb"}, {SteamId(40), 40 * gb, "internal"}, {imported, 5 * gb, "internal"}});
+    playden::homebrew::LiveRuntimeGame playing;
+    playing.game_id = SteamId(40);
+    playing.activity = playden::homebrew::TitleActivity::Running;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {playing});
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+    check(find_row(model, "settings-installed")->subtitle.find("move them to another drive") != std::string::npos,
+          "move: the Settings row mentions moving");
+    activate(model, "settings-installed");
+    model.action("l1");
+    const auto& navigation = model.state().navigation;
+    check(navigation.route == Route::ManageGames && navigation.manage_tab == ManageTab::Move, "move: L1 from Uninstall opens Move");
+    check(model.view().title == "Move games" && find_row(model, "manage-move-to")->value == "USB Drive" &&
+              navigation.focus_key == "manage-toggle-40",
+          "move: the usable drive with the most free space is the destination, not the read-only one");
+    check(!find_row(model, "manage-toggle-" + playden::ToKey(imported)), "move: imported games are not listed");
+    const auto* tunic = find_row(model, "manage-toggle-30");
+    check(tunic && !tunic->enabled && tunic->subtitle == "Already on USB Drive", "move: a game on the destination can't be picked");
+    const auto* celeste = find_row(model, "manage-toggle-40");
+    check(celeste && !celeste->enabled && celeste->subtitle == "Playing: close it to move", "move: a running game can't be picked");
+    check(find_row(model, "manage-toggle-10")->subtitle == "Console storage" && find_row(model, "manage-toggle-10")->enabled,
+          "move: a game says the drive it is on");
+    model.action("square");
+    check(find_row(model, "manage-toggle-10")->selected && find_row(model, "manage-toggle-20")->selected &&
+              !find_row(model, "manage-toggle-30")->selected,
+          "move: Select all checks only games that can move");
+    check(model.view().footer == "2 selected · 30.0 GB to USB Drive · 70.0 GB free after" &&
+              find_row(model, "manage-primary")->title == "Move 2",
+          "move: the footer sums the games and the space left after");
+
+    // Move to: the picker lists usable drives; a read-only drive can't be chosen. Choosing the console's
+    // drive drops the games already there from the selection.
+    activate(model, "manage-move-to");
+    check(model.view().surface == "move-storage" && navigation.focus_key == "volume-usb" &&
+              !find_row(model, "volume-archive")->enabled,
+          "move: Move to opens the drive picker on the current choice");
+    activate(model, "volume-internal");
+    check(navigation.modals.empty() && find_row(model, "manage-move-to")->value == "Console storage" &&
+              navigation.focus_key == "manage-move-to",
+          "move: the chosen drive becomes the destination");
+    check(!find_row(model, "manage-toggle-10")->selected && find_row(model, "manage-toggle-10")->subtitle == "Already on Console storage" &&
+              find_row(model, "manage-toggle-30")->enabled,
+          "move: the destination's own games leave the selection");
+    activate(model, "manage-move-to");
+    activate(model, "volume-usb");
+
+    // Not enough room: nothing is queued and the dialog names the drive.
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", true, 1000 * gb, 25 * gb},
+                         {"archive", "Archive", true, 1000 * gb, 900 * gb, false}}, "internal");
+    activate(model, "manage-toggle-10");
+    activate(model, "manage-toggle-20");
+    check(model.view().footer.find("more needed on USB Drive") != std::string::npos, "move: the footer says the drive is short");
+    model.action("triangle");
+    check(model.TakeInstallRequests().empty() && !navigation.modals.empty() &&
+              navigation.modals.back().title == "Not enough space on USB Drive",
+          "move: a selection that doesn't fit queues nothing");
+    activate(model, "alert-ok");
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"usb", "USB Drive", true, 1000 * gb, 100 * gb},
+                         {"archive", "Archive", true, 1000 * gb, 900 * gb, false}}, "internal");
+    model.action("triangle");
+    const auto requests = model.TakeInstallRequests();
+    check(requests.size() == 2 && requests[0].kind == InstallRequestKind::Move && requests[0].game_id == SteamId(20) &&
+              requests[0].volume_id == "usb" && requests[1].game_id == SteamId(10) && requests[1].volume_id == "usb",
+          "move: each checked game is its own move, in the list's order");
+    const auto notice = std::find_if(model.state().notices.begin(), model.state().notices.end(),
+                                     [](const auto& value) { return value.id == "move-batch"; });
+    check(navigation.route == Route::Settings && notice != model.state().notices.end() && notice->message == "2 moves queued",
+          "move: the screen closes with a notice");
+
+    // The game page: Maintenance has Move to…, for installed Steam games only, and it queues the same move.
+    check(model.action("details:20"), "move: game page");
+    activate(model, "details-more");
+    activate(model, "game-maintenance");
+    const auto* entry = find_row(model, "game-move");
+    check(entry && entry->enabled && entry->value == "Console storage", "move: Maintenance offers Move to…");
+    activate(model, "game-move");
+    check(model.view().surface == "move-storage" && !find_row(model, "volume-internal")->enabled &&
+              find_row(model, "volume-internal")->subtitle == "The game is here" && navigation.focus_key == "volume-usb",
+          "move: the game's own drive can't be chosen");
+    activate(model, "volume-usb");
+    const auto one = model.TakeInstallRequests();
+    check(one.size() == 1 && one[0].kind == InstallRequestKind::Move && one[0].game_id == SteamId(20) && one[0].volume_id == "usb" &&
+              navigation.modals.empty() && navigation.route == Route::Details,
+          "move: choosing a drive queues the game's move and returns to its page");
+    check(model.action("details:40"), "move: running game page");
+    activate(model, "details-more");
+    activate(model, "game-maintenance");
+    check(!find_row(model, "game-move")->enabled, "move: Maintenance waits to hear whether the game runs");
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {playing});
+    check(find_row(model, "game-move") && !find_row(model, "game-move")->enabled &&
+              find_row(model, "game-move")->subtitle == "Quit Celeste to move it.",
+          "move: a running game can't move from Maintenance");
+    activate(model, "game-move");
+    check(model.view().surface == "game-maintenance" && model.TakeInstallRequests().empty(), "move: the disabled row does nothing");
+}
+
+// The Queue holds 64 jobs: a batch of updates or moves that doesn't fit is not queued, the games stay
+// checked, and the alert says how many more it takes.
+void live_manage_queue_full(const std::filesystem::path& base) {
+    using playden::homebrew::InstallRequestKind;
+    using playden::homebrew::ManageTab;
+    constexpr std::int64_t kNow = 1'800'000'000;
+    constexpr std::uint64_t kAccount = 76561198000000002ull;
+    constexpr std::uint64_t gb = 1'000'000'000;
+    auto model = make_live(base);
+    model.SetWallClock(kNow);
+    model.UpdateAccount({AuthState::SignedIn, std::to_string(kAccount), "Owner", {}, {}, false});
+    check(model.UpdateLibrary({{{SteamId(10), "Portal", "", "", ""}, {SteamId(20), "Stray", "", "", ""}}, false, {}, false, true, kNow}),
+          "queue full: library delivered");
+    // An empty M.2 SSD with little room, and a USB drive with plenty.
+    model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
+                         {"m2", "M.2 SSD", true, 100 * gb, 9 * gb},
+                         {"usb", "USB Drive", true, 1000 * gb, 600 * gb}}, "internal");
+    const std::vector<playden::homebrew::LiveInstalledGame> installed{{SteamId(10), 10 * gb, "internal"},
+                                                                      {SteamId(20), 20 * gb, "internal"}};
+    const auto queue = [&](std::size_t count) {
+        std::vector<playden::homebrew::LiveInstallJob> jobs(count);
+        for (std::size_t index = 0; index < count; ++index) jobs[index].game_id = SteamId(static_cast<std::uint32_t>(1000 + index));
+        model.UpdateInstalls(jobs, installed);
+    };
+    queue(63);
+    model.BeginUpdateCheckLoad(kAccount);
+    playden::SavedUpdateCheck saved;
+    saved.checked_at = kNow - 60 * 60;
+    saved.games[SteamId(10)] = {true, false, 2 * gb};
+    saved.games[SteamId(20)] = {true, false, 1 * gb};
+    model.ApplyUpdateCheck(kAccount, saved);
+    for (int i = 0; i < 6 && model.state().navigation.route != Route::Settings; ++i) model.action("r1");
+    activate(model, "settings-installed");
+    model.action("r1");
+    const auto& navigation = model.state().navigation;
+    check(navigation.manage_tab == ManageTab::Updates, "queue full: Updates open");
+    model.action("triangle");
+    check(model.TakeInstallRequests().empty() && !navigation.modals.empty() && navigation.modals.back().title == "The Queue is full" &&
+              navigation.modals.back().body.find("room for 1 more") != std::string::npos,
+          "queue full: two updates with room for one queue nothing and say so");
+    activate(model, "alert-ok");
+    check(navigation.route == Route::ManageGames && find_row(model, "manage-toggle-10")->selected &&
+              find_row(model, "manage-toggle-20")->selected,
+          "queue full: the screen stays with the games checked");
+
+    // Moves count the same way, with what was asked for and not yet queued.
+    model.action("r1");
+    check(navigation.manage_tab == ManageTab::Move, "queue full: Move open");
+    check(find_row(model, "manage-move-to")->value == "USB Drive", "queue full: Move picks the drive with the most free space");
+    model.action("square");
+    model.action("triangle");
+    check(model.TakeInstallRequests().empty() && navigation.modals.back().title == "The Queue is full",
+          "queue full: two moves with room for one queue nothing");
+    activate(model, "alert-ok");
+    queue(62);
+    model.action("triangle");
+    const auto moves = model.TakeInstallRequests();
+    check(moves.size() == 2 && moves[0].kind == InstallRequestKind::Move && navigation.route == Route::Settings,
+          "queue full: with room for both they go");
+}
+
 int main() {
     live_root_access_missing();
     live_download_telemetry();
@@ -1363,6 +1986,12 @@ int main() {
     account_commands_dispatch_refresh_and_switch_barriers(base);
     live_self_update(base);
     live_kit_install(base / "kit");
+    live_update_check(base / "update-check");
+    live_manage_games_tabs(base / "manage-games");
+    live_manage_update_selected(base / "update-selected");
+    live_manage_move(base / "manage-move");
+    live_manage_queue_full(base / "queue-full");
+    live_settings_manage_rows(base / "settings-manage-rows");
 
     std::filesystem::remove_all(base, error);
     std::cout << "homebrew_live_model_test passed\n";

@@ -14,17 +14,7 @@ void AppDetailsService::Request(GameId id, std::uint64_t account_generation, boo
   if (!id.steam_app() || account_generation == 0) return;  // Steam games only
   std::lock_guard<std::mutex> lock(mutex_);
   if (stopping_) return;
-  if (account_generation != generation_) {
-    generation_ = account_generation;
-    pending_.clear();
-    requested_.clear();
-    results_.clear();
-    measure_pending_.clear();
-    measure_requested_.clear();
-    measured_.clear();
-    cancel_.store(true, std::memory_order_release);
-    measure_cancel_.store(true, std::memory_order_release);
-  }
+  if (account_generation != generation_) Reset(account_generation);
   if (requested_.count(id)) {
     // Queued already: it goes first. In flight or answered: nothing to do.
     if (const auto queued = std::find(pending_.begin(), pending_.end(), id); first && queued != pending_.end()) {
@@ -51,34 +41,55 @@ void AppDetailsService::Refresh(GameId id, std::uint64_t account_generation, boo
 
 void AppDetailsService::Invalidate(std::uint64_t account_generation) {
   std::lock_guard<std::mutex> lock(mutex_);
+  Reset(account_generation);
+  wake_.notify_all();
+}
+
+void AppDetailsService::Reset(std::uint64_t account_generation) {
   generation_ = account_generation;
   pending_.clear();
   requested_.clear();
   results_.clear();
+  check_pending_.clear();
+  check_waiting_.clear();
+  check_ = {};
   measure_pending_.clear();
   measure_requested_.clear();
   measured_.clear();
   cancel_.store(true, std::memory_order_release);
   measure_cancel_.store(true, std::memory_order_release);
+}
+
+bool AppDetailsService::CheckInstalled(const std::vector<GameId>& ids, std::uint64_t account_generation) {
+  if (account_generation == 0) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (stopping_) return false;
+  if (account_generation != generation_) Reset(account_generation);
+  if (check_.total && !check_.done()) return false;
+  check_ = {};
+  check_pending_.clear();
+  check_waiting_.clear();
+  ++check_serial_;
+  std::set<GameId> seen;
+  for (const auto& id : ids)
+    if (id.steam_app() && seen.insert(id).second) check_pending_.push_back(id);
+  check_.account_generation = account_generation;
+  check_.total = check_pending_.size();
   wake_.notify_all();
+  return check_.total != 0;
+}
+
+InstalledCheck AppDetailsService::CheckProgress() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return check_;
 }
 
 void AppDetailsService::Measure(SizeRequest request, std::uint64_t account_generation) {
   if (!request.id.steam_app() || account_generation == 0) return;
   std::lock_guard<std::mutex> lock(mutex_);
   if (stopping_) return;
-  if (account_generation != generation_) {
-    // Another account: what was asked for the previous one goes, as for Request.
-    generation_ = account_generation;
-    pending_.clear();
-    requested_.clear();
-    results_.clear();
-    measure_pending_.clear();
-    measure_requested_.clear();
-    measured_.clear();
-    cancel_.store(true, std::memory_order_release);
-    measure_cancel_.store(true, std::memory_order_release);
-  }
+  // Another account: what was asked for the previous one goes, as for Request.
+  if (account_generation != generation_) Reset(account_generation);
   if (measure_requested_.count(request) || measure_pending_.size() >= kMaxPending) return;
   measure_requested_.insert(request);
   measure_pending_.push_back(std::move(request));
@@ -96,7 +107,14 @@ std::vector<AppDetails> AppDetailsService::Pump(std::size_t maximum) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<AppDetails> output;
   while (!results_.empty() && output.size() < maximum) {
-    output.push_back(std::move(results_.front()));
+    auto& [details, check] = results_.front();
+    // The check counts a game once it is handed out, so its progress never runs ahead of the answers. An
+    // earlier answer for the same game (a page's, still queued) is not the check's.
+    if (check == check_serial_ && check_waiting_.erase(details.id)) {
+      ++check_.answered;
+      if (details.failed) ++check_.failed;
+    }
+    output.push_back(std::move(details));
     results_.pop_front();
   }
   return output;
@@ -118,16 +136,28 @@ void AppDetailsService::Shutdown() {
 void AppDetailsService::Run() {
   for (;;) {
     std::vector<GameId> batch;
-    std::uint64_t generation = 0;
+    std::set<GameId> checked;  // the games the check asked for in this batch
+    std::uint64_t generation = 0, check = 0;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      wake_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+      wake_.wait(lock, [this] { return stopping_ || !pending_.empty() || !check_pending_.empty(); });
       if (stopping_) return;
       while (!pending_.empty() && batch.size() < kBatch) {
         batch.push_back(pending_.front());
         pending_.pop_front();
       }
+      // The installed check fills what the queue leaves: it waits behind every request, a page's included.
+      while (!check_pending_.empty() && batch.size() < kBatch) {
+        const auto id = check_pending_.front();
+        check_pending_.pop_front();
+        ++check_.asked;
+        check_waiting_.insert(id);
+        checked.insert(id);
+        requested_.insert(id);
+        if (std::find(batch.begin(), batch.end(), id) == batch.end()) batch.push_back(id);
+      }
       generation = generation_;
+      check = check_serial_;
       cancel_.store(false, std::memory_order_release);
     }
     std::vector<AppDetails> fetched;
@@ -138,6 +168,13 @@ void AppDetailsService::Run() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) return;
     if (generation != generation_ || cancel_.load(std::memory_order_acquire)) continue;
+    if (fetched.empty() && !check_pending_.empty()) {
+      // Nothing answered (no session, Steam unreachable): the rest of the check would fail the same way.
+      check_.asked += check_pending_.size();
+      check_.answered += check_pending_.size();
+      check_.failed += check_pending_.size();
+      check_pending_.clear();
+    }
     for (const auto& id : batch) {
       const auto found = std::find_if(fetched.begin(), fetched.end(),
                                       [id](const AppDetails& details) { return details.id == id; });
@@ -146,10 +183,11 @@ void AppDetailsService::Run() {
       result.account_generation = generation;
       if (found == fetched.end()) {
         result.available = false;
+        result.failed = true;
         result.reason = "Steam details are unavailable right now.";
         requested_.erase(id);  // allow a later retry
       }
-      results_.push_back(std::move(result));
+      results_.emplace_back(std::move(result), checked.count(id) ? check : 0);
     }
   }
 }

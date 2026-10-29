@@ -315,11 +315,12 @@ int main(int argc,char** argv) {
       assert(live.action("focus:settings-installed"));
       capture_live("settings-storage.png");
       assert(live.action("cross"));
-      assert(live.action("focus:installed-toggle-43") && live.action("cross"));
+      assert(live.state().navigation.route == Route::ManageGames);
+      assert(live.action("focus:manage-toggle-43") && live.action("cross"));
       capture_live("installed-games.png");
-      // A batch: the list closes and Queue follows it; one game is uninstalled, the other stops on Cloud.
-      assert(live.action("focus:installed-toggle-42") && live.action("cross"));
-      assert(live.action("focus:installed-selection-uninstall") && live.action("cross"));
+      // A batch: the screen closes and Queue follows it; one game is uninstalled, the other stops on Cloud.
+      assert(live.action("focus:manage-toggle-42") && live.action("cross"));
+      assert(live.action("focus:manage-primary") && live.action("cross"));
       capture_live("installed-games-confirm.png");
       assert(live.action("focus:confirm-destructive") && live.action("cross"));
       titled.uninstall_status="Removing PS5 title…";
@@ -354,7 +355,83 @@ int main(int argc,char** argv) {
       capture_live("settings-storage-unknown.png");
     }
     {
-      // A long list: Sort and Select all stay on top and the footer stays visible mid-list.
+      // Manage installed games from its fixture scenarios: each Updates state and the Uninstall tab.
+      const auto profile = output / "manage-profile.json";
+      Simulation fixture(PLAYDEN_HOMEBREW_FIXTURES_DIR, profile);
+      for (const char* name : {"manage-updates", "manage-updates-checking", "manage-uninstall", "manage-updates-current",
+                               "manage-updates-unchecked", "manage-updates-failed", "manage-updates-no-room", "manage-move",
+                               "manage-move-no-room"}) {
+        assert(fixture.scenario(name));
+        assert(fixture.state().navigation.route == Route::ManageGames);
+        for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+        assert(renderer.capture_png(output/(std::string(name)+".png"),1920,1080));
+      }
+      // Move: without room Triangle says so; the drive picker shows each drive's state.
+      assert(fixture.view().footer.find("more needed on USB fixture library") != std::string::npos);
+      assert(fixture.action("triangle") && !fixture.state().navigation.modals.empty());
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"manage-move-no-room-dialog.png",1920,1080));
+      assert(fixture.scenario("manage-move"));
+      assert(fixture.view().footer == "2 selected · 99.1 GB to USB fixture library · 310.9 GB free after");
+      assert(fixture.action("focus:manage-move-to") && fixture.action("cross") && fixture.view().surface == "move-storage");
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"manage-move-picker.png",1920,1080));
+      // A game's Maintenance: Move to… opens the same picker for that game, its own drive disabled.
+      assert(fixture.scenario("manage-move") && fixture.action("circle"));
+      const auto first = fixture.state().games.front().id;
+      assert(fixture.action("details:" + playden::ToKey(first)) && fixture.action("focus:details-more") && fixture.action("cross"));
+      assert(fixture.action("focus:game-maintenance") && fixture.action("cross") && fixture.action("focus:game-move"));
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"maintenance-move.png",1920,1080));
+      assert(fixture.action("cross") && fixture.view().surface == "move-storage");
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"maintenance-move-picker.png",1920,1080));
+      assert(fixture.action("focus:volume-external") && fixture.action("cross") && fixture.state().navigation.modals.empty());
+      assert(fixture.scenario("manage-move") && fixture.action("triangle") && fixture.state().navigation.route != Route::ManageGames);
+      assert(std::any_of(fixture.state().notices.begin(), fixture.state().notices.end(),
+                         [](const auto& notice) { return notice.message == "2 moves queued"; }));
+      // Without room Triangle warns in a dialog, and Update anyway queues them; with room the screen closes on a notice.
+      assert(fixture.scenario("manage-updates-no-room"));
+      assert(fixture.view().footer.find("more on Console fixture storage") != std::string::npos);
+      assert(fixture.action("triangle") && !fixture.state().navigation.modals.empty());
+      assert(fixture.state().navigation.modals.back().title == "Update anyway?");
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"manage-updates-no-room-dialog.png",1920,1080));
+      assert(fixture.action("focus:confirm-destructive") && fixture.action("cross"));
+      assert(fixture.state().navigation.route != Route::ManageGames);
+      assert(std::any_of(fixture.state().notices.begin(), fixture.state().notices.end(),
+                         [](const auto& notice) { return notice.message == "3 updates queued"; }));
+      assert(fixture.scenario("manage-updates") && fixture.view().footer.find("82.0 GB free on") != std::string::npos);
+      assert(fixture.action("triangle") && fixture.state().navigation.route != Route::ManageGames);
+      assert(std::any_of(fixture.state().notices.begin(), fixture.state().notices.end(),
+                         [](const auto& notice) { return notice.message == "3 updates queued"; }));
+      // Uninstall: Triangle asks first, naming the checked games; confirming closes the screen on a notice.
+      assert(fixture.scenario("manage-uninstall") && fixture.action("triangle"));
+      assert(!fixture.state().navigation.modals.empty() && fixture.state().navigation.modals.back().id == "confirmation");
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"manage-uninstall-dialog.png",1920,1080));
+      assert(fixture.action("focus:confirm-destructive") && fixture.action("cross"));
+      assert(fixture.state().navigation.route != Route::ManageGames && fixture.state().navigation.modals.empty());
+      assert(std::any_of(fixture.state().notices.begin(), fixture.state().notices.end(), [](const auto& notice) {
+        return notice.message.rfind("Uninstalling", 0) == 0 && notice.detail == "Fixture: nothing is uninstalled";
+      }));
+      // Settings: both rows that open the screen, from the same saved check.
+      assert(fixture.scenario("manage-settings") && fixture.state().navigation.route == Route::Settings);
+      const auto settings_row = [&fixture](const std::string& key) {
+        for (const auto& row : fixture.view().rows) if (row.key == key) return row;
+        return ViewRow{};
+      };
+      assert(settings_row("settings-game-updates").value == "3 updates · 2.3 GB");
+      assert(settings_row("settings-installed").value == "6 games · 123.4 GB · 3 updates");
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"manage-settings.png",1920,1080));
+      assert(fixture.action("focus:settings-installed"));
+      for(int i=0;i<24;++i) renderer.draw(fixture,1920,1080);
+      assert(renderer.capture_png(output/"manage-settings-storage.png",1920,1080));
+      assert(fixture.action("cross") && fixture.state().navigation.route == Route::ManageGames);
+    }
+    {
+      // A long list: the toolbar stays on top and the footer stays visible mid-list.
       Simulation many({}, {}, ModelMode::Live);
       many.SetWallClock(1700000000);
       many.UpdateAccount({AuthState::SignedIn,"123","Synthetic account",{},{},true});
@@ -371,8 +448,8 @@ int main(int argc,char** argv) {
       many.UpdateInstalls({}, installed);
       while(many.state().navigation.route!=Route::Settings) assert(many.action("r1"));
       assert(many.action("focus:settings-installed") && many.action("cross"));
-      assert(many.action("focus:installed-toggle-5003") && many.action("cross"));
-      assert(many.action("focus:installed-toggle-5005") && many.action("cross"));
+      assert(many.action("focus:manage-toggle-5003") && many.action("cross"));
+      assert(many.action("focus:manage-toggle-5005") && many.action("cross"));
       for(int step=0; step<14; ++step) assert(many.action("down"));
       for(int i=0;i<24;++i) renderer.draw(many,1920,1080);
       assert(renderer.capture_png(output/"installed-games-long.png",1920,1080));

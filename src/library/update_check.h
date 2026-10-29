@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "library/model.h"
+#include "platform/storage.h"
+
+#include <cstdint>
+#include <map>
+#include <optional>
+
+namespace playden {
+
+// What a check found for one installed game: a newer version, DLC the install doesn't hold, and Steam's
+// estimate of the download.
+struct SavedGameUpdate {
+  bool newer = false;
+  bool new_dlc = false;
+  std::uint64_t download_bytes = 0;
+};
+bool operator==(const SavedGameUpdate& left, const SavedGameUpdate& right);
+
+// The last check of a Steam account's installed games for updates: when it last finished for all of them,
+// and the games it found with an update (none without one), so Settings and the update list work after a
+// restart without going online.
+struct SavedUpdateCheck {
+  std::int64_t checked_at = 0;  // unix seconds; 0: never finished
+  std::map<GameId, SavedGameUpdate> games;
+};
+bool operator==(const SavedUpdateCheck& left, const SavedUpdateCheck& right);
+
+class UpdateCheckRepository {
+ public:
+  virtual ~UpdateCheckRepository() = default;
+  // Nothing saved for the account: an empty optional.
+  virtual Result<std::optional<SavedUpdateCheck>> Load(std::uint64_t account_id) const = 0;
+  virtual Result<void> Save(std::uint64_t account_id, const SavedUpdateCheck& check) const = 0;
+};
+
+// `updates-<account>.v1` in the storage root, owner-only: "version=1", "checked_at=<seconds>", then one
+// "<game key> <flags> <download bytes>" line per game (flags: 1 newer, 2 new DLC). A damaged file fails
+// the load with kInvalidData.
+class UpdateCheckStore final : public UpdateCheckRepository {
+ public:
+  explicit UpdateCheckStore(Storage& storage) : storage_(storage) {}
+  Result<std::optional<SavedUpdateCheck>> Load(std::uint64_t account_id) const override;
+  Result<void> Save(std::uint64_t account_id, const SavedUpdateCheck& check) const override;
+
+ private:
+  Storage& storage_;
+};
+
+}  // namespace playden

@@ -1,4 +1,5 @@
 #include "app/persistence_service.h"
+#include "library/update_check.h"
 
 #include <atomic>
 #include <cassert>
@@ -391,6 +392,33 @@ void WaitIdleDrainsAnAcceptedLoadWithoutStoppingWorker() {
 
 }  // namespace
 
+// Each Steam account's update check is read and saved on the worker; without a store nothing is asked.
+void UpdateChecksLoadAndSavePerAccount() {
+  TemporaryDirectory directory;
+  Storage storage(directory.path());
+  PreferencesStore preferences(storage);
+  Repository organizations;
+  {
+    PersistenceService without(preferences, organizations);
+    assert(!without.LoadUpdateCheck(1) && !without.SaveUpdateCheck(1, 1, {}));
+  }
+  UpdateCheckStore updates(storage);
+  PersistenceService service(preferences, organizations, &updates);
+  auto loaded = Await(service, PersistenceEventKind::kUpdateCheckLoaded, service.LoadUpdateCheck(7));
+  assert(loaded.error == StorageError::kNone && !loaded.update_check && loaded.account_id == 7);
+  SavedUpdateCheck check;
+  check.checked_at = 1'800'000'000;
+  check.games[SteamId(440)] = {true, false, 12};
+  const auto saved = Await(service, PersistenceEventKind::kUpdateCheckSaved, service.SaveUpdateCheck(7, 3, check));
+  assert(saved.error == StorageError::kNone && saved.revision == 3 && saved.account_id == 7);
+  loaded = Await(service, PersistenceEventKind::kUpdateCheckLoaded, service.LoadUpdateCheck(7));
+  assert(loaded.update_check && *loaded.update_check == check);
+  loaded = Await(service, PersistenceEventKind::kUpdateCheckLoaded, service.LoadUpdateCheck(8));
+  assert(loaded.error == StorageError::kNone && !loaded.update_check);
+  service.Shutdown();
+  std::remove((directory.path() + "/updates-7.v1").c_str());
+}
+
 int main() {
   PreferencesLoadSaveCoalesceAndShutdown();
   PreferencesStatusesAndFailures();
@@ -402,4 +430,5 @@ int main() {
   OrganizationReadWriteFailures();
   TerminalCapacityRejectsWithoutChangingScope();
   WaitIdleDrainsAnAcceptedLoadWithoutStoppingWorker();
+  UpdateChecksLoadAndSavePerAccount();
 }

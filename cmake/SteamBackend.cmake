@@ -179,6 +179,17 @@ if(PLAYDEN_PLATFORM_PS5)
     target_compile_options(playden_local_copy PRIVATE -fno-exceptions -fno-rtti)
 endif()
 
+# Moving installed games between drives: the install service's MoveRunner (it reuses the copy plan
+# of imported games and removes folders with the depot installer's RemoveManagedInstall).
+add_library(playden_game_move STATIC "${CMAKE_SOURCE_DIR}/src/installs/game_move.cpp")
+target_include_directories(playden_game_move PUBLIC "${CMAKE_SOURCE_DIR}/src")
+target_compile_features(playden_game_move PUBLIC cxx_std_17)
+target_link_libraries(playden_game_move PUBLIC playden_local_store playden_steam_cm playden_steam_core playden_managed_directory)
+if(PLAYDEN_PLATFORM_PS5)
+    target_compile_definitions(playden_game_move PRIVATE PLAYDEN_PLATFORM_PS5=1)
+    target_compile_options(playden_game_move PRIVATE -fno-exceptions -fno-rtti)
+endif()
+
 set(PLAYDEN_STEAM_CA_BUNDLE "${PLAYDEN_STEAM_PREFIX}/cacert.pem"
     CACHE INTERNAL "Verified Steam HTTPS trust bundle")
 set(PLAYDEN_STEAM_LINK_ARCHIVES
@@ -276,6 +287,16 @@ function(playden_register_steam_backend_tests)
         target_compile_definitions(local_copy_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1)
         target_link_libraries(local_copy_native_policy_test PRIVATE playden_steam_cm playden_storage playden_library)
         add_test(NAME local_copy_native_policy COMMAND local_copy_native_policy_test)
+        add_executable(game_move_test "${CMAKE_SOURCE_DIR}/tests/game_move_test.cpp")
+        target_link_libraries(game_move_test PRIVATE playden_game_move)
+        add_test(NAME game_move COMMAND game_move_test)
+        # The console's walk by path and ManagedDirectory's absolute-path backend, run on the host.
+        add_executable(game_move_native_policy_test "${CMAKE_SOURCE_DIR}/tests/game_move_test.cpp"
+            "${CMAKE_SOURCE_DIR}/src/installs/game_move.cpp" "${CMAKE_SOURCE_DIR}/src/stores/local/copy_plan.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/managed_directory.cpp")
+        target_compile_definitions(game_move_native_policy_test PRIVATE PLAYDEN_PLATFORM_PS5=1)
+        target_link_libraries(game_move_native_policy_test PRIVATE playden_steam_cm playden_steam_core playden_storage playden_library)
+        add_test(NAME game_move_native_policy COMMAND game_move_native_policy_test)
         add_executable(depot_installer_test "${CMAKE_SOURCE_DIR}/tests/depot_installer_test.cpp")
         target_link_libraries(depot_installer_test PRIVATE playden_steam_cm)
         add_test(NAME depot_installer COMMAND depot_installer_test "${CMAKE_SOURCE_DIR}/fixtures/steam/appinfo")

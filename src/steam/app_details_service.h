@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace playden::steam {
@@ -77,6 +78,20 @@ struct AppDetails {
     bool available() const { return newer || new_dlc; }
   };
   Update update;
+  // Steam gave no answer for the game (no session, the network): asking again may work. Not set when Steam
+  // answered that it has no usable app info.
+  bool failed = false;
+};
+
+// A check of every installed game for updates (AppDetailsService::CheckInstalled). Counts are games:
+// `asked` were sent to Steam, `answered` were handed out by Pump, `failed` of those got no answer.
+struct InstalledCheck {
+  std::uint64_t account_generation = 0;
+  std::size_t total = 0;  // 0: no check (none started, or Invalidate dropped it)
+  std::size_t asked = 0;
+  std::size_t answered = 0;
+  std::size_t failed = 0;
+  bool done() const { return total != 0 && answered >= total; }
 };
 
 // One install choice whose exact size is asked for: a version (Steam branch, "public" by default) and a
@@ -134,6 +149,13 @@ class AppDetailsService {
   // Asks again for a game already answered in this generation (an installed game whose content changed).
   void Refresh(GameId id, std::uint64_t account_generation, bool first = false);
   void Invalidate(std::uint64_t account_generation);
+  // Asks Steam again for every game in `ids` (installed games, for updates), even those answered in this
+  // generation. They are fed in as the queue drains, behind anything Request asked for, so a page opened
+  // meanwhile still goes first; there is no limit on how many. False while a check of this generation runs.
+  // Invalidate and another account drop it. When a whole batch gets no answer (Steam unreachable), the
+  // games not yet asked are counted as failed without asking.
+  bool CheckInstalled(const std::vector<GameId>& ids, std::uint64_t account_generation);
+  InstalledCheck CheckProgress();
   std::vector<AppDetails> Pump(std::size_t maximum = 8);
   // Asks for the exact size of one install choice, after the details already asked for. A choice already
   // queued or being checked is not asked twice.
@@ -147,6 +169,7 @@ class AppDetailsService {
  private:
   void Run();
   void RunMeasures();
+  void Reset(std::uint64_t account_generation);  // mutex_ held
 
   AppDetailsSource& source_;
   SessionRepository& sessions_;
@@ -155,7 +178,13 @@ class AppDetailsService {
   std::uint64_t generation_ = 0;
   std::deque<GameId> pending_;
   std::set<GameId> requested_;  // queued, in flight or answered for this generation
-  std::deque<AppDetails> results_;
+  // Each answer with the check that asked for it (check_serial_ then), 0 for a page's: only the running
+  // check's own answers count for it.
+  std::deque<std::pair<AppDetails, std::uint64_t>> results_;
+  std::deque<GameId> check_pending_;  // the installed check's games not yet asked
+  std::set<GameId> check_waiting_;    // asked by the check, not yet handed out by Pump
+  InstalledCheck check_;
+  std::uint64_t check_serial_ = 0;  // counts the checks started
   std::deque<SizeRequest> measure_pending_;
   std::set<SizeRequest> measure_requested_;  // queued or in flight
   std::deque<MeasuredSize> measured_;

@@ -2,6 +2,7 @@
 
 #include "app/preferences.h"
 #include "library/organization.h"
+#include "library/update_check.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -22,6 +23,8 @@ enum class PersistenceEventKind {
   kOrganizationLoaded,
   kOrganizationSaved,
   kOrganizationCleared,
+  kUpdateCheckLoaded,
+  kUpdateCheckSaved,
 };
 
 struct PersistenceEvent {
@@ -35,14 +38,16 @@ struct PersistenceEvent {
   PreferencesLoadStatus preferences_status = PreferencesLoadStatus::kLoaded;
   std::optional<Preferences> preferences;
   std::optional<OrganizationSnapshot> organization;
+  std::optional<SavedUpdateCheck> update_check;  // loaded; empty when the account has none saved
 };
 
-// A single worker owns all preferences and organization IO. Dependencies
-// outlive the service. Accepted saves and organization clears are durable
+// A single worker owns all preferences, organization and update check IO.
+// Dependencies outlive the service. Accepted saves and organization clears are durable
 // shutdown work; loads may be discarded when stale or during shutdown.
 class PersistenceService {
  public:
-  PersistenceService(PreferencesStore&, OrganizationRepository&);
+  // Without `updates`, update checks are neither loaded nor saved (their requests return 0).
+  PersistenceService(PreferencesStore&, OrganizationRepository&, UpdateCheckRepository* updates = nullptr);
   ~PersistenceService();
   PersistenceService(const PersistenceService&) = delete;
   PersistenceService& operator=(const PersistenceService&) = delete;
@@ -59,6 +64,9 @@ class PersistenceService {
   PersistenceRequestId ClearOrganization(std::uint64_t account_id,
                                          std::uint64_t account_generation);
   void InvalidateOrganization(std::uint64_t account_generation);
+  // A Steam account's last update check. A save replaces one of the same account still waiting.
+  PersistenceRequestId LoadUpdateCheck(std::uint64_t account_id);
+  PersistenceRequestId SaveUpdateCheck(std::uint64_t account_id, std::uint64_t revision, SavedUpdateCheck check);
   // Waits for all currently accepted work to finish without stopping the
   // worker. Used by shutdown coordination when a load must be merged before
   // the final save is submitted.
@@ -73,6 +81,8 @@ class PersistenceService {
     kLoadOrganization,
     kSaveOrganization,
     kClearOrganization,
+    kLoadUpdateCheck,
+    kSaveUpdateCheck,
   };
   struct Job {
     Command command = Command::kLoadPreferences;
@@ -82,6 +92,7 @@ class PersistenceService {
     std::uint64_t revision = 0;
     Preferences preferences;
     OrganizationSnapshot organization;
+    SavedUpdateCheck update_check;
   };
 
   PersistenceRequestId Submit(Job);
@@ -94,6 +105,7 @@ class PersistenceService {
 
   PreferencesStore& preferences_;
   OrganizationRepository& organizations_;
+  UpdateCheckRepository* updates_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::condition_variable idle_;

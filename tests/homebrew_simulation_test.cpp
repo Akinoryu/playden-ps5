@@ -743,6 +743,13 @@ void game_update_scenarios(const std::filesystem::path& fixtures, const std::fil
     check(simulation.action("details:900001") && row("details-play") && !row("details-play")->enabled &&
               row("details-play")->value == "Finishing the update…" && !row("details-update"),
           "an update putting its files in place locks Play");
+    check(simulation.scenario("moving") && simulation.state().navigation.route == playden::homebrew::Route::Downloads &&
+              simulation.state().jobs.size() == 3 && simulation.state().jobs.front().move &&
+              simulation.state().jobs.front().stage_text.rfind("Moving to ", 0) == 0,
+          "moving opens the queue with its moves");
+    check(simulation.action("details:900001") && row("details-play") && !row("details-play")->enabled &&
+              row("details-play")->value == "Moving…",
+          "a game that is moving can't be played");
 }
 
 void t12_stress_dataset_keeps_logical_focus(const std::filesystem::path& fixtures,

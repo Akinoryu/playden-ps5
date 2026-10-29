@@ -7,6 +7,7 @@
 #include "homebrew/simulation.hpp"
 #include "homebrew/controller.hpp"
 #include "steam/install_volumes.h"
+#include "installs/game_move.h"
 #include "stores/local/copy_runner.h"
 #include "stores/local/library_source.h"
 #include "app/diagnostic_log.h"
@@ -439,6 +440,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<playden::LibraryService> library_service;
     std::unique_ptr<playden::PreferencesStore> preferences;
     std::unique_ptr<playden::OrganizationStore> organization;
+    std::unique_ptr<playden::UpdateCheckStore> update_checks;
     std::unique_ptr<playden::app::PersistenceService> persistence;
     std::unique_ptr<playden::steam::CmClient> details_cm;
     std::unique_ptr<playden::steam::CmClient> sizes_cm;
@@ -454,6 +456,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<playden::Storage> import_storage;  // imports.json; declared first: the copy runner and the Local store use it
     std::unique_ptr<playden::stores::local::ImportStore> imports;
     std::unique_ptr<playden::stores::local::LocalCopyRunner> copy_runner;  // declared first: the install service uses it
+    std::unique_ptr<playden::installs::GameMover> game_mover;  // declared first: the install service moves games with it
     std::unique_ptr<playden::steam::InstallService> installs;
     // Declared after installs: the fallback callback must finish before installs is destroyed.
     std::unique_ptr<playden::steam::CmClient> servers_cm;
@@ -568,7 +571,8 @@ int main(int argc, char** argv) {
             content_language = saved.content_language;
         }
         organization=std::make_unique<playden::OrganizationStore>(*library_storage);
-        persistence=std::make_unique<playden::app::PersistenceService>(*preferences,*organization);
+        update_checks=std::make_unique<playden::UpdateCheckStore>(*library_storage);
+        persistence=std::make_unique<playden::app::PersistenceService>(*preferences,*organization,update_checks.get());
         details_cm = std::make_unique<playden::steam::CmClient>(PLAYDEN_HOMEBREW_CA_BUNDLE, *library_storage);
         details_cm->SetOwner("details");
         details_cm->SetSharedSession(steam_cm);
@@ -647,6 +651,13 @@ int main(int argc, char** argv) {
             playden::installs::InstallService::Runners{{playden::Store::kSteam, install_runner.get()},
                                                        {playden::Store::kLocal, copy_runner.get()}},
             playden::steam::DiscoverInstallVolumes(candidates));
+        // Moving installed games between drives (--extra-volume): no PS5 title follows on the Mac.
+        playden::installs::GameMoveOptions move_options;
+        move_options.log = [log_directory](const std::string& line) {
+            playden::app::AppendLogLine(log_directory, "install.log", line);
+        };
+        game_mover = std::make_unique<playden::installs::GameMover>(std::move(move_options));
+        installs->SetMoveRunner(game_mover.get());
         servers_cm = std::make_unique<playden::steam::CmClient>(PLAYDEN_HOMEBREW_CA_BUNDLE, *library_storage);
         servers_cm->SetOwner("servers");
         servers_cm->SetSharedSession(steam_cm);

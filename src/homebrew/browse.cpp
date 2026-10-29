@@ -235,10 +235,17 @@ std::vector<Shelf> shelves(const State& state)
 
     Shelf recent{"installed", "Recently installed", {}};
     seen.clear();
+    // Newest install first (a move keeps the game's time); without times, the latest listed first.
+    std::vector<const Installation*> installed;
     for (auto installation = state.installations.rbegin(); installation != state.installations.rend();
          ++installation)
         if (installation->installed_bytes > 0)
-            append_known(state, recent, installation->game_id, seen);
+            installed.push_back(&*installation);
+    std::stable_sort(installed.begin(), installed.end(), [](const Installation* left, const Installation* right) {
+        return left->installed_at > right->installed_at;
+    });
+    for (const Installation* installation : installed)
+        append_known(state, recent, installation->game_id, seen);
     // Imported games playing from their folder, newest first: without a store sign-in, they are
     // the whole of Home.
     std::vector<const Game*> in_place;

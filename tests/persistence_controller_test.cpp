@@ -394,6 +394,55 @@ void LogsSaveFailuresOnceAndRecovery() {
   assert(lines[1] == "organization save works again");
 }
 
+namespace {
+class UpdateRepository final : public UpdateCheckRepository {
+ public:
+  mutable std::mutex mutex;
+  mutable std::map<std::uint64_t, SavedUpdateCheck> saved;
+  mutable std::atomic<int> saves{0};
+  std::atomic<bool> fail_saves{false};
+  Result<std::optional<SavedUpdateCheck>> Load(std::uint64_t) const override {
+    return Result<std::optional<SavedUpdateCheck>>::Success(std::nullopt);
+  }
+  Result<void> Save(std::uint64_t account, const SavedUpdateCheck& check) const override {
+    ++saves;
+    if (fail_saves) return Result<void>::Failure(StorageError::kWriteFailed, "save");
+    std::lock_guard<std::mutex> lock(mutex);
+    saved[account] = check;
+    return Result<void>::Success();
+  }
+};
+}  // namespace
+
+// A failed save of the update check is submitted again when the player asks to retry.
+void UpdateCheckSaveRetries() {
+  TemporaryDirectory directory;
+  Storage storage(directory.path());
+  PreferencesStore preferences(storage);
+  Repository repository;
+  UpdateRepository updates;
+  updates.fail_saves = true;
+  PersistenceService service(preferences, repository, &updates);
+  Simulation model({}, {}, ModelMode::Live);
+  PersistenceController controller(model, service);
+  model.SetWallClock(1760000000);
+  Connect(model, controller);
+  Wait(controller, [&] { return model.state().update_check.loaded; });
+  assert(model.action("update-check") && model.TakeUpdateCheckRequest());
+  model.FinishUpdateCheck(false);
+  Wait(controller, [&] { return updates.saves.load() == 1; });
+  service.WaitIdle();
+  updates.fail_saves = false;
+  for (int i = 0; i < 20; ++i) { controller.Tick(); std::this_thread::sleep_for(1ms); }
+  assert(updates.saves.load() == 1 && model.UpdateCheckDirty());
+  controller.Retry();
+  Wait(controller, [&] { return updates.saves.load() == 2; });
+  service.WaitIdle();
+  controller.Tick();
+  std::lock_guard<std::mutex> lock(updates.mutex);
+  assert(updates.saved[123].checked_at == model.state().update_check.checked_at && !model.UpdateCheckDirty());
+}
+
 int main() {
   PendingLoadReplaysLocalEditAndSavesMergedSnapshot();
   SignOutClearKeepsOrganization();
@@ -404,4 +453,5 @@ int main() {
   InvalidMergedLoadStaysUnsavedUntilEditAndRetryResolveIt();
   InitialPreferencesFailureRetriesWithoutOverwritingUnknownData();
   LogsSaveFailuresOnceAndRecovery();
+  UpdateCheckSaveRetries();
 }

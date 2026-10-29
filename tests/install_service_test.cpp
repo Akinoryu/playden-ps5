@@ -893,8 +893,8 @@ void UpdatesAnInstalledGame(const std::filesystem::path& root) {
   Runner runner(sessions);
   InstallService service(runner, root.string());
   const auto game = SteamId(700);
-  // Not installed: nothing to update.
-  service.Update(game);
+  // Not installed: nothing to update, and the answer says why.
+  CHECK(service.Update(game) == "The game is not installed.");
   CHECK(!JobOf(service.Snapshot(), game));
   service.Install(game);
   AwaitAt(__LINE__, service, [&](const InstallSnapshot& s) { return Installed(s, game) && !JobOf(s, game); });
@@ -905,7 +905,8 @@ void UpdatesAnInstalledGame(const std::filesystem::path& root) {
   InstallService again(runner, root.string());
   runner.block = true;
   runner.apply_block = true;
-  again.Update(game);
+  CHECK(again.Update(game).empty());
+  CHECK(again.Update(game) == "The game is already in the Queue.");
   AwaitAt(__LINE__, again, [&](const InstallSnapshot& s) {
     const auto* job = JobOf(s, game);
     return job && job->state == InstallJobState::kRunning && job->step == InstallStep::kDownloading && runner.updates == 1;
@@ -1212,6 +1213,14 @@ int main() {
     CHECK(copies[0].action == InstallRequest::Action::kCopy && copies[0].game == playden::GameId::Local(uuid) &&
           copies[0].volume.empty());
     CHECK(copies[1].action == InstallRequest::Action::kCopy && copies[1].volume == "usb0");
+    // `move` moves a drop-folder game into Playden, or an installed Steam game to the drive named.
+    const auto moves = ParseInstallRequests("move local-" + uuid + "\nmove 220 usb0\nmove 220\nmove local-" + uuid +
+                                            " usb0\nmove 220 usb0 extra\nmove 220 USB!\n");
+    CHECK(moves.size() == 2);
+    CHECK(moves[0].action == InstallRequest::Action::kMove && moves[0].game == playden::GameId::Local(uuid) &&
+          moves[0].volume.empty());
+    CHECK(moves[1].action == InstallRequest::Action::kMove && moves[1].game == playden::GameId::Steam(220) &&
+          moves[1].volume == "usb0");
     // Refused: a cancel (imported games have no download), a malformed key, missing or extra words,
     // unclosed or empty quotes, a quote glued to the next word.
     CHECK(ParseInstallRequests("cancel local-" + uuid + "\nlocal-XYZ\nlocal-" + uuid + " extra\n"

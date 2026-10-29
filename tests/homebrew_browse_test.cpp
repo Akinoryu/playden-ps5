@@ -289,6 +289,26 @@ void disconnected_installations_remain_installed(const std::filesystem::path& fi
           "Recently installed keeps disconnected games visible");
 }
 
+// Recently installed lists the newest install first, by the time each game was installed (a move keeps it),
+// whatever order the installations come in; games without a time follow.
+void recently_installed_follows_install_times(const std::filesystem::path& fixtures)
+{
+    auto state = fixture_state(fixtures);
+    check(state.installations.size() >= 3, "fixture has installations");
+    const auto first = state.installations[0].game_id, second = state.installations[1].game_id,
+               third = state.installations[2].game_id;
+    state.installations[0].installed_at = 300;
+    state.installations[1].installed_at = 100;
+    state.installations[2].installed_at = 200;
+    const auto projected = shelves(state);
+    const auto recent = std::find_if(projected.begin(), projected.end(), [](const Shelf& shelf) {
+        return shelf.key == "installed";
+    });
+    check(recent != projected.end() && recent->game_ids.size() >= 3 && recent->game_ids[0] == first &&
+              recent->game_ids[1] == third && recent->game_ids[2] == second,
+          "Recently installed goes by install time, newest first");
+}
+
 void live_unicode_query() {
     State state;
     state.simulation_mode=false;
@@ -425,6 +445,7 @@ int main(int argc, char** argv)
     download_window_keeps_late_jobs_visible(fixtures);
     utf8_caret_boundaries();
     disconnected_installations_remain_installed(fixtures);
+    recently_installed_follows_install_times(fixtures);
     imported_scope_lists_local_games(fixtures);
     imported_games_fill_home_signed_out();
     std::cout << "homebrew browse tests passed\n";

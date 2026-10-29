@@ -22,6 +22,8 @@ struct LibraryResult {
   LibraryError error = LibraryError::kProtocol;
   std::vector<playden::GameSummary> games;
   bool metadata_partial = false;
+  // The account's licenses were read with the games (Steam's CM answered): the library says what it owns.
+  bool licenses_read = false;
 };
 
 class LibraryBackend {

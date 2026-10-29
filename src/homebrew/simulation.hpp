@@ -5,6 +5,7 @@
 
 #include "app/preferences.h"
 #include "library/organization.h"
+#include "library/update_check.h"
 #include "library/model.h"
 #include "runtime/game_settings.h"
 #include "steam/backend/content_language.h"
@@ -23,7 +24,9 @@ namespace playden::homebrew {
 
 using GameId = playden::GameId;
 
-enum class Route { Startup, SignIn, Home, Library, Downloads, Settings, Details, Session, Saves, SaveDetails };
+enum class Route { Startup, SignIn, Home, Library, Downloads, Settings, Details, Session, Saves, SaveDetails, ManageGames };
+// Manage installed games: one tab per batch action. Each has its own list and selection.
+enum class ManageTab { Updates, Move, Uninstall };
 enum class ModelMode { Simulation, Live };
 // UsePassword/UseQr switch the sign-in screen's method; BeginPassword and SubmitCode carry the form's
 // secrets, which the controller takes with TakeSignInCredentials and TakeGuardCode.
@@ -72,13 +75,14 @@ enum class JobStage { Download, Verify, Install, Uninstall };
 enum class SessionState { Idle, Preparing, Launching, Running, Stopping, Failed, Crashed };
 enum class RuntimeState { Unavailable, Checking, Ready, Failed };
 enum class LogState { Loading, Ready, Failed };
-// Update: an installed game's update (or DLC bought since), from its details page.
+// Update: an installed game's update (or DLC bought since), from its details page. Move: an installed game to
+// another drive (volume_id).
 enum class InstallRequestKind { Install, Pause, Resume, DownloadNow, MoveUp, MoveDown, Cancel, Uninstall, SetDefaultVolume,
-                                DismissCompleted, ClearCompleted, Update };
+                                DismissCompleted, ClearCompleted, Update, Move };
 struct InstallRequest {
     InstallRequestKind kind = InstallRequestKind::Install;
     GameId game_id;
-    std::string volume_id;  // SetDefaultVolume; Install: this install's drive (empty: the default)
+    std::string volume_id;  // SetDefaultVolume, Move: the drive; Install: this install's drive (empty: the default)
     bool delete_saves = false;  // Uninstall only: also delete the game's kept saves and settings
     // Install: the content language chosen in the install sheet for this install (empty: the Settings
     // download language), and the branch (empty: public).
@@ -98,6 +102,8 @@ inline constexpr const char* kFastestDownloadServer = "fastest";
 // "Fastly · 18.2 MB/s · ~3 min left": the server's name comes first when there is a rate.
 std::string FormatDownloadRate(std::optional<std::uint64_t> bytes_per_second, std::optional<int> eta_seconds,
                                const std::string& server_name = {});
+// The jobs the install service's Queue holds at once (installs::InstallService::kMaxJobs).
+inline constexpr std::size_t kQueueJobLimit = 64;
 struct LiveInstallJob {
     GameId game_id;
     JobState state = JobState::Queued;
@@ -114,12 +120,18 @@ struct LiveInstallJob {
     bool locked = false;          // the update is putting its files in place: the game can't be played
     bool checking_files = false;  // while running: the update hashes the installed files
     bool applying = false;        // while running: the update puts its files in place
+    // A move to another drive (volume_id) from from_volume_id; while running, what it is doing. locked: its
+    // title may already use the copy, or it is deleting the old folder, so it can't be paused or canceled.
+    bool move = false;
+    std::string from_volume_id;
+    enum class MoveStep { Copying, Verifying, Switching, DeletingOld } move_step = MoveStep::Copying;
 };
 struct LiveInstalledGame {
     GameId game_id;
     std::uint64_t install_bytes = 0;
     std::string volume_id;
     bool available = true;  // false while the game's drive is absent
+    std::int64_t finished_at = 0;  // when it was installed (Unix seconds; a move keeps it), 0 unknown
 };
 // A recent finished download, listed in Downloads after the queue.
 struct LiveCompletedDownload {
@@ -502,6 +514,19 @@ struct GameUpdate {
     bool operator==(const GameUpdate&) const = default;
 };
 
+// Live: the check of the Steam account's installed games for updates (Manage installed games). It runs at
+// most once a day when the screen opens, or when the player asks; the result is saved per account.
+struct UpdateCheckState {
+    bool loaded = false;          // the account's saved check has been read (or there was none)
+    std::int64_t checked_at = 0;  // the last check that finished for every game, unix seconds; 0: never
+    bool checking = false;
+    std::size_t asked = 0;     // games sent to Steam so far
+    std::size_t answered = 0;  // games Steam answered (or failed to)
+    std::size_t total = 0;     // games the running check covers; 0 until the controller starts it
+    bool failed = false;       // the last check couldn't reach Steam: the saved results stand ("Couldn't check")
+    std::map<GameId, GameUpdate> games;  // installed games with an update or new DLC, from checks and game pages
+};
+
 struct Game {
     GameId id;
     std::string title;
@@ -559,6 +584,7 @@ struct Installation {
     bool available = true;
     bool runtime_ready = true;
     bool saves_present = true;
+    std::int64_t installed_at = 0;  // live: when it was installed (Unix seconds), 0 unknown; Home's Recently installed
 };
 
 struct Job {
@@ -584,7 +610,9 @@ struct Job {
     bool checking_licenses = false;  // live: a slow Steam license check before the download starts
     std::string server_name;  // live, while downloading: the download server's display name
     bool update = false;  // an installed game's update (kind stays "install": a game's download)
-    bool locked = false;  // the update is putting its files in place: Play waits for it
+    bool locked = false;  // the update is putting its files in place, or the move must finish: Play waits for it
+    bool move = false;    // an installed game moving to volume_id from from_volume_id: Play waits while it runs
+    std::string from_volume_id;
     // A job that is not a game's (the Playden update): its title and the words for its stage and state.
     std::string title;
     std::string stage_text;
@@ -639,6 +667,7 @@ struct Navigation {
     // and the game its details page shows.
     int saves_filter = 0;
     GameId save_id;
+    ManageTab manage_tab = ManageTab::Uninstall;  // Manage installed games: the open tab
 };
 
 struct EditorState {
@@ -718,6 +747,7 @@ struct State {
     std::vector<LiveImportCandidate> import_candidates; // live: folders on the drives that could be imported
     bool import_scanning = false;                       // live: Playden is looking for games to import
     LiveSavesJob saves_job;                             // live: the Saves tab's running check or Sync all
+    UpdateCheckState update_check;                      // live: installed games' updates, the signed-in account's
     std::map<GameId, std::uint64_t> save_sizes;         // live: Windows user folders of games without Steam Cloud
     Navigation navigation;
     EditorState editor;
@@ -793,6 +823,9 @@ struct ViewData {
     std::string subtitle;
     std::string eyebrow;  // a sheet's label above its title; empty: the sheet's place (view.cpp)
     std::vector<ViewRow> rows;
+    // Manage installed games: its tabs (selected: the open one; value: the count badge) and each drive's free space.
+    std::vector<ViewRow> tabs;
+    std::string aside;
     std::vector<ViewRow> actions;
     struct Shelf {
         std::string key;
@@ -908,6 +941,9 @@ public:
     [[nodiscard]] std::vector<std::pair<GameId, MaintenanceKind>> TakeMaintenanceRequests();
     [[nodiscard]] std::vector<GameId> TakeActivityRequests();
     void NotifyUninstallStopped(GameId id, const std::string& reason);
+    // A move or an update the install service refused when it was asked (InstallRequestKind::Move, ::Update).
+    void NotifyMoveRefused(GameId id, const std::string& reason);
+    void NotifyUpdateRefused(GameId id, const std::string& reason);
     // The uninstall is over: the game's PS5 title and files are gone. Queue lists it as done.
     void NotifyUninstallFinished(GameId id);
     // Play prepared the game first and that ended without a playable title.
@@ -955,11 +991,12 @@ public:
     // Live mode: Steam app-info estimates for one game (download/install size, installability).
     // `languages`: the content languages the game carries, as Steam names them. `dlc_count`: owned
     // DLC with content an install includes, shown on the install sheet. `versions`: the versions an
-    // install can choose, public first. `update`: an installed game's update or new DLC.
+    // install can choose, public first. `update`: an installed game's update or new DLC, which the account's
+    // saved update list takes only when `updates_known` (the library refresh has read the licenses).
     bool UpdateAppDetails(GameId id, std::optional<std::uint64_t> download_bytes,
                           std::optional<std::uint64_t> install_bytes, std::optional<bool> windows_installable,
                           std::vector<std::string> languages = {}, std::uint32_t dlc_count = 0,
-                          std::vector<GameVersion> versions = {}, GameUpdate update = {});
+                          std::vector<GameVersion> versions = {}, GameUpdate update = {}, bool updates_known = true);
     // Live mode: the Steam store's description, genres and controller support for one game;
     // kept across library refreshes.
     void UpdateStoreDetails(GameId id, std::string description, std::vector<std::string> genres,
@@ -971,6 +1008,23 @@ public:
                               playden::StorageError error);
     void OrganizationCleared(std::uint64_t account);
     PersistenceLoadToken BeginPreferencesLoad();
+    // Live mode: the update check of installed games, saved per Steam account. BeginUpdateCheckLoad: that
+    // account's saved check is read next (ApplyUpdateCheck; nothing saved: an empty optional). Reset: no account.
+    void BeginUpdateCheckLoad(std::uint64_t account);
+    void ApplyUpdateCheck(std::uint64_t account, std::optional<playden::SavedUpdateCheck> saved);
+    void ResetUpdateCheck();
+    [[nodiscard]] std::uint64_t UpdateCheckAccount() const noexcept { return update_check_account_; }
+    [[nodiscard]] std::uint64_t UpdateCheckRevision() const noexcept { return update_check_revision_; }
+    // Loaded, and changed since the last save that worked.
+    [[nodiscard]] bool UpdateCheckDirty() const noexcept;
+    [[nodiscard]] playden::SavedUpdateCheck ExportUpdateCheck() const;
+    void UpdateCheckSaveResult(std::uint64_t account, std::uint64_t revision, playden::StorageError error);
+    // A check the controller should start: the player asked, or the screen opened a day after the last one.
+    [[nodiscard]] bool TakeUpdateCheckRequest();
+    // The running check's progress, in games; Finish ends it. `failed`: Steam gave no answer for some games,
+    // so the time of the last full check stays and their saved results stand.
+    void UpdateCheckProgress(std::size_t asked, std::size_t answered, std::size_t total);
+    void FinishUpdateCheck(bool failed);
     bool ApplyPreferences(PersistenceLoadToken token,
                           const playden::PreferencesLoadResult& loaded);
     [[nodiscard]] playden::OrganizationSnapshot ExportOrganization() const;
@@ -1044,6 +1098,7 @@ private:
     bool download_server_cancel_pending_ = false;
     bool download_server_test_requested_ = false;
     bool download_server_fixture_ = false;
+    bool manage_fixture_ = false;  // a Manage installed games scenario: Settings shows its rows in the fixture
     void refresh_download_servers(const std::string& focus = {});
     [[nodiscard]] std::string best_tested_download_server() const;
     [[nodiscard]] std::string download_server_choice_key() const;
@@ -1118,6 +1173,7 @@ private:
     bool live_installs_seen_ = false;
     std::map<GameId, JobState> live_job_states_;
     std::set<GameId> live_update_jobs_;  // the live jobs that are updates, as last projected
+    std::set<GameId> live_move_jobs_;    // the live jobs that are moves, as last projected
     std::set<GameId> canceled_updates_;  // updates the player canceled, until their job ends
     std::set<GameId> live_installed_ids_;
     std::set<GameId> pending_uninstalls_;
@@ -1129,17 +1185,29 @@ private:
     bool uninstall_delete_saves_ = false;  // the uninstall dialog's choice
     std::set<GameId> kept_selected_;  // the kept game data manager's checked games
     std::set<std::string> leftover_selected_;  // the leftover titles manager's checked title IDs
-    // Installed games (Settings > Storage): the checked games and the list's order.
-    std::set<GameId> installed_selected_;
-    bool installed_by_played_ = false;  // false: largest first; true: never played, then the oldest
+    // Manage installed games: each tab's checked games, order and focus, kept while the screen is open.
+    struct ManageTabState {
+        std::set<GameId> selected;
+        std::set<GameId> listed;  // Updates: games listed so far; each is checked when it first shows up
+        bool by_played = false;   // false: largest first (download size on Updates); true: never played, then the oldest
+        std::string focus;        // the row focused when the player switched away
+        std::string list_focus;   // the game row the focus left for the footer
+    };
+    std::map<ManageTab, ManageTabState> manage_tabs_;
+    Route manage_return_route_ = Route::Settings;  // where Circle returns: Settings, or the storage-full sign-in
+    std::string manage_return_focus_;              // the row that opened the screen
+    int manage_focus_index_ = 0;       // the focused row's place, to stay near it when that game goes
     // Games uninstalled together from the Installed games list: Queue follows them, so they post
     // no notice of their own when they finish, and a stop is a corner notice, not a dialog.
     std::set<GameId> batch_uninstalls_;
     std::map<GameId, std::string> uninstall_titles_;  // names of games being uninstalled, for once they are gone
     // Steam games still being uninstalled when their account signed out: how they end is not listed.
     std::set<GameId> previous_account_uninstalls_;
-    std::string installed_list_focus_;  // the game row the focus left for the footer
-    std::string installed_message_;  // the list's note when a confirmed uninstall could not start
+    std::string manage_message_;  // the Uninstall tab's note when a confirmed uninstall could not start
+    // Move: the drive the checked games go to (each moves from where it is), and the game a drive is being
+    // chosen for from its page's Maintenance (none: the Move tab's Move to).
+    std::string manage_move_volume_id_;
+    GameId move_picker_game_;
     bool rebuilding_overlay_ = false;  // rebuild_view is building the screen under an open sheet
     struct StoreFacts { std::string description; std::vector<std::string> genres; std::string controller_support; };
     std::map<GameId, StoreFacts> store_facts_;  // live: from the Steam store, applied over library refreshes
@@ -1215,7 +1283,17 @@ private:
     playden::OrganizationSnapshot captured_organization_;
     playden::OrganizationSnapshot persisted_organization_;
     playden::Preferences captured_preferences_;
+    std::uint64_t update_check_account_ = 0;
+    std::uint64_t update_check_revision_ = 0;
+    std::uint64_t update_check_saved_revision_ = 0;
+    bool update_check_requested_ = false;
+    std::optional<bool> update_check_waiting_;  // asked (true: by the player) before the saved check was read
+    std::map<GameId, GameUpdate> update_check_early_;  // results before the saved check was read
 
+    // The screen opened (`forced` false: only a day after the last full check) or Check for updates.
+    void request_update_check(bool forced);
+    // A game's update as Steam answered it: kept when there is one, dropped otherwise.
+    void set_saved_update(GameId id, const GameUpdate& update);
     void load_fixtures();
     void load_profile();
     bool save_profile();
@@ -1316,17 +1394,57 @@ private:
     // Why the latest add of a folder was refused, by candidate key: its row on the Import sheet says it
     // (a dialog waits until the sheet closes).
     std::map<std::string, std::string> import_failures_;
-    // Installed games list: its games in the chosen order (those a running batch uninstalled
-    // included), why a game cannot be picked now (empty when it can), and the list's refresh.
-    [[nodiscard]] std::vector<GameId> installed_list() const;
+    // Manage installed games: a tab's games in its order, why a game cannot be picked now (empty when it
+    // can), and the screen's refresh when installs, jobs or the runtime change.
+    [[nodiscard]] std::vector<GameId> manage_list(ManageTab tab) const;
     [[nodiscard]] std::string installed_blocker(GameId id) const;
-    [[nodiscard]] std::vector<std::string> installed_manager_actions() const;
-    void refresh_installed_manager();
+    // On Updates also a game whose drive is disconnected or read-only.
+    [[nodiscard]] std::string manage_blocker(ManageTab tab, GameId id) const;
+    void refresh_manage_games();
+    void open_manage_games(ManageTab tab);
+    void close_manage_games();
+    void switch_manage_tab(int delta);
+    void manage_select_all();
+    void ask_manage_uninstall();
+    // The Updates tab's checked games that can update now, in list order, the download they add up to, and
+    // the first drive without room for its share (empty when they all fit or free space can't be read).
+    struct ManageUpdates {
+        std::vector<GameId> games;
+        std::uint64_t bytes = 0;
+        std::vector<std::pair<std::string, std::uint64_t>> free;  // each drive's label and free space
+        std::string short_drive;
+        std::uint64_t short_bytes = 0;
+    };
+    [[nodiscard]] ManageUpdates manage_updates() const;
+    void queue_manage_updates(bool anyway = false);
+    // The Move tab's checked games that can move now, in list order, their size, and the destination's free
+    // space (none when it can't be read); short when they don't fit there.
+    struct ManageMoves {
+        std::vector<GameId> games;
+        std::uint64_t bytes = 0;
+        std::optional<std::uint64_t> free;
+        bool short_of_space = false;
+    };
+    [[nodiscard]] ManageMoves manage_moves() const;
+    void queue_manage_moves();
+    // Drives a game can move to: available and writable. Moving needs two of them.
+    [[nodiscard]] std::vector<const Volume*> move_volumes() const;
+    // Live: how many more games the Queue takes (kQueueJobLimit less its jobs and those asked for); false
+    // when the batch of `count` doesn't fit, after telling the player.
+    [[nodiscard]] std::size_t queue_room() const;
+    bool queue_fits(std::size_t count);
+    void choose_manage_move_volume();
+    void open_move_picker(GameId game);
+    void choose_move_volume(const std::string& volume_id);
+    // Why a game can't move to `volume_id` now (empty when it can).
+    [[nodiscard]] std::string move_blocker(GameId id, const std::string& volume_id) const;
+    void build_manage_games_view();
+    [[nodiscard]] std::string manage_default_focus() const;
+    bool move_manage(int delta_x, int delta_y);
     // Asks the controller to uninstall a game; batch: from the Installed games list.
     void request_uninstall(GameId id, bool delete_saves, bool batch);
     void end_uninstall(GameId id, const std::string& stopped);
     [[nodiscard]] const EndedUninstall* uninstall_stop(GameId id) const;
-    void move_installed_manager(int delta_x, int delta_y);
     [[nodiscard]] std::vector<std::string> collection_sheet_actions(const std::string& sheet) const;
     void refresh_collection_sheets(const std::string& focus = {});
     void refresh_game_settings();

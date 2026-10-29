@@ -28,6 +28,10 @@ class DetailsSource {
   virtual void RequestFirst(const GameId& id, std::uint64_t generation) { Request(id, generation); }
   virtual void Invalidate(std::uint64_t generation) = 0;
   virtual std::vector<GameDetails> Pump(std::size_t maximum) = 0;
+  // Asks again for every installed game, for updates (steam::AppDetailsService::CheckInstalled); a store
+  // without updates checks nothing and answers false.
+  virtual bool CheckInstalled(const std::vector<GameId>&, std::uint64_t) { return false; }
+  virtual steam::InstalledCheck CheckProgress() { return {}; }
   // The exact size of one install choice (steam::MeasuredSize); a store without it answers nothing.
   virtual void Measure(const steam::SizeRequest&, std::uint64_t) {}
   virtual std::vector<steam::MeasuredSize> PumpMeasured() { return {}; }

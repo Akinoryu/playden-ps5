@@ -374,7 +374,7 @@ InstallRunner::Result SteamInstallRunner::Run(const StoredSession& session, std:
   std::optional<FreeLicenseResult> claim;
   std::set<std::uint32_t> refused_before;
   if (!app->dlc_app_ids.empty()) {
-    const auto grant = licensed_ ? licensed_->Get() : std::nullopt;
+    const auto grant = licensed_ ? licensed_->Get(session.steam_id) : std::nullopt;
     if (free_dlc_memory_) refused_before = LoadFreeDlcMemory(*free_dlc_memory_, account);
     if (!grant) {
       log("dlc", "claim", "skipped=no-licenses");

@@ -204,6 +204,13 @@ std::string byte_count(std::optional<std::uint64_t> bytes)
     constexpr double mib = 1000.0 * 1000.0;
     constexpr double gib = 1000.0 * mib;
     std::array<char, 32> value{};
+    // Below a megabyte, kilobytes (at least 1): a small update isn't "0 MB". Nothing at all stays "0 MB".
+    if (*bytes > 0 && *bytes < 999'500)
+    {
+        const int written = std::snprintf(value.data(), value.size(), "%.0f KB",
+                                          std::max(1.0, static_cast<double>(*bytes) / 1000.0));
+        return written > 0 ? std::string(value.data(), static_cast<std::size_t>(written)) : "Unknown";
+    }
     // Below a gigabyte, megabytes: "0.2 GB" says little about a small game.
     if (*bytes < static_cast<std::uint64_t>(gib))
     {
@@ -512,6 +519,9 @@ class Render::Impl
             break;
         case Route::SaveDetails:
             draw_save_details(route_view, state);
+            break;
+        case Route::ManageGames:
+            draw_manage_games(route_view, state);
             break;
         case Route::Details:
             draw_details(scene, route_view, state);
@@ -2703,6 +2713,235 @@ class Render::Impl
         scene_.pop_clip();
     }
 
+    // A button glyph as the hint row draws them ("L1", "R1"), standing alone.
+    void glyph_pill(std::string_view label, float x, float cy)
+    {
+        const float width = std::max(30.0F, fonts_.semibold.measure(label, 15.0F) + 14.0F);
+        scene_.rounded_rect({x, cy - 15.0F, width, 30.0F}, 15.0F, kText.with_alpha(0.10F));
+        ui::text(scene_, fonts_.semibold, label, x + width * 0.5F, cy + 5.0F, 15.0F, kText, gfx::Align::center);
+    }
+
+    // Manage installed games, fullscreen: tabs switched with L1/R1, each with its toolbar, a table of
+    // games and a footer with the selection and the tab's one action. Blue is Update, amber Move, red Uninstall.
+    void draw_manage_games(const ViewData &view, const State &state)
+    {
+        const auto shown = state.navigation.manage_tab;
+        const bool updates = shown == ManageTab::Updates;
+        const bool moves = shown == ManageTab::Move;
+        const gfx::Color tone = updates ? kBlue : moves ? kAmber : kRed;
+        const auto focused_key = [&]() -> std::string {
+            if (view.focused_row < 0 || static_cast<std::size_t>(view.focused_row) >= view.rows.size()) return {};
+            return view.rows[static_cast<std::size_t>(view.focused_row)].key;
+        }();
+        const auto focus_of = [&](const ViewRow &row) {
+            const bool focused = route_focus_ && focused_key == row.key;
+            if (focused)
+                stats_.focused_control_key = row.key;
+            return control_focus(row.key, focused);
+        };
+
+        // The tabs, as the main bar draws them, between their shoulder buttons.
+        constexpr float cy = 82.0F;
+        float x = kSafeX;
+        glyph_pill("L1", x, cy);
+        x += 46.0F;
+        for (const ViewRow &tab : view.tabs)
+        {
+            const float label = fonts_.display.measure(tab.title, 30.0F);
+            const float badge = tab.value.empty() ? 0.0F : fonts_.semibold.measure(tab.value, 16.0F) + 30.0F;
+            const gfx::Rect box{x, cy - 26.0F, 44.0F + label + badge, 52.0F};
+            if (tab.selected)
+                scene_.bordered_rect(box, 8.0F, kText.with_alpha(0.12F), 2.0F, kText.with_alpha(0.35F));
+            ui::text(scene_, fonts_.display, tab.title, x + 22.0F, cy + 11.0F, 30.0F, tab.selected ? kText : kSecondary);
+            if (!tab.value.empty())
+            {
+                const float badge_x = x + 22.0F + label + 12.0F;
+                scene_.rounded_rect({badge_x, cy - 14.0F, badge - 12.0F, 28.0F}, 14.0F, kAccent);
+                ui::text(scene_, fonts_.semibold, tab.value, badge_x + (badge - 12.0F) * 0.5F, cy + 6.0F, 16.0F, kBackground,
+                         gfx::Align::center);
+            }
+            x += box.w + 8.0F;
+        }
+        glyph_pill("R1", x, cy);
+        ui::text(scene_, fonts_.regular, fit(fonts_.regular, view.aside, 22.0F, 1824.0F - x - 80.0F), 1824.0F, 91.0F, 22.0F,
+                 kSecondary, gfx::Align::right);
+
+        ui::text(scene_, fonts_.display, view.title, kSafeX, 192.0F, 56.0F, kText);
+        const ViewRow *check = nullptr;
+        for (const ViewRow &row : view.rows)
+            if (row.key == "manage-check")
+                check = &row;
+        if (check != nullptr && check->selected)
+        {
+            // A check is running: its progress, with a bar while Steam's answers come in.
+            const float words = fonts_.regular.measure(view.subtitle, 23.0F);
+            ui::text(scene_, fonts_.regular, view.subtitle, kSafeX, 230.0F, 23.0F, kSecondary);
+            const float bar_x = kSafeX + words + 18.0F, bar_w = std::max(0.0F, 900.0F - words - 18.0F);
+            scene_.rounded_rect({bar_x, 219.0F, bar_w, 6.0F}, 3.0F, kText.with_alpha(0.10F));
+            if (check->progress > 0.0F)
+                scene_.rounded_rect({bar_x, 219.0F, bar_w * check->progress, 6.0F}, 3.0F, kBlue);
+        }
+        else
+            ui::text(scene_, fonts_.regular, fit(fonts_.regular, view.subtitle, 23.0F, 1728.0F), kSafeX, 230.0F, 23.0F,
+                     kSecondary);
+
+        // The toolbar: Move to (on Move), Select all and Sort at the left, Check for updates at the right.
+        float tool_x = kSafeX;
+        std::vector<const ViewRow *> games, notes;
+        const ViewRow *primary = nullptr;
+        for (const ViewRow &row : view.rows)
+        {
+            if (row.key == "manage-move-to" || row.key == "manage-select-all" || row.key == "manage-sort" ||
+                row.key == "manage-check")
+            {
+                const bool picker = row.key == "manage-move-to";
+                const float label = fonts_.regular.measure(row.title, 22.0F);
+                const float value = row.value.empty() ? 0.0F : fonts_.regular.measure(row.value, 22.0F) + 12.0F;
+                const float width = label + value + 44.0F + (picker ? 26.0F : 0.0F);
+                const bool right = row.key == "manage-check";
+                const gfx::Rect box{right ? 1824.0F - width : tool_x, 252.0F, width, 56.0F};
+                if (!right)
+                    tool_x += width + 12.0F;
+                const float amount = focus_of(row);
+                focus_glow(scene_, box, amount, true);
+                scene_.rounded_rect(box, 8.0F, kBackground);
+                scene_.bordered_rect(box, 8.0F, kText.with_alpha(0.05F), 2.0F,
+                                     picker && row.enabled ? kAmber.with_alpha(0.55F) : kText.with_alpha(0.10F));
+                const bool muted = !row.enabled;
+                if (picker)
+                {
+                    // A chevron: it opens the drive picker.
+                    const float cx = box.x + box.w - 30.0F, cy = box.cy();
+                    scene_.line(cx - 2.0F, cy - 5.0F, cx + 3.0F, cy, 2.0F, kSecondary);
+                    scene_.line(cx + 3.0F, cy, cx - 2.0F, cy + 5.0F, 2.0F, kSecondary);
+                }
+                if (row.value.empty())
+                    ui::text(scene_, fonts_.regular, row.title, box.x + 22.0F, box.cy() + 8.0F, 22.0F, muted ? kMuted : kText);
+                else
+                {
+                    ui::text(scene_, fonts_.semibold, row.title, box.x + 22.0F, box.cy() + 8.0F, 22.0F, kSecondary);
+                    ui::text(scene_, fonts_.regular, row.value, box.x + 22.0F + label + 12.0F, box.cy() + 8.0F, 22.0F,
+                             muted ? kMuted : kText);
+                }
+                focus_ring(scene_, box, amount, true);
+            }
+            else if (row.key.rfind("manage-toggle-", 0) == 0)
+                games.push_back(&row);
+            else if (row.key == "manage-primary")
+                primary = &row;
+            else
+                notes.push_back(&row);
+        }
+
+        // The table: checkbox, cover, the game and its note, when it was last played, its size.
+        constexpr float table_x = kSafeX, table_w = 1824.0F - kSafeX;
+        constexpr float played_x = 1356.0F, size_right = 1800.0F;
+        constexpr float name_x = table_x + 24.0F + 30.0F + 24.0F + 44.0F + 24.0F;
+        const auto heading = [&](std::string_view label, float at, gfx::Align align) {
+            ui::text(scene_, fonts_.semibold, label, at, 352.0F, 17.0F, kSecondary, align, 2.0F);
+        };
+        if (!games.empty())
+        {
+            heading("GAME", name_x, gfx::Align::left);
+            heading("LAST PLAYED", played_x, gfx::Align::left);
+            heading(updates ? "DOWNLOAD" : "SIZE", size_right, gfx::Align::right);
+        }
+        const std::string list_key = "manage-" + std::string(updates ? "updates" : moves ? "move" : "uninstall");
+        int focus_index = 0;
+        bool on_game = false;
+        for (std::size_t index = 0; index < games.size(); ++index)
+            if (games[index]->key == focused_key)
+            {
+                focus_index = static_cast<int>(index);
+                on_game = true;
+            }
+        // On the footer button the list keeps showing the game the focus left (Up goes back to it); from the
+        // toolbar it shows the top.
+        if (on_game)
+            manage_list_focus_[list_key] = focus_index;
+        else if (const auto left = manage_list_focus_.find(list_key);
+                 focused_key == "manage-primary" && left != manage_list_focus_.end() && !games.empty())
+            focus_index = std::min(left->second, static_cast<int>(games.size()) - 1);
+        constexpr float pitch = 84.0F, top = 366.0F, viewport = 872.0F - top;
+        const float content = games.size() * pitch + (notes.empty() ? 0.0F : 80.0F);
+        const float offset = list_scroll(list_key, focus_index * pitch, focus_index * pitch + 80.0F, viewport, content,
+                                         state.reduced_motion);
+        scene_.push_clip({0.0F, top - 8.0F, kWidth, viewport + 8.0F});
+        for (std::size_t index = 0; index < games.size(); ++index)
+        {
+            const float y = top + index * pitch - offset;
+            if (y + pitch < top - 8.0F || y > top + viewport)
+                continue;
+            const ViewRow &row = *games[index];
+            const gfx::Rect box{table_x, y, table_w, 80.0F};
+            const float amount = focus_of(row);
+            focus_glow(scene_, box, amount, true);
+            if (amount > 0.0F)
+            {
+                // The row covers the glow's middle, lifted a little.
+                scene_.rounded_rect(box, 10.0F, kBackground);
+                scene_.rounded_rect(box, 10.0F, kText.with_alpha(0.07F * amount));
+            }
+            if (!row.enabled)
+                scene_.push_opacity(0.5F);
+            const gfx::Rect tick{box.x + 24.0F, y + 25.0F, 30.0F, 30.0F};
+            if (row.selected)
+            {
+                scene_.rounded_rect(tick, 7.0F, tone);
+                scene_.line(tick.x + 7.0F, tick.y + 15.0F, tick.x + 12.0F, tick.y + 21.0F, 3.0F, kPanel);
+                scene_.line(tick.x + 12.0F, tick.y + 21.0F, tick.x + 23.0F, tick.y + 9.0F, 3.0F, kPanel);
+            }
+            else
+                scene_.bordered_rect(tick, 7.0F, kPanel.with_alpha(0.0F), 2.0F, kText.with_alpha(0.45F));
+            save_art(state, row.game_id, {box.x + 78.0F, y + 7.0F, 44.0F, 66.0F});
+            const ui::FontRef &face = font_for(row.title, fonts_.semibold);
+            ui::text(scene_, face, face.font->fit(row.title, 26.0F, played_x - name_x - 32.0F), name_x, y + 37.0F, 26.0F, kText);
+            const gfx::Color note = row.tone == "problem" ? kRed : row.tone == "update" ? kBlue : kSecondary;
+            ui::text(scene_, fonts_.regular, fit(fonts_.regular, row.subtitle, 19.0F, played_x - name_x - 32.0F), name_x, y + 64.0F,
+                     19.0F, note);
+            ui::text(scene_, fonts_.regular, row.badge, played_x, y + 49.0F, 22.0F, kSecondary);
+            ui::text(scene_, fonts_.regular, row.value, size_right, y + 49.0F, 24.0F, kText, gfx::Align::right);
+            if (!row.enabled)
+                scene_.pop_opacity();
+            focus_ring(scene_, box, amount, true);
+        }
+        // A running check's note under the games, or the empty tab's words.
+        for (const ViewRow *row : notes)
+        {
+            if (!games.empty() || row->key == "manage-more")
+            {
+                const float y = top + games.size() * pitch - offset;
+                ui::text(scene_, fonts_.regular, row->title, table_x + 78.0F, y + 46.0F, 21.0F, kSecondary);
+            }
+            else
+            {
+                ui::text(scene_, fonts_.display, row->title, kSafeX, 420.0F, 40.0F, kText);
+                if (!row->subtitle.empty())
+                    ui::text(scene_, fonts_.regular, row->subtitle, kSafeX, 462.0F, 23.0F, kSecondary);
+            }
+        }
+        scene_.pop_clip();
+
+        // The footer: the selection's summary, and the tab's one action.
+        scene_.rounded_rect({0.0F, 880.0F, kWidth, 1.0F}, 0.0F, kText.with_alpha(0.10F));
+        float summary_w = 1728.0F;
+        if (primary != nullptr)
+        {
+            const float width = fonts_.display.measure(primary->title, 27.0F) + 64.0F;
+            const gfx::Rect button{1824.0F - width, 896.0F, width, 60.0F};
+            summary_w -= width + 16.0F;
+            const float amount = focus_of(*primary);
+            focus_glow(scene_, button, amount);
+            scene_.rounded_rect(button, 8.0F, kBackground);
+            scene_.bordered_rect(button, 8.0F, kText.with_alpha(0.04F), 2.0F,
+                                 primary->enabled ? tone.with_alpha(updates ? 0.65F : moves ? 0.60F : 0.55F) : kText.with_alpha(0.12F));
+            ui::text(scene_, fonts_.display, primary->title, button.cx(), button.cy() + 10.0F, 27.0F,
+                     !primary->enabled ? kMuted : updates || moves ? kText : kRed, gfx::Align::center);
+            focus_ring(scene_, button, amount);
+        }
+        ui::text(scene_, fonts_.regular, fit(fonts_.regular, view.footer, 24.0F, summary_w), kSafeX, 935.0F, 24.0F, kSecondary);
+    }
+
     // One game's saves: Steam Cloud and this console side by side, and what can be done.
     void draw_save_details(const ViewData &view, const State &state)
     {
@@ -3284,12 +3523,8 @@ class Render::Impl
             draw_hint_row(scene_, hints, 96.0F);
             return;
         }
-        // The Installed games sheet shows its own hints; the bar behind it would only repeat them, dimmed.
-        if (view.surface != "installed-games")
-        {
-            std::string shoulder;
-            draw_hint_row(scene_, legend_hints(view, shoulder, true), 96.0F);
-        }
+        std::string shoulder;
+        draw_hint_row(scene_, legend_hints(view, shoulder, true), 96.0F);
         if (view.show_simulation_label)
         {
             scene_.rounded_rect({1652.0F, 989.0F, 172.0F, 34.0F}, 17.0F, kText.with_alpha(0.08F));
@@ -3320,7 +3555,7 @@ class Render::Impl
         if (view.surface != "home" && view.surface != "library" && view.surface != "downloads" &&
             view.surface != "settings" && view.surface != "details" && view.surface != "qr" &&
             view.surface != "startup" && view.surface != "session" && view.surface != "saves" &&
-            view.surface != "save-details")
+            view.surface != "save-details" && view.surface != "manage-games")
             draw_sheet_overlay(view);
 
         // Live notifications wait behind dialogs (they also stop counting down there).
@@ -3435,6 +3670,10 @@ class Render::Impl
                     label = "Uninstall";
                 else if (modal.title.find("download") != std::string::npos)
                     label = "Cancel download";
+                else if (modal.title == "Cancel the move?")
+                    label = "Cancel move";
+                else if (modal.title == "Update anyway?")
+                    label = "Update anyway";
                 else
                     label = "Confirm";
             }
@@ -3510,10 +3749,10 @@ class Render::Impl
     {
         static const std::map<std::string, std::string> names = {
             {"choice-picker", "Game settings"}, {"preset-picker", "Game settings"}, {"button-mapping", "Game settings"}, {"controller-tuning", "Game settings"},
-            {"game-settings", "Playden"}, {"game-maintenance", "Playden"}, {"kept-data", "Settings"}, {"leftover-titles", "Settings"}, {"installed-games", "Settings"},
+            {"game-settings", "Playden"}, {"game-maintenance", "Playden"}, {"kept-data", "Settings"}, {"leftover-titles", "Settings"},
             {"download-server", "Settings"},
             {"import-games", "Library"}, {"import-programs", "Import games"}, {"steam-programs", "Setup"}, {"import-choice", "Import games"},
-            {"import-storage", "Import games"},
+            {"import-storage", "Import games"}, {"move-storage", "Move game"},
             {"job-actions", "Downloads"}, {"prep-actions", "Preparation"}, {"storage-details", "Storage"}, {"context", "Game"}, {"compatibility", "Game"}, {"collections", "Game"}, {"collections-manage", "Library"},
             {"filters", "Library"}, {"logs-controls", "Logs"}, {"setting-value", "Settings"}, {"diagnostics", "Settings"},
             {"notices", "Notifications"}, {"qr-controls", "Sign in"}, {"session-controls", "Simulation"},
@@ -3559,9 +3798,9 @@ class Render::Impl
                           view.surface == "button-mapping" || view.surface == "controller-tuning" ||
                           view.surface == "game-maintenance" ||
                           view.surface == "controller" || view.surface == "logs" ||
-                          view.surface == "storage" || view.surface == "install" || view.surface == "update" || view.surface == "kept-data" || view.surface == "leftover-titles" ||
+                          view.surface == "storage" || view.surface == "move-storage" || view.surface == "install" || view.surface == "update" || view.surface == "kept-data" || view.surface == "leftover-titles" ||
                           view.surface == "download-server" ||
-                          view.surface == "installed-games" || view.surface == "import-games" ||
+                          view.surface == "import-games" ||
                           view.surface == "import-programs" || view.surface == "steam-programs";
         const float width = overlay_transition_.panel_width(wide ? 960.0F : 640.0F);
         const gfx::Rect panel{kWidth - width + (1.0F - ease) * width, 0.0F, width, kHeight};
@@ -3585,8 +3824,8 @@ class Render::Impl
                           panel.w - 96.0F, 32.0F, kSecondary, view.surface == "install" ? 6 : 3);
         if (view.surface == "storage")
             draw_storage_overlay_rows(view, {panel.x + 40.0F, 246.0F, panel.w - 80.0F, 710.0F});
-        else if (view.surface == "import-storage")
-            // The wizard's drive choice: the drive cards of the storage picker, under a one-line subtitle.
+        else if (view.surface == "import-storage" || view.surface == "move-storage")
+            // The wizard's drive choice, or a move's: the drive cards of the storage picker, under a one-line subtitle.
             draw_storage_overlay_rows(view, {panel.x + 40.0F, 262.0F + drop, panel.w - 80.0F, 694.0F - drop});
         else if (view.surface == "storage-details")
             draw_drive_details(view, panel);
@@ -3594,8 +3833,6 @@ class Render::Impl
             draw_log_overlay(view, {panel.x + 40.0F, 246.0F, panel.w - 80.0F, 710.0F});
         else if (view.surface == "controller")
             draw_controller_overlay(view, {panel.x + 40.0F, 236.0F, panel.w - 80.0F, 720.0F});
-        else if (view.surface == "installed-games")
-            draw_installed_games_sheet(view, panel);
         else
             draw_overlay_rows(view, {panel.x + 40.0F, (view.surface == "install" ? 414.0F : 292.0F) + drop,
                                      panel.w - 80.0F, (view.surface == "install" ? 528.0F : 650.0F) - drop});
@@ -3677,7 +3914,7 @@ class Render::Impl
             const gfx::Rect card{bounds.x, y, bounds.w, 156.0F};
             const float amount = control_focus("volume-" + row.key, row_index == view.focused_row);
             // The import wizard dims a drive that can't take the game, as its other rows dim.
-            const bool dimmed = view.surface == "import-storage" && !row.enabled;
+            const bool dimmed = (view.surface == "import-storage" || view.surface == "move-storage") && !row.enabled;
             if (dimmed)
                 overlay_.push_opacity(0.5F);
             focus_glow(overlay_, card, amount);
@@ -3688,7 +3925,7 @@ class Render::Impl
                      27.0F, row.enabled ? kText : kMuted);
             // The import wizard's rows say all of their state (its default drive included); a
             // disabled one is amber only for a problem with the drive (tone "warn").
-            const bool wizard = view.surface == "import-storage";
+            const bool wizard = view.surface == "import-storage" || view.surface == "move-storage";
             const bool is_default = !wizard && !current_state_->simulation_mode && volume.id == current_state_->default_volume_id;
             const bool warn = wizard ? row.tone == "warn" : !row.enabled;
             ui::text(overlay_, fonts_.regular, is_default && row.enabled ? "Default · " + row.subtitle : row.subtitle,
@@ -3955,77 +4192,6 @@ class Render::Impl
 
     // Installed games: Sort and Select all pinned on top, the games scrolling under them, and a
     // footer with the selection (or the batch) and Uninstall selected / Show all games / Close.
-    void draw_installed_games_sheet(const ViewData &view, const gfx::Rect &panel)
-    {
-        ViewData head = view, list = view;
-        head.rows.clear();
-        list.rows.clear();
-        head.focused_row = list.focused_row = -1;
-        std::vector<const ViewRow *> footer;
-        int footer_focus = -1;
-        for (int index = 0; index < static_cast<int>(view.rows.size()); ++index)
-        {
-            const ViewRow &row = view.rows[static_cast<std::size_t>(index)];
-            const bool focused = index == view.focused_row;
-            if (row.key == "installed-sort" || row.key == "installed-select-all")
-            {
-                if (focused) head.focused_row = static_cast<int>(head.rows.size());
-                head.rows.push_back(row);
-            }
-            else if (row.key.rfind("installed-toggle-", 0) == 0)
-            {
-                if (focused) list.focused_row = static_cast<int>(list.rows.size());
-                list.rows.push_back(row);
-            }
-            else
-            {
-                if (focused) footer_focus = static_cast<int>(footer.size());
-                footer.push_back(&row);
-            }
-        }
-        const float x = panel.x + 40.0F, w = panel.w - 80.0F;
-        const float head_h = head.rows.empty() ? 0.0F : head.rows.size() * 84.0F;
-        if (!head.rows.empty())
-            draw_overlay_rows(head, {x, 292.0F, w, head_h - 12.0F}, false);
-        // The list scrolls between the pinned rows and the footer and never draws under either.
-        // The footer's buttons sit above the sheet's hint row.
-        constexpr float footer_top = 870.0F;
-        const float list_top = 292.0F + head_h + (head.rows.empty() ? 0.0F : 12.0F);
-        const float clip_top = head.rows.empty() ? list_top - 32.0F : list_top - 10.0F;
-        overlay_.push_clip({panel.x, clip_top, panel.w, footer_top - 8.0F - clip_top});
-        draw_overlay_rows(list, {x, list_top, w, footer_top - 40.0F - list_top});
-        overlay_.pop_clip();
-        overlay_.rounded_rect({panel.x, footer_top - 8.0F, panel.w, 1.0F}, 0.0F, kText.with_alpha(0.10F));
-        // Buttons from the right edge, in order; the note fills the space left of them.
-        float right = x + w;
-        std::vector<gfx::Rect> buttons(footer.size());
-        for (int index = static_cast<int>(footer.size()) - 1; index >= 0; --index)
-        {
-            const float button_w = fonts_.display.measure(footer[static_cast<std::size_t>(index)]->title, 26.0F) + 56.0F;
-            buttons[static_cast<std::size_t>(index)] = {right - button_w, footer_top + 14.0F, button_w, 60.0F};
-            right -= button_w + 16.0F;
-        }
-        if (!view.footer.empty())
-            ui::text(overlay_, fonts_.regular, fit(fonts_.regular, view.footer, 23.0F, right - x - 16.0F), x + 8.0F,
-                     footer_top + 52.0F, 23.0F, kSecondary);
-        for (std::size_t index = 0; index < footer.size(); ++index)
-        {
-            const ViewRow &row = *footer[index];
-            const gfx::Rect &rect = buttons[index];
-            const float amount = control_focus("sheet-" + row.key, static_cast<int>(index) == footer_focus);
-            focus_glow(overlay_, rect, amount);
-            overlay_.rounded_rect(rect, 8.0F, kPanel);
-            overlay_.bordered_rect(rect, 8.0F, kText.with_alpha(0.04F), 2.0F,
-                                   (row.dangerous && row.enabled ? kRed : kText).with_alpha(row.enabled ? 0.35F : 0.12F));
-            ui::text(overlay_, fonts_.display, row.title, rect.cx(), rect.cy() + 10.0F, 26.0F,
-                     !row.enabled ? kMuted : row.dangerous ? kRed : kText, gfx::Align::center);
-            focus_ring(overlay_, rect, amount);
-        }
-        // L1/R1 do nothing here, so the row leaves them out.
-        std::string shoulder;
-        draw_hint_row(overlay_, legend_hints(view, shoulder, false), x + 8.0F);
-    }
-
     // `scrolls` false: rows pinned in place (a sheet's fixed header), leaving the list's scroll alone.
     void draw_overlay_rows(const ViewData &view, const gfx::Rect &bounds, bool scrolls = true)
     {
@@ -4065,9 +4231,9 @@ class Render::Impl
                 return 54.0F + 12.0F;
             if (row.kind == RowKind::Heading || row.kind == RowKind::Separator)
                 return 54.0F;
-            const bool checkbox = (view.surface == "kept-data" || view.surface == "leftover-titles" || view.surface == "installed-games" || (view.surface == "collections" && row.action.rfind("collection-toggle-", 0) == 0)) &&
+            const bool checkbox = (view.surface == "kept-data" || view.surface == "leftover-titles" || (view.surface == "collections" && row.action.rfind("collection-toggle-", 0) == 0)) &&
                                   row.kind == RowKind::Toggle;
-            const bool described = (settings_sheet || checkbox || view.surface == "installed-games" || import_sheet) && !row.subtitle.empty();
+            const bool described = (settings_sheet || checkbox || import_sheet) && !row.subtitle.empty();
             return (described ? 96.0F + hint_extra(row) : 72.0F) + 12.0F;
         };
         std::vector<float> tops;
@@ -4157,9 +4323,9 @@ class Render::Impl
             // Game settings rows carry an effect line under the name (or the reason a row is
             // disabled), an accent dot when the player changed the value, and a tag.
             // Kept game data: each game is a checkbox row with its kept date under the name.
-            const bool checkbox = (view.surface == "kept-data" || view.surface == "leftover-titles" || view.surface == "installed-games" || (view.surface == "collections" && row.action.rfind("collection-toggle-", 0) == 0)) &&
+            const bool checkbox = (view.surface == "kept-data" || view.surface == "leftover-titles" || (view.surface == "collections" && row.action.rfind("collection-toggle-", 0) == 0)) &&
                                   row.kind == RowKind::Toggle;
-            const bool described = (settings_sheet || checkbox || view.surface == "installed-games" || import_sheet) && !row.subtitle.empty() && row.kind != RowKind::Heading;
+            const bool described = (settings_sheet || checkbox || import_sheet) && !row.subtitle.empty() && row.kind != RowKind::Heading;
             const gfx::Rect rect{bounds.x, y, bounds.w, described ? 96.0F + hint_extra(row) : 72.0F};
             const float amount = control_focus("sheet-" + row.key, index == view.focused_row);
             focus_glow(overlay_, rect, amount);
@@ -4291,6 +4457,7 @@ class Render::Impl
     FocusMotion focus_motion_;
     Scroll home_scroll_;
     std::map<std::string, Scroll> list_scrolls_;  // Downloads, Saves and Settings lists
+    std::map<std::string, int> manage_list_focus_;  // each Manage tab's game row the focus was last on
     std::map<std::string, Scroll> home_rows_;
     float frame_dt_ = 1.0F / 60.0F;
     ui::TabBar tabs_;

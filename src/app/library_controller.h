@@ -31,6 +31,11 @@ class LibraryController {
   bool NeedsRenewal() const { return offline_ || needs_renewal_; }
   // A Steam load, refresh or clear is still running.
   bool Busy() const { return request_ != 0 || clearing_; }
+  // The model's account generation when Steam's library last came back from Steam itself (not the saved
+  // copy) with the account's licenses read; 0 before that. A load whose license read failed doesn't count.
+  std::uint64_t LicensesGeneration() const { return licenses_generation_; }
+  // Counts those refreshes.
+  std::uint64_t LicensesRead() const { return licenses_read_; }
  private:
   struct Other {
     stores::LibrarySource* source = nullptr;
@@ -46,6 +51,7 @@ class LibraryController {
   stores::LibrarySource& steam_;
   std::vector<Other> others_;
   std::uint64_t account_=0,generation_=0,request_=0;
+  std::uint64_t licenses_generation_=0,licenses_read_=0;
   bool offline_=false,clearing_=false;
   bool needs_renewal_=false;
   std::optional<steam::LibraryError> clear_result_;
