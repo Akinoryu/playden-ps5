@@ -1464,8 +1464,9 @@ std::vector<GameId> Simulation::manage_list(ManageTab tab) const {
     for (const auto& installation : state_.installations) {
         const auto id = installation.game_id;
         std::uint64_t bytes = installation.installed_bytes;
-        // Move: imported games have their own Copy/Move into Playden.
+        // Move: imported games have their own Copy/Move into Playden; Move from lists one drive's games.
         if (tab == ManageTab::Move && id.store == Store::kLocal) continue;
+        if (tab == ManageTab::Move && !manage_move_from_id_.empty() && installation.volume_id != manage_move_from_id_) continue;
         // Updates: installed Steam games whose update or new DLC Steam told of; their size is the download (an
         // unknown one sorts last).
         if (updates) {
@@ -1527,7 +1528,8 @@ const Volume* volume_of(const State& state, const std::string& id) {
 
 // Where a row of Manage installed games sits: 0 the toolbar, 1 the games, 2 the footer, -1 not a stop.
 int manage_part(const ViewRow& row) {
-    if (row.key == "manage-move-to" || row.key == "manage-select-all" || row.key == "manage-sort" || row.key == "manage-check")
+    if (row.key == "manage-move-from" || row.key == "manage-move-to" || row.key == "manage-select-all" || row.key == "manage-sort" ||
+        row.key == "manage-check")
         return 0;
     if (row.key.rfind("manage-toggle-", 0) == 0) return 1;
     if (row.key == "manage-primary") return 2;
@@ -1548,6 +1550,7 @@ void Simulation::open_manage_games(ManageTab tab) {
     manage_tabs_.clear();
     manage_message_.clear();
     manage_move_volume_id_.clear();
+    manage_move_from_id_.clear();
     manage_return_focus_ = state_.navigation.focus_key;
     manage_return_route_ = state_.navigation.route == Route::ManageGames ? manage_return_route_ : state_.navigation.route;
     state_.navigation.route = Route::ManageGames;
@@ -1747,17 +1750,47 @@ std::string Simulation::move_blocker(GameId id, const std::string& volume_id) co
 
 // The Move tab's drive when the screen opens, or when the chosen one goes: the usable drive with the most
 // free space (one whose free space is unknown comes last); ties go to the drives' order.
+// A Move from drive that has no games to move any more (or went) lists every drive again.
 void Simulation::choose_manage_move_volume() {
+    const auto from = move_from_volumes();
+    if (std::none_of(from.begin(), from.end(), [this](const Volume* volume) { return volume->id == manage_move_from_id_; }))
+        manage_move_from_id_.clear();
     const auto volumes = move_volumes();
-    if (std::any_of(volumes.begin(), volumes.end(), [this](const Volume* volume) { return volume->id == manage_move_volume_id_; }))
+    if (std::any_of(volumes.begin(), volumes.end(), [this](const Volume* volume) {
+            return volume->id == manage_move_volume_id_ && volume->id != manage_move_from_id_;
+        }))
         return;
     const Volume* best = nullptr;
     std::optional<std::uint64_t> most;
     for (const auto* volume : volumes) {
+        if (volume->id == manage_move_from_id_) continue;
         const auto free = volume_free(*volume);
         if (!best || (free && (!most || *free > *most))) { best = volume; most = free; }
     }
     manage_move_volume_id_ = best ? best->id : std::string();
+}
+
+std::vector<const Volume*> Simulation::move_from_volumes() const {
+    std::vector<const Volume*> volumes;
+    if (move_volumes().size() < 2) return volumes;
+    for (const auto& volume : state_.volumes)
+        if (volume.available && std::any_of(state_.installations.begin(), state_.installations.end(), [&](const Installation& installation) {
+                return installation.volume_id == volume.id && installation.game_id.store != Store::kLocal;
+            }))
+            volumes.push_back(&volume);
+    return volumes;
+}
+
+// All drives, then each drive with games; a destination the same as the drive picked goes to another one.
+void Simulation::cycle_manage_move_from() {
+    const auto volumes = move_from_volumes();
+    if (volumes.empty()) return;
+    const auto at = std::find_if(volumes.begin(), volumes.end(), [this](const Volume* volume) { return volume->id == manage_move_from_id_; });
+    if (manage_move_from_id_.empty()) manage_move_from_id_ = volumes.front()->id;
+    else if (at == volumes.end() || at + 1 == volumes.end()) manage_move_from_id_.clear();
+    else manage_move_from_id_ = (*(at + 1))->id;
+    choose_manage_move_volume();
+    refresh_manage_games();
 }
 
 // The old copy stays until the new one is checked, so the destination needs room for every checked game,
@@ -1828,6 +1861,7 @@ void Simulation::choose_move_volume(const std::string& volume_id) {
     const auto game = move_picker_game_;
     if (!game.valid()) {
         manage_move_volume_id_ = volume_id;
+        if (manage_move_from_id_ == volume_id) manage_move_from_id_.clear();
         close_modal();
         state_.navigation.focus_key = "manage-move-to";
         refresh_manage_games();
@@ -1968,7 +2002,11 @@ void Simulation::build_manage_games_view() {
         }
     const std::string select_title = choosable > 0 && chosen == choosable ? "Clear selection" : "Select all";
     if (moves) {
-        // Only the destination is chosen: each game moves from the drive it is on.
+        // Move from narrows the list to one drive's games; each game moves from the drive it is on.
+        auto& move_from = row("manage-move-from", RowKind::Action, "Move from", "manage-move-from");
+        const auto* source = volume_of(state_, manage_move_from_id_);
+        move_from.enabled = move_from_volumes().size() >= 2 || (source && !move_from_volumes().empty());
+        move_from.value = source ? source->label : "All drives";
         auto& move_to = row("manage-move-to", RowKind::Action, "Move to", "manage-move-to");
         move_to.enabled = move_volumes().size() >= 2;
         move_to.value = !move_to.enabled ? "No other drive" : destination ? destination->label : "No drive";
@@ -2031,6 +2069,9 @@ void Simulation::build_manage_games_view() {
             // Moving needs a second drive; the tab stays so L1/R1 always go round the same tabs.
             empty.title = "Only one drive";
             empty.subtitle = "Connect a USB drive or an M.2 SSD to move games between drives.";
+        } else if (moves && volume_of(state_, manage_move_from_id_)) {
+            empty.title = "Nothing to move";
+            empty.subtitle = "No games from Steam on " + volume_of(state_, manage_move_from_id_)->label + ".";
         } else if (moves) {
             empty.title = "Nothing to move";
             empty.subtitle = "Games installed from Steam can move here. Imported games use Copy or Move into Playden.";
@@ -8940,6 +8981,8 @@ void Simulation::activate() {
         queue_manage_moves();
     } else if (action_name == "manage-move-to") {
         if (move_volumes().size() >= 2) open_move_picker({});
+    } else if (action_name == "manage-move-from") {
+        cycle_manage_move_from();
     } else if (action_name == "confirm-destructive" && pending_destructive_action_ == "manage-update-anyway") {
         pending_destructive_action_.clear();
         close_modal();

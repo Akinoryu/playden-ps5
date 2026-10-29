@@ -1870,6 +1870,30 @@ void live_manage_move(const std::filesystem::path& base) {
     activate(model, "manage-move-to");
     activate(model, "volume-usb");
 
+    // Move from lists one drive's games: All drives, then each drive with games (not the read-only one without
+    // any), then All drives again. Picking the destination's drive sends the games to another one.
+    check(find_row(model, "manage-move-from")->value == "All drives" && find_row(model, "manage-move-from")->enabled,
+          "move: Move from starts on All drives");
+    activate(model, "manage-move-from");
+    check(find_row(model, "manage-move-from")->value == "Console storage" && find_row(model, "manage-move-to")->value == "USB Drive" &&
+              find_row(model, "manage-toggle-10") && !find_row(model, "manage-toggle-30"),
+          "move: Move from Console storage lists only its games");
+    activate(model, "manage-move-from");
+    check(find_row(model, "manage-move-from")->value == "USB Drive" && find_row(model, "manage-move-to")->value == "Console storage" &&
+              find_row(model, "manage-toggle-30") && find_row(model, "manage-toggle-30")->enabled && !find_row(model, "manage-toggle-10"),
+          "move: Move from the destination's drive moves the games to another drive");
+    activate(model, "manage-move-to");
+    activate(model, "volume-usb");
+    check(find_row(model, "manage-move-from")->value == "All drives" && find_row(model, "manage-toggle-10"),
+          "move: a destination the same as Move from lists every drive again");
+    activate(model, "manage-move-from");
+    activate(model, "manage-move-from");
+    activate(model, "manage-move-from");
+    check(find_row(model, "manage-move-from")->value == "All drives" && find_row(model, "manage-move-to")->value == "Console storage",
+          "move: Move from goes round to All drives, the destination as it was left");
+    activate(model, "manage-move-to");
+    activate(model, "volume-usb");
+
     // Not enough room: nothing is queued and the dialog names the drive.
     model.UpdateVolumes({{"internal", "Console storage", true, 800 * gb, 500 * gb},
                          {"usb", "USB Drive", true, 1000 * gb, 25 * gb},
