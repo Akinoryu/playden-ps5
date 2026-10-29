@@ -1441,13 +1441,26 @@ void InstallService::RunMove(GameId id, const std::string& from, const std::stri
     if (!job || job->view.step == step) return;
     job->view.step = step;
     job->view.step_since = std::chrono::steady_clock::now();
+    job->view.checked_files = job->view.check_files = 0;
     // From the switch on the title may name the copy: the move can't stop half way.
     if (step == InstallStep::kSwitching && !job->view.locked) job->view.locked = true;
     ++revision_;
   };
+  // A check of tens of thousands of files reports each one: the view changes once a percent, and at the end.
+  const auto checked = [this, id](std::uint64_t done, std::uint64_t total) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto* job = Find(id);
+    if (!job) return;
+    const auto percent = [](std::uint64_t value, std::uint64_t of) { return of == 0 ? 0 : value * 100 / of; };
+    const bool changed = total != job->view.check_files || done == total ||
+                         percent(done, total) != percent(job->view.checked_files, job->view.check_files);
+    job->view.checked_files = done;
+    job->view.check_files = total;
+    if (changed) ++revision_;
+  };
   InstallRunner::Result result;
   if (finishing) result.ok = true;
-  else result = mover->Copy(id, from, to, volume_id, active_cancel_, progress, step);
+  else result = mover->Copy(id, from, to, volume_id, active_cancel_, progress, step, checked);
 
   bool discard = false, finish = false;
   {

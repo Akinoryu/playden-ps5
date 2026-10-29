@@ -2132,6 +2132,8 @@ void Controller::TickInstalls() {
                        : job.step == steam::InstallStep::kSwitching ? Step::Switching
                        : job.step == steam::InstallStep::kDeletingOld ? Step::DeletingOld
                                                                       : Step::Copying;
+      live.checked_files = job.checked_files;
+      live.check_files = job.check_files;
     }
     jobs.push_back(std::move(live));
   }

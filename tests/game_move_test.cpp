@@ -199,7 +199,7 @@ struct Fixture {
   // what it said then.
   InstallRunner::Result CopyUntil(const std::atomic<bool>& cancel) {
     GameMover direct(options);
-    return direct.Copy(kGame, (internal / "730").string(), (usb / "730").string(), "usb0", cancel, {}, {});
+    return direct.Copy(kGame, (internal / "730").string(), (usb / "730").string(), "usb0", cancel, {}, {}, {});
   }
   void RegistryMoving() {
     Write(internal / ".playden-games", "730\tinternal\t" + std::to_string(game_bytes) + "\tmove=usb0\tfrom=internal\n");
@@ -450,6 +450,65 @@ void ResumesAfterEachStep() {
     f.CheckMoved();
     CHECK(f.files == 2);  // only the file list and the record, copied again
   }
+}
+
+// The checks count their files: every copied file before the switch, and again with the title stopped.
+void ChecksCountTheirFiles() {
+  Fixture f;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> counts;
+  std::vector<InstallStep> steps;
+  GameMover mover(f.options);
+  const std::atomic<bool> never{false};
+  const auto result = mover.Copy(kGame, (f.internal / "730").string(), (f.usb / "730").string(), "usb0", never, {},
+                                 [&](InstallStep step) { steps.push_back(step); },
+                                 [&](std::uint64_t done, std::uint64_t total) { counts.emplace_back(done, total); });
+  CHECK(result.ok);
+  CHECK((steps == std::vector<InstallStep>{InstallStep::kCopying, InstallStep::kVerifying, InstallStep::kSwitching}));
+  // Six game files, checked once while verifying and once more at the switch.
+  using Count = std::pair<std::uint64_t, std::uint64_t>;
+  CHECK(counts.size() == 12 && counts[0] == Count(1, 6) && counts[5] == Count(6, 6) && counts[11] == counts[5]);
+  CHECK(f.Logged("move rechecks game=730 files=6") && f.Logged("move rechecked game=730"));
+}
+
+// Stopped once the title followed the copy (Playden quit before the service knew): the move goes straight
+// back to the switch, without walking or checking the files again, and finishes.
+void ResumesAtTheSwitchWithoutCheckingAgain() {
+  Fixture f;
+  f.options.checkpoint = [](MoveCheckpoint reached) { return reached != MoveCheckpoint::kSwitched; };
+  const std::atomic<bool> never{false};
+  CHECK(f.CopyUntil(never).canceled);
+  CHECK(f.Relocations() == 1);
+  f.options.checkpoint = {};
+  // As RuntimeHost::Relocate for a title that already names the copy: nothing to move.
+  f.options.relocate = [&](const GameRelocation& relocation) {
+    std::lock_guard<std::mutex> lock(f.mutex);
+    f.relocated.push_back(relocation.to);
+    return GameRelocationResult{};
+  };
+  // A file the game would have rewritten meanwhile is the title's business now: the copy is what it plays.
+  Write(f.internal / "730/readme.txt", "changed!");
+  std::vector<InstallStep> steps;
+  std::size_t counted = 0;
+  GameMover mover(f.options);
+  f.files = 0;
+  const auto result = mover.Copy(kGame, (f.internal / "730").string(), (f.usb / "730").string(), "usb0", never, {},
+                                 [&](InstallStep step) { steps.push_back(step); },
+                                 [&](std::uint64_t, std::uint64_t) { ++counted; });
+  CHECK(result.ok && result.install_bytes == f.game_bytes);
+  // Only the copy is checked, by size: no file is copied.
+  CHECK((steps == std::vector<InstallStep>{InstallStep::kVerifying, InstallStep::kSwitching}) && counted == 6 && f.files == 0);
+  CHECK(f.Relocations() == 2 && f.Logged("move resumes at the switch game=730"));
+  CHECK(Read(f.usb / "730/readme.txt") == "read me");
+  // A copy that lost a file since goes the whole way again: the file comes back before the old folder may go.
+  fs::remove(f.usb / "730/data/level1.pak");
+  f.files = 0;
+  CHECK(mover.Copy(kGame, (f.internal / "730").string(), (f.usb / "730").string(), "usb0", never, {}, {}, {}).ok);
+  CHECK(f.Logged("move copy changed at the switch game=730 path=data/level1.pak"));
+  CHECK(fs::file_size(f.usb / "730/data/level1.pak") == 300000 && f.files >= 1);
+  // Without the copy's record the copy isn't whole: the move doesn't finish.
+  fs::remove(f.usb / "730" / kInstallRecordName);
+  const auto refused = mover.Copy(kGame, (f.internal / "730").string(), (f.usb / "730").string(), "usb0", never, {}, {}, {});
+  CHECK(!refused.ok && refused.failure.find("install record is missing") != std::string::npos);
 }
 
 void FinishesDeletingTheOldFolder() {
@@ -713,6 +772,8 @@ int main() {
   AFileRewrittenAtItsSizeIsCopiedAgain();
   AFileDeletedWhilePausedNeverComesBack();
   ResumesAfterEachStep();
+  ChecksCountTheirFiles();
+  ResumesAtTheSwitchWithoutCheckingAgain();
   FinishesDeletingTheOldFolder();
   OldFolderLeftAfterTheSwitchIsDeletedAtStart();
   TheOldFolderStaysUntilTheRegistryIsSaved();

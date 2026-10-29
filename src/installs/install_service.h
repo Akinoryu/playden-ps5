@@ -103,6 +103,10 @@ struct InstallJobView {
   std::string server_name;  // while running: where the download comes from, a display name (never a host)
   InstallStep step = InstallStep::kStarting;  // while running
   std::chrono::steady_clock::time_point step_since{};
+  // A move checking its copy (kVerifying, or kSwitching while the title's files are checked again): the files
+  // checked so far, of how many. 0 total: the step counts nothing.
+  std::uint64_t checked_files = 0;
+  std::uint64_t check_files = 0;
 };
 
 struct InstalledGame {
@@ -215,11 +219,13 @@ class MoveRunner {
   // has the game's PS5 title follow it. ok: the game plays from `to` (install_bytes from its record); the
   // folder at `from` is still there. Called again after any interruption, it carries on from what is
   // copied. Reports kCopying, kVerifying and kSwitching; a stop or failure before the title follows
-  // leaves the game playing from `from`. retry_later: the title runs or the runtime is busy.
+  // leaves the game playing from `from`. retry_later: the title runs or the runtime is busy. `checked` counts
+  // the files a check has gone through, of how many, from the start of each check.
   virtual InstallRunner::Result Copy(const GameId& id, const std::string& from, const std::string& to,
                                      const std::string& volume_id, const std::atomic<bool>& cancel,
                                      const std::function<void(std::uint64_t done, std::uint64_t total, std::uint64_t held)>& progress,
-                                     const std::function<void(InstallStep)>& step) = 0;
+                                     const std::function<void(InstallStep)>& step,
+                                     const std::function<void(std::uint64_t done, std::uint64_t total)>& checked) = 0;
   // Once the service lists the game at `to`: deletes the old folder at `from`, then the copy's journal.
   // Empty, or why not (a short sentence). Safe to run again.
   virtual std::string Finish(const std::string& from, const std::string& to) = 0;

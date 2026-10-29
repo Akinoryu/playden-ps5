@@ -2590,6 +2590,26 @@ void live_move_job_actions_say_move() {
     model.UpdateInstalls({job}, {{SteamId(42), 100, "usb", true}});
     activate(model, "job-42");
     check(!find_row(model, "job-pause-42") && !find_row(model, "job-cancel-42"), "move job: a switching move can't be stopped");
+    activate(model, "cancel");
+    // A check says how far it got; the switch says so while it checks the copy again, then switches.
+    const auto state_text = [&model] {
+        const auto found = std::find_if(model.state().jobs.begin(), model.state().jobs.end(),
+                                        [](const Job& entry) { return entry.game_id == SteamId(42); });
+        return found == model.state().jobs.end() ? std::string() : found->state_text;
+    };
+    job.move_step = LiveInstallJob::MoveStep::Verifying;
+    job.checked_files = 12'345;
+    job.check_files = 61'384;
+    model.UpdateInstalls({job}, {{SteamId(42), 100, "internal", true}});
+    check(state_text() == "Checking the copy · 12,345 of 61,384 files", "move job: the check counts its files");
+    job.move_step = LiveInstallJob::MoveStep::Switching;
+    job.checked_files = 900;
+    job.check_files = 1'000;
+    model.UpdateInstalls({job}, {{SteamId(42), 100, "internal", true}});
+    check(state_text() == "Checking the copy · 900 of 1,000 files", "move job: the switch's check counts too");
+    job.checked_files = 1'000;
+    model.UpdateInstalls({job}, {{SteamId(42), 100, "internal", true}});
+    check(state_text() == "Switching to the copy", "move job: then it switches");
 }
 
 void live_completed_downloads_follow_the_queue() {

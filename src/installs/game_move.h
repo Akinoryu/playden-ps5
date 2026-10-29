@@ -85,7 +85,8 @@ class GameMover final : public MoveRunner {
   InstallRunner::Result Copy(const GameId& id, const std::string& from, const std::string& to, const std::string& volume_id,
                              const std::atomic<bool>& cancel,
                              const std::function<void(std::uint64_t done, std::uint64_t total, std::uint64_t held)>& progress,
-                             const std::function<void(InstallStep)>& step) override;
+                             const std::function<void(InstallStep)>& step,
+                             const std::function<void(std::uint64_t done, std::uint64_t total)>& checked) override;
   std::string Finish(const std::string& from, const std::string& to) override;
   std::string Discard(const std::string& from, const std::string& to) override;
 

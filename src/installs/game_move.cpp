@@ -12,6 +12,7 @@
 #include <array>
 #include <tuple>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <dirent.h>
 #include <fcntl.h>
@@ -282,7 +283,9 @@ struct Comparison {
   std::vector<std::string> gone;       // planned files the source no longer has
   bool changed = false;                // `fresh` is not the plan saved
 };
-Comparison Compare(const CopyPlan& old, const CopyPlan& fresh, const std::string& to) {
+// `checked` hears each file of `fresh` compared (how many, of how many).
+Comparison Compare(const CopyPlan& old, const CopyPlan& fresh, const std::string& to,
+                   const std::function<void(std::uint64_t, std::uint64_t)>& checked = {}) {
   Comparison result;
   std::unordered_map<std::string, const CopyFile*> planned;
   for (const auto& file : old.files) planned.emplace(file.path, &file);
@@ -298,6 +301,7 @@ Comparison Compare(const CopyPlan& old, const CopyPlan& fresh, const std::string
       result.done[index] = 1;
       result.done_bytes += file.bytes;
     }
+    if (checked) checked(index + 1, fresh.files.size());
   }
   std::unordered_set<std::string> present;
   for (const auto& file : fresh.files) present.insert(file.path);
@@ -362,7 +366,8 @@ bool GameMover::Reached(MoveCheckpoint checkpoint) const {
 InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from, const std::string& to,
                                       const std::string& volume_id, const std::atomic<bool>& cancel,
                                       const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)>& progress,
-                                      const std::function<void(InstallStep)>& step) {
+                                      const std::function<void(InstallStep)>& step,
+                                      const std::function<void(std::uint64_t, std::uint64_t)>& checked) {
   InstallRunner::Result result;
   const auto key = ToKey(id);
   const auto fail = [&](const std::string& failure, const std::string& why) {
@@ -411,13 +416,39 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
       return fail("A folder on the destination is in the way of the move.", to + " has a record, plan source " + saved->source);
     return fail("The move's copy is of another folder. Cancel it, then move the game again.", "plan source " + saved->source);
   }
-  // The source as it is now: a resume keeps what is copied of files the game hasn't changed since.
-  auto build = stores::local::BuildCopyPlan(from);
-  if (!build.ok) return fail(build.failure, "plan errno=" + std::to_string(build.error));
-  build.plan.source = from;
-  CopyPlan plan = std::move(build.plan);
+  // Stopped at the switch (the copy was whole and checked when its marker was written): the title may already
+  // play from the copy, and if it doesn't, the switch checks the copy against the game again with the title
+  // stopped. Walking the game and comparing it first would only do that twice. The copy is still checked
+  // (every planned file at its size): one that lost files since goes the whole way again.
+  bool at_switch = switching && saved && saved->source == from;
+  if (at_switch) {
+    if (step) step(InstallStep::kVerifying);
+    for (std::size_t index = 0; index < saved->files.size(); ++index) {
+      const auto& file = saved->files[index];
+      const auto size = FileSize(to + "/" + file.path);
+      if (!size || *size != file.bytes) {
+        Log("move copy changed at the switch game=" + key + " path=" + file.path);
+        at_switch = false;
+        break;
+      }
+      if (checked) checked(index + 1, saved->files.size());
+    }
+  }
+  CopyPlan plan;
   Comparison state;
-  if (!saved) {
+  if (at_switch) {
+    plan = *saved;
+    state.done.assign(plan.files.size(), 1);
+    state.done_bytes = plan.total;
+    Log("move resumes at the switch game=" + key + " to=" + to);
+  } else {
+    // The source as it is now: a resume keeps what is copied of files the game hasn't changed since.
+    auto build = stores::local::BuildCopyPlan(from);
+    if (!build.ok) return fail(build.failure, "plan errno=" + std::to_string(build.error));
+    build.plan.source = from;
+    plan = std::move(build.plan);
+  }
+  if (!at_switch && !saved) {
     if (const auto refused = room_for(plan.total, Parent(to)); !refused.empty())
       return fail(refused, "space for " + std::to_string(plan.total) + " bytes");
     Destination made(from, to, options_.hold_effective_uid);
@@ -430,7 +461,7 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
     state.done.assign(plan.files.size(), 0);
     Log("move planned game=" + key + " from=" + from + " to=" + to + " files=" + std::to_string(plan.files.size()) +
         " bytes=" + std::to_string(plan.total));
-  } else {
+  } else if (!at_switch) {
     state = Compare(*saved, plan, to);
     if (state.changed) {
       Destination stale(from, to, options_.hold_effective_uid);
@@ -440,7 +471,7 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
     }
   }
   if (progress) progress(state.done_bytes, plan.total, state.done_bytes);
-  if (const auto refused = room_for(plan.total - state.done_bytes, to); !refused.empty())
+  if (const auto refused = at_switch ? std::string() : room_for(plan.total - state.done_bytes, to); !refused.empty())
     return fail(refused, "space for " + std::to_string(plan.total - state.done_bytes) + " bytes");
 
   Destination destination(from, to, options_.hold_effective_uid);
@@ -453,9 +484,9 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
       if (!destination.Folder(dir)) return false;
     return true;
   };
-  if (!prepare()) return fail("Could not write the game files.", "folders errno=" + std::to_string(errno));
+  if (!at_switch && !prepare()) return fail("Could not write the game files.", "folders errno=" + std::to_string(errno));
 
-  if (step) step(InstallStep::kCopying);
+  if (step && !at_switch) step(InstallStep::kCopying);
   std::vector<char> buffer(options_.buffer_bytes);
   SourceWalk walk(from);
   std::uint64_t copied = state.done_bytes;
@@ -509,10 +540,14 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
     }
   }
 
-  if (step) step(InstallStep::kVerifying);
-  for (const auto& file : plan.files) {
-    const auto size = FileSize(to + "/" + file.path);
-    if (!size || *size != file.bytes) return fail("Some copied files are missing. Resume to copy them again.", "verify " + file.path);
+  if (!at_switch) {
+    if (step) step(InstallStep::kVerifying);
+    for (std::size_t index = 0; index < plan.files.size(); ++index) {
+      const auto& file = plan.files[index];
+      const auto size = FileSize(to + "/" + file.path);
+      if (!size || *size != file.bytes) return fail("Some copied files are missing. Resume to copy them again.", "verify " + file.path);
+      if (checked) checked(index + 1, plan.files.size());
+    }
   }
   if (!Reached(MoveCheckpoint::kCopied)) {
     result.canceled = true;
@@ -545,13 +580,19 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
   // With the title stopped: files the game changed or added since they were copied are copied again,
   // files it deleted go from the copy, then the file list and the install record (last) follow.
   relocation.move_files = [&]() -> std::string {
+    const auto started = std::chrono::steady_clock::now();
+    const auto ms = [&] {
+      return std::to_string(
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+    };
     auto rebuilt = stores::local::BuildCopyPlan(from);
     if (!rebuilt.ok) {
       Log("move recheck failed game=" + key + " errno=" + std::to_string(rebuilt.error) + ": " + rebuilt.failure);
       return rebuilt.failure;
     }
     rebuilt.plan.source = from;
-    const auto now = Compare(plan, rebuilt.plan, to);
+    Log("move rechecks game=" + key + " files=" + std::to_string(rebuilt.plan.files.size()) + " walk_ms=" + ms());
+    const auto now = Compare(plan, rebuilt.plan, to, checked);
     if (now.changed) {
       if (!RemoveStale(destination, rebuilt.plan, now, to)) return "Could not write the game files. Check the drive, then Resume.";
       if (const auto written = save_plan(rebuilt.plan); !written.empty()) return written;
@@ -585,6 +626,7 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
     bool synced = SyncFolder(to);
     for (const auto& dir : plan.dirs) synced = SyncFolder(to + "/" + dir) && synced;
     if (!synced) return "The move could not be saved on the storage. Resume to try again.";
+    Log("move rechecked game=" + key + " ms=" + ms());
     return {};
   };
   GameRelocationResult relocated;
@@ -607,6 +649,9 @@ InstallRunner::Result GameMover::Copy(const GameId& id, const std::string& from,
     return fail(relocated.message.empty() ? "The game's PS5 title could not follow the move." : relocated.message,
                 "relocation " + relocated.message);
   }
+  // The copy's record goes last: without it the copy isn't whole, and the old folder must stay.
+  if (Missing(to + "/" + kInstallRecordName))
+    return fail("The game's install record is missing from the copy. Check the drive, then Resume.", "no record in the copy");
   Log("move switched game=" + key + " to=" + to + (relocated.message.empty() ? "" : " note=" + relocated.message));
   if (!Reached(MoveCheckpoint::kSwitched)) {
     result.canceled = true;

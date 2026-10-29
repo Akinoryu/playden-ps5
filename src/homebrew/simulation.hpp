@@ -125,6 +125,9 @@ struct LiveInstallJob {
     bool move = false;
     std::string from_volume_id;
     enum class MoveStep { Copying, Verifying, Switching, DeletingOld } move_step = MoveStep::Copying;
+    // While the move checks its copy: the files checked so far, of how many (0 of 0: no count).
+    std::uint64_t checked_files = 0;
+    std::uint64_t check_files = 0;
 };
 struct LiveInstalledGame {
     GameId game_id;

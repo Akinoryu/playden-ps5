@@ -177,6 +177,13 @@ AuthState parse_auth_state(const std::string& state) {
     return AuthState::SignedOut;
 }
 
+// "61,384": a count with its thousands grouped.
+std::string grouped_count(std::uint64_t count) {
+    auto digits = std::to_string(count);
+    for (auto at = digits.size(); at > 3; at -= 3) digits.insert(at - 3, ",");
+    return digits;
+}
+
 std::string format_bytes(std::uint64_t bytes) {
     if (bytes == 0) return {};
     char text[32];
@@ -2853,6 +2860,14 @@ void Simulation::UpdateInstalls(const std::vector<LiveInstallJob>& jobs, const s
                 case Step::Switching: job.state_text = "Switching to the copy"; break;
                 case Step::DeletingOld: job.state_text = "Deleting the old copy"; break;
                 }
+                // A check of a game with many files takes minutes: how far it got. The switch checks the copy
+                // again before the title follows it, and says so while it does.
+                const bool counting = live_job.check_files > 0 &&
+                                      (live_job.move_step == Step::Verifying ||
+                                       (live_job.move_step == Step::Switching && live_job.checked_files < live_job.check_files));
+                if (counting)
+                    job.state_text = "Checking the copy · " + grouped_count(live_job.checked_files) + " of " +
+                                     grouped_count(live_job.check_files) + " files";
             }
         }
         projected.push_back(std::move(job));
