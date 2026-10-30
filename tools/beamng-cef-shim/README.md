@@ -66,6 +66,8 @@ the Khronos validation layer and its synchronization checks).
 
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). Every
+10 seconds a `pace:` line counts the frames presented, how many took over 17, 34 and 100 ms, and how
+long each frame waited in acquire (for a free display buffer) and spent in present. Every
 half minute it also copies BeamNG's own log, `beamng.log` in the game's user folder inside the
 bottle (which FTP cannot read), to `libcef_shim_beamng.log` beside the DLL. `shim:save-frames` saves
 CEF frames 20, 100, 300 and 600 as `libcef_ui_frame_<n>.bmp`, and `shim:dump-after=N` lists every

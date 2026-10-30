@@ -60,6 +60,8 @@ __declspec(dllimport) BOOL WINAPI Module32FirstW(HANDLE, void*);
 __declspec(dllimport) BOOL WINAPI Module32NextW(HANDLE, void*);
 __declspec(dllimport) void* WINAPI VirtualAlloc(void*, size_t, DWORD, DWORD);
 __declspec(dllimport) DWORD WINAPI GetEnvironmentVariableW(const WCHAR*, WCHAR*, DWORD);
+__declspec(dllimport) BOOL WINAPI QueryPerformanceCounter(int64_t*);
+__declspec(dllimport) BOOL WINAPI QueryPerformanceFrequency(int64_t*);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -858,7 +860,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 19)\n");
+    Log("libcef-shim: loaded (build 20)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);

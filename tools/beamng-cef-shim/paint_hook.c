@@ -101,6 +101,7 @@ static void SaveFrame(long number, const void* pixels, int width, int height) {
 
 static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count, const void* dirty, const void* buffer,
                         int width, int height) {
+  int64_t start = PaceNow();
   long count = __sync_add_and_fetch(&g_paints, 1);
   int visible = 0, opaque = 0;
   if (buffer && width > 0 && height > 0) SampleFrame(buffer, width, height, &visible, &opaque);
@@ -114,6 +115,8 @@ static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count,
     VkLog("cef paint: of 144 samples, coloured, opaque", (uint64_t)visible, (uint64_t)opaque, 0);
   }
   g_game_on_paint(self, browser, type, dirty_count, dirty, buffer, width, height);
+  g_pace.paint += PaceNow() - start;
+  ++g_pace.paints;
 }
 
 static void OnAcceleratedPaintHook(void* self, void* browser, int type, size_t dirty_count, const void* dirty,

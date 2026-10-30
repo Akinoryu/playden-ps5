@@ -286,6 +286,85 @@ static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapcha
 }
 
 static volatile long g_vk_calls;
+
+// Frame pacing, one line every 10 s from the present path: how many frames, how long they took from
+// present to present, how many missed a 60 Hz refresh (over 17 ms) or a 30 Hz one (over 34 ms) or
+// hitched (over 100 ms), and of each frame how long the game waited in vkAcquireNextImageKHR (for a
+// display buffer to free up: the GPU and the refresh) and spent in vkQueuePresentKHR (with the
+// overlay's copy), and how long CEF's paints took on the game's main thread (paint_hook.c).
+static struct {
+  int64_t frequency, last, window;
+  long frames, over17, over34, over100, paints;
+  int64_t longest, acquire, present, paint;
+} g_pace;
+
+static int64_t PaceNow(void) {
+  int64_t now = 0;
+  QueryPerformanceCounter(&now);
+  return now;
+}
+
+// Appends text, or ticks as milliseconds with one decimal, or a count.
+static void PaceText(char* line, size_t* n, const char* text) {
+  while (*text && *n < 300) line[(*n)++] = *text++;
+}
+static void PaceCount(char* line, size_t* n, uint64_t value) {
+  char digits[24];
+  int d = 0;
+  do digits[d++] = (char)('0' + value % 10), value /= 10; while (value && d < 24);
+  while (d && *n < 300) line[(*n)++] = digits[--d];
+}
+static void PaceMs(char* line, size_t* n, int64_t ticks) {
+  uint64_t tenths = ticks > 0 ? (uint64_t)ticks * 10000 / (uint64_t)g_pace.frequency : 0;
+  PaceCount(line, n, tenths / 10);
+  PaceText(line, n, ".");
+  PaceCount(line, n, tenths % 10);
+}
+
+static void PaceFrame(int64_t now) {
+  if (!g_pace.frequency) {
+    QueryPerformanceFrequency(&g_pace.frequency);
+    g_pace.last = g_pace.window = now;
+    return;
+  }
+  int64_t interval = now - g_pace.last, ms = g_pace.frequency / 1000;
+  g_pace.last = now;
+  ++g_pace.frames;
+  g_pace.over17 += interval > 17 * ms + ms / 2;
+  g_pace.over34 += interval > 34 * ms;
+  g_pace.over100 += interval > 100 * ms;
+  if (interval > g_pace.longest) g_pace.longest = interval;
+  if (now - g_pace.window < 10 * g_pace.frequency || !g_pace.frames) return;
+  char line[320];
+  size_t n = 0;
+  long frames = g_pace.frames, paints = g_pace.paints;
+  PaceText(line, &n, "libcef-shim: pace: ");
+  PaceCount(line, &n, (uint64_t)frames);
+  PaceText(line, &n, " frames, ");
+  PaceMs(line, &n, (now - g_pace.window) / frames);
+  PaceText(line, &n, " ms each; ");
+  PaceCount(line, &n, (uint64_t)g_pace.over17);
+  PaceText(line, &n, " over 17 ms, ");
+  PaceCount(line, &n, (uint64_t)g_pace.over34);
+  PaceText(line, &n, " over 34, ");
+  PaceCount(line, &n, (uint64_t)g_pace.over100);
+  PaceText(line, &n, " over 100, longest ");
+  PaceMs(line, &n, g_pace.longest);
+  PaceText(line, &n, " ms; per frame ");
+  PaceMs(line, &n, g_pace.acquire / frames);
+  PaceText(line, &n, " ms in acquire, ");
+  PaceMs(line, &n, g_pace.present / frames);
+  PaceText(line, &n, " ms in present; ");
+  PaceCount(line, &n, (uint64_t)paints);
+  PaceText(line, &n, " UI paints, ");
+  PaceMs(line, &n, paints ? g_pace.paint / paints : 0);
+  PaceText(line, &n, " ms each\n");
+  line[n] = 0;
+  Log(line);
+  g_pace.window = now;
+  g_pace.frames = g_pace.over17 = g_pace.over34 = g_pace.over100 = g_pace.paints = 0;
+  g_pace.longest = g_pace.acquire = g_pace.present = g_pace.paint = 0;
+}
 static volatile long g_paints, g_accelerated_paints, g_blank_paints;  // paint_hook.c
 
 // Wine answers VK_SUBOPTIMAL_KHR for a swapchain whose size is not its window's, and an enlarged
@@ -318,7 +397,9 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       uint32_t* index;
       int32_t result;
     }* p = args;
+    int64_t start = PaceNow();
     long status = Acquire(handle, code, args, p->swapchain, &p->timeout, &p->result);
+    g_pace.acquire += PaceNow() - start;
     if (!status) HideSuboptimal(p->swapchain, &p->result);
     if (!status) NoteAcquire(p->swapchain, p->index ? *p->index : 0, p->result);
     return status;
@@ -335,7 +416,9 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       uint32_t* index;
       int32_t result;
     }* p = args;
+    int64_t start = PaceNow();
     long status = Acquire(handle, code, args, p->info->swapchain, &p->info->timeout, &p->result);
+    g_pace.acquire += PaceNow() - start;
     if (!status) HideSuboptimal(p->info->swapchain, &p->result);
     if (!status) NoteAcquire(p->info->swapchain, p->index ? *p->index : 0, p->result);
     return status;
@@ -347,10 +430,14 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       int32_t result;
     }* p = args;
     const present_info_t* game_info = p->info;
+    int64_t start = PaceNow();
     const present_info_t* overlay_info = OverlayPresent((void*)(uintptr_t)p->queue, p->info);
     if (overlay_info) p->info = overlay_info;
     long status = RealFor(handle)(handle, code, args);
     p->info = game_info;
+    int64_t end = PaceNow();
+    g_pace.present += end - start;
+    PaceFrame(end);
     g_present_handle = handle;
     if (!status && p->info && p->info->swapchain_count == 1) {
       if (p->info->results) HideSuboptimal(p->info->swapchains[0], &p->info->results[0]);
