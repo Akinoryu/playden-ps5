@@ -15,7 +15,8 @@ mkdir -p "$out"
 
 printf 'LIBRARY kernel32.dll\nEXPORTS\n' >"$out/kernel32.def"
 for f in LoadLibraryW GetProcAddress GetModuleFileNameW GetStdHandle WriteFile ReadFile CreateFileW \
-    CloseHandle VirtualProtect; do
+    CloseHandle VirtualProtect VirtualQuery AddVectoredExceptionHandler GetModuleHandleExW GetCurrentThreadId \
+    RtlLookupFunctionEntry RtlVirtualUnwind; do
   printf '  %s\n' "$f" >>"$out/kernel32.def"
 done
 llvm-dlltool -m i386:x86-64 -d "$out/kernel32.def" -l "$out/kernel32.lib"

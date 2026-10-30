@@ -39,6 +39,12 @@ __declspec(dllimport) BOOL WINAPI ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
 __declspec(dllimport) HANDLE WINAPI CreateFileW(const WCHAR*, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
 __declspec(dllimport) BOOL WINAPI CloseHandle(HANDLE);
 __declspec(dllimport) BOOL WINAPI VirtualProtect(void*, size_t, DWORD, DWORD*);
+__declspec(dllimport) size_t WINAPI VirtualQuery(const void*, void*, size_t);
+__declspec(dllimport) void* WINAPI AddVectoredExceptionHandler(DWORD, void*);
+__declspec(dllimport) BOOL WINAPI GetModuleHandleExW(DWORD, const void*, HMODULE*);
+__declspec(dllimport) DWORD WINAPI GetCurrentThreadId(void);
+__declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
+__declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
 // CEF C API, Windows: cef_string_t is UTF-16. Only the parts used here.
 typedef struct {
@@ -89,6 +95,7 @@ static const char* const kDefaultSwitches[] = {"single-process", "in-process-gpu
 
 static HMODULE g_real;
 static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line_t*);
+static BOOL g_no_hook;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -128,6 +135,80 @@ static void LogNumber(const char* prefix, uintptr_t value) {
   Log(line);
 }
 
+// "prefix module+0xoffset" for a code address, or "prefix 0xaddress" outside any module.
+static void LogAddress(const char* prefix, uint64_t address) {
+  HMODULE module = NULL;
+  WCHAR path[260];
+  if (address && GetModuleHandleExW(6 /* FROM_ADDRESS | UNCHANGED_REFCOUNT */, (const void*)address, &module) &&
+      module) {
+    DWORD n = GetModuleFileNameW(module, path, 260);
+    DWORD start = n;
+    while (start && path[start - 1] != '\\' && path[start - 1] != '/') --start;
+    char line[160];
+    size_t k = 0, p = Length(prefix);
+    for (size_t i = 0; i < p && k < 60; ++i) line[k++] = prefix[i];
+    for (DWORD i = start; i < n && k < 120; ++i) line[k++] = path[i] < 0x80 ? (char)path[i] : '?';
+    line[k++] = '+';
+    line[k] = 0;
+    LogNumber(line, address - (uint64_t)(uintptr_t)module);
+  } else {
+    LogNumber(prefix, address);
+  }
+}
+
+// x64 CONTEXT and EXCEPTION_RECORD, by offset: no Windows headers here.
+#define CONTEXT_RSP 0x98
+#define CONTEXT_RIP 0xf8
+typedef struct {
+  DWORD code;
+  DWORD flags;
+  void* next;
+  void* address;
+  DWORD parameter_count;
+  uint64_t parameters[15];
+} exception_record_t;
+typedef struct {
+  exception_record_t* record;
+  unsigned char* context;
+} exception_pointers_t;
+
+static long g_reported;
+
+static BOOL Interesting(DWORD code) {
+  return code == 0xc0000409 || code == 0xc0000005 || code == 0xc000001d || code == 0x80000003 ||
+         code == 0xc0000374 || code == 0xc0000096 || code == 0xc00000fd || code == 0xe06d7363;
+}
+
+// Logs crashes and C++ exceptions with a call stack, then lets them continue as before.
+static long WINAPI ExceptionLogger(exception_pointers_t* info) {
+  exception_record_t* record = info->record;
+  if (!Interesting(record->code) || g_reported >= 12) return 0;
+  ++g_reported;
+  LogNumber("libcef-shim: exception code ", record->code);
+  LogNumber("libcef-shim:   thread ", GetCurrentThreadId());
+  LogNumber("libcef-shim:   flags ", record->flags);
+  LogAddress("libcef-shim:   at ", (uint64_t)(uintptr_t)record->address);
+  for (DWORD i = 0; i < record->parameter_count && i < 4; ++i) LogNumber("libcef-shim:   parameter ", record->parameters[i]);
+  static _Alignas(16) unsigned char context[1232];
+  for (size_t i = 0; i < sizeof(context); ++i) context[i] = info->context[i];
+  for (int frame = 0; frame < 32; ++frame) {
+    uint64_t* rip = (uint64_t*)(context + CONTEXT_RIP);
+    uint64_t* rsp = (uint64_t*)(context + CONTEXT_RSP);
+    if (!*rip) break;
+    LogAddress("libcef-shim:   frame ", *rip);
+    uint64_t base = 0, establisher = 0;
+    void* handler_data = NULL;
+    void* entry = RtlLookupFunctionEntry(*rip, &base, NULL);
+    if (entry) {
+      RtlVirtualUnwind(0, base, *rip, entry, context, &handler_data, &establisher, NULL);
+    } else {
+      *rip = *(uint64_t*)(uintptr_t)*rsp;
+      *rsp += 8;
+    }
+  }
+  return 0;  // EXCEPTION_CONTINUE_SEARCH
+}
+
 // Directory of this DLL, with a trailing backslash, into dir. Returns its length.
 static DWORD ModuleDirectory(WCHAR* dir, DWORD capacity) {
   extern char __ImageBase;
@@ -151,6 +232,12 @@ static void LoadConfig(void) {
     g_config[g_config_size] = 0;
     g_have_config = 1;
     Log("libcef-shim: switches from libcef_shim.txt\n");
+    for (const char* p = g_config; *p; ++p) {
+      static const char option[] = "shim:nohook";
+      size_t i = 0;
+      while (option[i] && p[i] == option[i]) ++i;
+      if (!option[i]) g_no_hook = 1;
+    }
   }
   CloseHandle(file);
 }
@@ -190,6 +277,10 @@ static void AppendConfigured(cef_command_line_t* command_line) {
     const char* s = p;
     const char* e = line_end;
     while (s < e && IsSpace(*s)) ++s;
+    if (e - s >= 11 && s[0] == 's' && s[1] == 'h' && s[2] == 'i' && s[3] == 'm' && s[4] == ':') {
+      p = line_end + 1;  // shim:... options were read by LoadConfig
+      continue;
+    }
     while (s < e && (*s == '-')) ++s;  // "--single-process" and "single-process" both work
     for (const char* h = s; h < e; ++h)
       if (*h == '#') e = h;
@@ -208,7 +299,9 @@ static void AppendConfigured(cef_command_line_t* command_line) {
 
 static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_string_t* process_type,
                                                 cef_command_line_t* command_line) {
+  Log("libcef-shim: CEF asked for the command line; calling BeamNG's handler first\n");
   if (g_original_hook) g_original_hook(self, process_type, command_line);
+  Log("libcef-shim: BeamNG's handler returned\n");
   if (process_type && process_type->length) {
     LogWide("libcef-shim: leaving a helper process alone: ", process_type->str, process_type->length);
     return;
@@ -254,16 +347,28 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
     Log("libcef-shim: the game passed no CefApp, using the shim's\n");
   }
   LogNumber("libcef-shim: CefApp struct size ", app->base.size);
-  g_original_hook = app->on_before_command_line_processing;
-  DWORD old_protect;
-  void* slot = &app->on_before_command_line_processing;
-  if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect)) {
-    app->on_before_command_line_processing = HookedOnBeforeCommandLineProcessing;
-    VirtualProtect(slot, sizeof(void*), old_protect, &old_protect);
-    Log("libcef-shim: hooked OnBeforeCommandLineProcessing\n");
+  LogAddress("libcef-shim: BeamNG's handler ", (uint64_t)(uintptr_t)app->on_before_command_line_processing);
+  LogAddress("libcef-shim: CefApp struct ", (uint64_t)(uintptr_t)app);
+  if (g_no_hook) {
+    Log("libcef-shim: shim:nohook set, passing cef_initialize through unchanged\n");
   } else {
-    Log("libcef-shim: could not hook OnBeforeCommandLineProcessing\n");
+    g_original_hook = app->on_before_command_line_processing;
+    // The struct is normally heap memory; only change protection if it is not writable.
+    struct { void* base; void* allocation; DWORD allocation_protect; size_t size; DWORD state, protect, type; } region;
+    DWORD old_protect = 0;
+    void* slot = &app->on_before_command_line_processing;
+    BOOL writable = VirtualQuery(slot, &region, sizeof(region)) &&
+                    (region.protect & 0xcc /* READWRITE | WRITECOPY | EXECUTE_READWRITE | EXECUTE_WRITECOPY */);
+    LogNumber("libcef-shim: CefApp memory protection ", region.protect);
+    if (writable || VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect)) {
+      app->on_before_command_line_processing = HookedOnBeforeCommandLineProcessing;
+      if (!writable) VirtualProtect(slot, sizeof(void*), old_protect, &old_protect);
+      Log("libcef-shim: hooked OnBeforeCommandLineProcessing\n");
+    } else {
+      Log("libcef-shim: could not hook OnBeforeCommandLineProcessing\n");
+    }
   }
+  Log("libcef-shim: calling the real cef_initialize\n");
   int result = real(args, settings, app, sandbox_info);
   LogNumber("libcef-shim: cef_initialize returned ", (uintptr_t)result);
   return result;
@@ -272,6 +377,9 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
   (void)reserved;
-  if (reason == DLL_PROCESS_ATTACH) Log("libcef-shim: loaded\n");
+  if (reason == DLL_PROCESS_ATTACH) {
+    Log("libcef-shim: loaded (diagnostics build 2)\n");
+    AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
+  }
   return 1;
 }
