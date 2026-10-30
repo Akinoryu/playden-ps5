@@ -9409,11 +9409,10 @@ void Simulation::activate() {
         const auto slash = setup_program_choice_.find_last_of('/');
         const auto name = slash == std::string::npos ? setup_program_choice_ : setup_program_choice_.substr(slash + 1);
         ModalEntry confirm{"confirmation", "Run " + name + " once?", state_.navigation.focus_key, {"cancel", "run-once-start"}, 1, false};
-        confirm.body = "Playden starts " + setup_program_choice_ + " instead of the game, one time. It runs until you close it.\n\n"
-                       "Controls use the Mouse preset for this run: the left stick moves the pointer, Cross clicks, Circle "
-                       "right-clicks and Options presses Enter.\n\n"
-                       "If the program has its own Play button, it may not start the game on the PS5. Change your settings in "
-                       "it, close it, then press Play in Playden. Play and Game settings stay as they are.";
+        // The dialog shows about five lines.
+        confirm.body = setup_program_choice_ + " starts instead of the game, once, with the Mouse preset: the left stick "
+                       "moves the pointer and Cross clicks.\n\n"
+                       "Its own Play button can't start the game here. Change the settings, close it, then press Play.";
         open_modal(std::move(confirm));
     } else if (live() && action_name == "run-once-start") {
         const auto id = state_.navigation.selected_game_id;
