@@ -121,6 +121,19 @@ static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
 
+// The compiler may call these for struct copies; there is no C runtime.
+void* memcpy(void* to, const void* from, size_t count) {
+  unsigned char* d = to;
+  const unsigned char* f = from;
+  while (count--) *d++ = *f++;
+  return to;
+}
+void* memset(void* to, int value, size_t count) {
+  unsigned char* d = to;
+  while (count--) *d++ = (unsigned char)value;
+  return to;
+}
+
 static size_t Length(const char* s) {
   size_t n = 0;
   while (s[n]) ++n;
@@ -665,7 +678,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 9)\n");
+    Log("libcef-shim: loaded (build 10)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

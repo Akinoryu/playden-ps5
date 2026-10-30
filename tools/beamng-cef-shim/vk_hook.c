@@ -44,6 +44,10 @@ typedef struct {
   const uint64_t* handle_cell;
   int32_t (*present)(uint64_t queue, const void* info);
   unix_call_fn real;
+  unix_call_fn* slot;
+  unsigned char* sites[16];
+  unsigned char site_bytes[16][6];
+  int site_count;
 } vk_module_t;
 
 static vk_module_t g_vk_modules[4];
@@ -232,7 +236,7 @@ static volatile long g_vk_calls;
 
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
   long calls = __sync_add_and_fetch(&g_vk_calls, 1);
-  if (calls == 1 || calls == 1000 || calls == 100000) VkLog("calls seen so far, latest code", calls, code, 0);
+  if (calls <= 40) VkLog("call: number, code, caller", calls, code, (uint64_t)(uintptr_t)__builtin_return_address(0));
   if (code == g_code_acquire) {
     struct {
       uint64_t device, swapchain, timeout, semaphore, fence;
@@ -376,6 +380,8 @@ static void HookModule(HMODULE module) {
   // Each thunk calls through the slot: point its call straight at VkDispatcher ("call rel32"),
   // and the present thunk's helper too, whose calls through the slot are a call and a jump.
   int patched = 0;
+  vk_module_t record = {module, handle_cell, (int32_t (*)(uint64_t, const void*))GetProcAddress(module, names[4]),
+                        real == VkDispatcher ? g_real_dispatcher : real, slot, {0}, {{0}}, 0};
   for (int i = 0; i < 5; ++i) {
     unsigned char* thunk = GetProcAddress(module, names[i]);
     unsigned char* sites[4];
@@ -418,6 +424,11 @@ static void HookModule(HMODULE module) {
       VirtualProtect(site, 6, old_protect, &old_protect);
       FlushInstructionCache((HANDLE)(intptr_t)-1, site, 6);
       ++patched;
+      if (record.site_count < 16) {
+        record.sites[record.site_count] = site;
+        for (int b = 0; b < 6; ++b) record.site_bytes[record.site_count][b] = bytes[b];
+        ++record.site_count;
+      }
     }
   }
 
@@ -428,10 +439,7 @@ static void HookModule(HMODULE module) {
     VirtualProtect(slot, sizeof(*slot), old_protect, &old_protect);
   }
   VkLog("call sites patched, slot now", patched, (uint64_t)(uintptr_t)*(void* volatile*)slot, 0);
-  if (g_vk_module_count < 4)
-    g_vk_modules[g_vk_module_count++] =
-        (vk_module_t){module, handle_cell, (int32_t (*)(uint64_t, const void*))GetProcAddress(module, names[4]),
-                      real == VkDispatcher ? g_real_dispatcher : real};
+  if (g_vk_module_count < 4) g_vk_modules[g_vk_module_count++] = record;
   if (!g_queue_present) g_queue_present = g_vk_modules[0].present;
 }
 
@@ -443,11 +451,51 @@ static BOOL SameNameNoCase(const WCHAR* a, const char* b) {
   return !*a && !*b;
 }
 
-// Watches for winevulkan.dll for three minutes and hooks every copy that loads.
+// Puts a patch back if something restored the original bytes, and says so.
+static void VerifyPatches(void) {
+  for (int m = 0; m < g_vk_module_count; ++m) {
+    vk_module_t* record = &g_vk_modules[m];
+    if (*(void* volatile*)record->slot != (void*)VkDispatcher) {
+      VkLog("dispatcher slot was restored, setting it again", (uint64_t)(uintptr_t)record->slot,
+            (uint64_t)(uintptr_t)*(void* volatile*)record->slot, 0);
+      DWORD old_protect;
+      if (VirtualProtect(record->slot, 8, PAGE_READWRITE, &old_protect)) {
+        *record->slot = VkDispatcher;
+        VirtualProtect(record->slot, 8, old_protect, &old_protect);
+      }
+    }
+    for (int k = 0; k < record->site_count; ++k) {
+      unsigned char* site = record->sites[k];
+      BOOL same = 1;
+      for (int b = 0; b < 6; ++b) same &= ((volatile unsigned char*)site)[b] == record->site_bytes[k][b];
+      if (same) continue;
+      VkLog("call site was restored, patching it again: site, bytes", (uint64_t)(uintptr_t)site,
+            *(volatile uint64_t*)site, 0);
+      DWORD old_protect;
+      if (VirtualProtect(site, 6, 0x40, &old_protect)) {
+        *(volatile uint16_t*)site = 0xfeeb;
+        __sync_synchronize();
+        for (int b = 2; b < 6; ++b) site[b] = record->site_bytes[k][b];
+        __sync_synchronize();
+        *(volatile uint16_t*)site = (uint16_t)(record->site_bytes[k][0] | record->site_bytes[k][1] << 8);
+        VirtualProtect(site, 6, old_protect, &old_protect);
+        FlushInstructionCache((HANDLE)(intptr_t)-1, site, 6);
+      }
+    }
+  }
+}
+
+// Watches for winevulkan.dll and hooks every copy that loads; keeps checking the patches.
 static DWORD WINAPI HookVulkanLater(void* unused) {
   (void)unused;
   static unsigned char entry[1080];  // MODULEENTRY32W
-  for (int round = 0; round < 1800; ++round) {
+  for (int round = 0;; ++round) {
+    if (g_vk_module_count) VerifyPatches();
+    if (round % 100 == 0 && g_vk_module_count) VkLog("calls through the shim so far", g_vk_calls, 0, 0);
+    if (round >= 1800) {  // after three minutes only the checks go on
+      Sleep(100);
+      continue;
+    }
     HANDLE snapshot = CreateToolhelp32Snapshot(8 /* TH32CS_SNAPMODULE */, 0);
     if (snapshot != INVALID_HANDLE_VALUE) {
       *(DWORD*)entry = sizeof(entry);
