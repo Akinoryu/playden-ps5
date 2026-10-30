@@ -56,6 +56,9 @@ __declspec(dllimport) BOOL WINAPI GetThreadContext(HANDLE, void*);
 __declspec(dllimport) HMODULE WINAPI GetModuleHandleW(const WCHAR*);
 __declspec(dllimport) uint64_t WINAPI GetTickCount64(void);
 __declspec(dllimport) BOOL WINAPI FlushInstructionCache(HANDLE, const void*, size_t);
+__declspec(dllimport) BOOL WINAPI Module32FirstW(HANDLE, void*);
+__declspec(dllimport) BOOL WINAPI Module32NextW(HANDLE, void*);
+__declspec(dllimport) void* WINAPI VirtualAlloc(void*, size_t, DWORD, DWORD);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -112,6 +115,7 @@ static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line
 static BOOL g_no_hook;
 static BOOL g_keep_settings;
 static BOOL g_keep_profiler;
+static BOOL g_no_commit;
 static BOOL g_vk_fix;
 static char g_config[4096];
 static DWORD g_config_size;
@@ -202,8 +206,25 @@ static BOOL Interesting(DWORD code) {
 }
 
 // Logs crashes and C++ exceptions with a call stack, then lets them continue as before.
+static long g_committed;
+
 static long WINAPI ExceptionLogger(exception_pointers_t* info) {
   exception_record_t* record = info->record;
+  // A read of a page that is reserved but not committed, such as a stack page below what its
+  // thread has used (Chromium reading another thread's stack hit one at 0x1000114000): commit
+  // that host page and let the read run again, rather than end the game.
+  if (record->code == 0xc0000005 && record->parameter_count >= 2 && record->parameters[0] == 0 &&
+      g_committed < 64 && !g_no_commit) {
+    struct { void* base; void* allocation; DWORD allocation_protect; size_t size; DWORD state, protect, type; } region;
+    void* page = (void*)(uintptr_t)(record->parameters[1] & ~(uint64_t)0x3fff);
+    if (VirtualQuery(page, &region, sizeof(region)) && region.state == 0x2000 /* MEM_RESERVE */ &&
+        region.type == 0x20000 /* MEM_PRIVATE */ && VirtualAlloc(page, 0x4000, 0x1000 /* MEM_COMMIT */, PAGE_READWRITE)) {
+      ++g_committed;
+      LogAddress("libcef-shim: committed a reserved page read by ", (uint64_t)(uintptr_t)record->address);
+      LogNumber("libcef-shim:   page ", (uint64_t)(uintptr_t)page);
+      return -1;  // EXCEPTION_CONTINUE_EXECUTION
+    }
+  }
   if (!Interesting(record->code) || g_reported >= 12) return 0;
   ++g_reported;
   LogNumber("libcef-shim: exception code ", record->code);
@@ -377,6 +398,10 @@ static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char no_commit[] = "shim:no-commit";
+      i = 0;
+      while (no_commit[i] && p[i] == no_commit[i]) ++i;
+      if (!no_commit[i]) g_no_commit = 1;
       static const char keep_profiler[] = "shim:keep-profiler";
       i = 0;
       while (keep_profiler[i] && p[i] == keep_profiler[i]) ++i;
@@ -640,7 +665,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 8)\n");
+    Log("libcef-shim: loaded (build 9)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

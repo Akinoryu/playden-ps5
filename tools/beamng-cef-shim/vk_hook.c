@@ -36,6 +36,25 @@ static volatile long g_vk_lock;
 static long g_vk_logged;
 static BOOL g_vk_fix = 1;
 static int32_t (*g_queue_present)(uint64_t queue, const void* info);
+static uint64_t g_present_handle;
+
+// One loaded winevulkan.dll: its unixlib handle cell and its vkQueuePresentKHR.
+typedef struct {
+  HMODULE module;
+  const uint64_t* handle_cell;
+  int32_t (*present)(uint64_t queue, const void* info);
+  unix_call_fn real;
+} vk_module_t;
+
+static vk_module_t g_vk_modules[4];
+static int g_vk_module_count;
+
+// The dispatcher of the copy whose unixlib handle a call carries.
+static unix_call_fn RealFor(uint64_t handle) {
+  for (int i = 0; i < g_vk_module_count; ++i)
+    if (g_vk_modules[i].handle_cell && *g_vk_modules[i].handle_cell == handle) return g_vk_modules[i].real;
+  return g_real_dispatcher;
+}
 
 static void VkLock(void) {
   while (__sync_lock_test_and_set(&g_vk_lock, 1)) Sleep(0);
@@ -110,12 +129,16 @@ static BOOL ReleaseRetiredImages(void) {
       }
   }
   uint64_t queue = g_last_queue;
+  int32_t (*present)(uint64_t, const void*) = g_queue_present;
+  for (int i = 0; i < g_vk_module_count; ++i)
+    if (g_vk_modules[i].handle_cell && *g_vk_modules[i].handle_cell == g_present_handle)
+      present = g_vk_modules[i].present;
   VkUnlock();
-  if (!count || !queue || !g_queue_present) return 0;
+  if (!count || !queue || !present) return 0;
   for (uint32_t i = 0; i < count; ++i) {
     present_info_t info = {1000001001 /* VK_STRUCTURE_TYPE_PRESENT_INFO_KHR */, NULL, 0, NULL, 1, &chains[i],
                            &indices[i], NULL};
-    int32_t result = g_queue_present(queue, &info);
+    int32_t result = present(queue, &info);
     VkLog("released stuck image: chain, index, result", chains[i], indices[i], (uint32_t)result);
     VkLock();
     chain_t* chain = FindChain(chains[i]);
@@ -190,7 +213,7 @@ static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapcha
   uint64_t waited = 0;
   for (;;) {
     *timeout = asked < step ? asked : step;
-    long status = g_real_dispatcher(handle, code, args);
+    long status = RealFor(handle)(handle, code, args);
     *timeout = asked;
     if (status) return status;
     if (*result != 2 /* VK_TIMEOUT */) {
@@ -205,6 +228,7 @@ static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapcha
 }
 
 static volatile long g_vk_calls;
+
 
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
   long calls = __sync_add_and_fetch(&g_vk_calls, 1);
@@ -241,7 +265,8 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       const present_info_t* info;
       int32_t result;
     }* p = args;
-    long status = g_real_dispatcher(handle, code, args);
+    long status = RealFor(handle)(handle, code, args);
+    g_present_handle = handle;
     NotePresent(p->queue, p->info, status ? -1 : p->result);
     return status;
   }
@@ -253,7 +278,7 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       uint64_t* swapchain;
       int32_t result;
     }* p = args;
-    long status = g_real_dispatcher(handle, code, args);
+    long status = RealFor(handle)(handle, code, args);
     uint32_t width = *(const uint32_t*)(p->info + 44), height = *(const uint32_t*)(p->info + 48);
     uint64_t old = *(const uint64_t*)(p->info + 96);
     VkLock();
@@ -288,9 +313,9 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
     }
     if (g_current_chain == p->swapchain) g_current_chain = 0;
     VkUnlock();
-    return g_real_dispatcher(handle, code, args);
+    return RealFor(handle)(handle, code, args);
   }
-  return g_real_dispatcher(handle, code, args);
+  return RealFor(handle)(handle, code, args);
 }
 
 // The Unix call code a winevulkan thunk passes ("mov edx, imm32", or "mov ecx,
@@ -312,40 +337,41 @@ static BOOL DecodeThunk(const unsigned char* code, BOOL queue_call, unsigned* ca
   return 0;
 }
 
-static DWORD WINAPI HookVulkanLater(void* unused) {
-  (void)unused;
-  static const WCHAR name[] = {'w', 'i', 'n', 'e', 'v', 'u', 'l', 'k', 'a', 'n', '.', 'd', 'l', 'l', 0};
-  HMODULE module = NULL;
-  for (int i = 0; i < 6000 && !module; ++i) {  // up to two minutes
-    module = GetModuleHandleW(name);
-    if (!module) Sleep(20);
-  }
-  if (!module) {
-    Log("libcef-shim: vk: winevulkan.dll never loaded\n");
-    return 0;
-  }
+// Points one winevulkan.dll's swapchain calls at VkDispatcher. Every copy of the DLL a game
+// loads has its own code and its own dispatcher pointer.
+static void HookModule(HMODULE module) {
   const char* names[] = {"vkAcquireNextImageKHR", "vkAcquireNextImage2KHR", "vkCreateSwapchainKHR",
                          "vkDestroySwapchainKHR", "vkQueuePresentKHR"};
-  unsigned* codes[] = {&g_code_acquire, &g_code_acquire2, &g_code_create, &g_code_destroy, &g_code_present};
   // The codes of the winevulkan in Playden's kit 0.15; another build is left alone.
   static const unsigned expected[] = {0x4, 0x3, 0x191, 0x1c8, 0x2ab};
+  unsigned codes[5];
   unix_call_fn* slot = NULL;
   for (int i = 0; i < 5; ++i) {
     const unsigned char* thunk = GetProcAddress(module, names[i]);
     unix_call_fn* this_slot = slot;
-    if (!thunk || !DecodeThunk(thunk, i == 4, codes[i], &this_slot) || (slot && this_slot != slot) ||
-        *codes[i] != expected[i]) {
-      Log("libcef-shim: vk: winevulkan.dll is not the expected build, swapchain watch off\n");
-      return 0;
+    if (!thunk || !DecodeThunk(thunk, i == 4, &codes[i], &this_slot) || (slot && this_slot != slot) ||
+        codes[i] != expected[i]) {
+      VkLog("a winevulkan.dll is not the expected build, left alone", (uint64_t)(uintptr_t)module, 0, 0);
+      return;
     }
     slot = this_slot;
-    VkLog(names[i], *codes[i], 0, 0);
   }
-  g_queue_present = (int32_t (*)(uint64_t, const void*))GetProcAddress(module, "vkQueuePresentKHR");
-  g_real_dispatcher = *slot;
-  g_dispatcher_slot = slot;
-  VkLog("module, slot, dispatcher", (uint64_t)(uintptr_t)module, (uint64_t)(uintptr_t)slot,
-        (uint64_t)(uintptr_t)g_real_dispatcher);
+  g_code_acquire = codes[0], g_code_acquire2 = codes[1], g_code_create = codes[2], g_code_destroy = codes[3];
+  g_code_present = codes[4];
+
+  // The unixlib handle: "mov rcx, [rip + rel32]" in the acquire thunk.
+  const uint64_t* handle_cell = NULL;
+  const unsigned char* acquire = GetProcAddress(module, names[0]);
+  for (int k = 0; k < 0x50; ++k)
+    if (acquire[k] == 0x48 && acquire[k + 1] == 0x8b && acquire[k + 2] == 0x0d) {
+      handle_cell = (const uint64_t*)(acquire + k + 7 + *(const int32_t*)(acquire + k + 3));
+      break;
+    }
+  unix_call_fn real = *slot;
+  if (g_real_dispatcher && real != g_real_dispatcher && real != VkDispatcher)
+    VkLog("this copy's dispatcher differs", (uint64_t)(uintptr_t)module, (uint64_t)(uintptr_t)real, 0);
+  if (!g_real_dispatcher && real != VkDispatcher) g_real_dispatcher = real;
+  VkLog("module, slot, dispatcher", (uint64_t)(uintptr_t)module, (uint64_t)(uintptr_t)slot, (uint64_t)(uintptr_t)real);
 
   // Each thunk calls through the slot: point its call straight at VkDispatcher ("call rel32"),
   // and the present thunk's helper too, whose calls through the slot are a call and a jump.
@@ -394,7 +420,6 @@ static DWORD WINAPI HookVulkanLater(void* unused) {
       ++patched;
     }
   }
-  VkLog("call sites patched", patched, 0, 0);
 
   DWORD old_protect;
   if (VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protect)) {
@@ -402,7 +427,50 @@ static DWORD WINAPI HookVulkanLater(void* unused) {
     *slot = VkDispatcher;
     VirtualProtect(slot, sizeof(*slot), old_protect, &old_protect);
   }
-  VkLog("slot now, shim dispatcher", (uint64_t)(uintptr_t)*(void* volatile*)slot, (uint64_t)(uintptr_t)VkDispatcher, 0);
-  Log(g_vk_fix ? "libcef-shim: vk: swapchain watch on, with the fix\n" : "libcef-shim: vk: swapchain watch on, log only\n");
+  VkLog("call sites patched, slot now", patched, (uint64_t)(uintptr_t)*(void* volatile*)slot, 0);
+  if (g_vk_module_count < 4)
+    g_vk_modules[g_vk_module_count++] =
+        (vk_module_t){module, handle_cell, (int32_t (*)(uint64_t, const void*))GetProcAddress(module, names[4]),
+                      real == VkDispatcher ? g_real_dispatcher : real};
+  if (!g_queue_present) g_queue_present = g_vk_modules[0].present;
+}
+
+static BOOL SameNameNoCase(const WCHAR* a, const char* b) {
+  for (; *a && *b; ++a, ++b) {
+    WCHAR x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a;
+    if (x != (unsigned char)*b) return 0;
+  }
+  return !*a && !*b;
+}
+
+// Watches for winevulkan.dll for three minutes and hooks every copy that loads.
+static DWORD WINAPI HookVulkanLater(void* unused) {
+  (void)unused;
+  static unsigned char entry[1080];  // MODULEENTRY32W
+  for (int round = 0; round < 1800; ++round) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(8 /* TH32CS_SNAPMODULE */, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+      *(DWORD*)entry = sizeof(entry);
+      for (BOOL more = Module32FirstW(snapshot, entry); more; *(DWORD*)entry = sizeof(entry),
+                more = Module32NextW(snapshot, entry)) {
+        HMODULE module = *(HMODULE*)(entry + 40);
+        if (!SameNameNoCase((const WCHAR*)(entry + 48), "winevulkan.dll")) continue;
+        BOOL known = 0;
+        for (int i = 0; i < g_vk_module_count; ++i) known |= g_vk_modules[i].module == module;
+        if (known || g_vk_module_count >= 4) continue;
+        VkLog("found a winevulkan.dll, after milliseconds", (uint64_t)(uintptr_t)module, (uint64_t)round * 100, 0);
+        const WCHAR* path = (const WCHAR*)(entry + 560);
+        size_t length = 0;
+        while (length < 259 && path[length]) ++length;
+        LogWide("libcef-shim: vk   path ", path, length);
+        HookModule(module);
+        if (g_vk_module_count == 1)
+          Log(g_vk_fix ? "libcef-shim: vk: swapchain watch on, with the fix\n"
+                       : "libcef-shim: vk: swapchain watch on, log only\n");
+      }
+      CloseHandle(snapshot);
+    }
+    Sleep(100);
+  }
   return 0;
 }
