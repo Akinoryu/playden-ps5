@@ -137,6 +137,7 @@ static BOOL g_no_shared_texture;
 static BOOL g_keep_begin_frame;
 static BOOL g_no_overlay;
 static BOOL g_save_frames;
+static BOOL g_no_sample;  // shim:no-sample: no sampling of the thread that presents (sampler.c)
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -514,6 +515,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
       if (!keep[i]) g_keep_settings = 1;
+      static const char no_sample[] = "shim:no-sample";
+      i = 0;
+      while (no_sample[i] && p[i] == no_sample[i]) ++i;
+      if (!no_sample[i]) g_no_sample = 1;
     }
   }
   CloseHandle(file);
@@ -623,19 +628,9 @@ static void Append(cef_command_line_t* command_line, const char* name, size_t na
 
 static BOOL IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r'; }
 
-static void AppendConfigured(cef_command_line_t* command_line) {
-  if (!g_have_config) {
-    for (int i = 0; kDefaultSwitches[i]; ++i) {
-      const char* name = kDefaultSwitches[i];
-      size_t length = Length(name), equals = 0;
-      while (equals < length && name[equals] != '=') ++equals;
-      if (equals < length)
-        Append(command_line, name, equals, name + equals + 1, length - equals - 1);
-      else
-        Append(command_line, name, length, NULL, 0);
-    }
-    return;
-  }
+// The switches libcef_shim.txt lists: appended to command_line, or only counted when it is NULL.
+static int ConfiguredSwitches(cef_command_line_t* command_line) {
+  int count = 0;
   const char* p = g_config;
   const char* end = g_config + g_config_size;
   while (p < end) {
@@ -655,12 +650,33 @@ static void AppendConfigured(cef_command_line_t* command_line) {
     if (e > s) {
       const char* equals = s;
       while (equals < e && *equals != '=') ++equals;
-      if (equals < e)
+      ++count;
+      if (command_line && equals < e)
         Append(command_line, s, (size_t)(equals - s), equals + 1, (size_t)(e - equals - 1));
-      else
+      else if (command_line)
         Append(command_line, s, (size_t)(e - s), NULL, 0);
     }
     p = line_end + 1;
+  }
+  return count;
+}
+
+// libcef_shim.txt's switches, or the default ones when it lists none: a file with only shim:
+// options keeps the defaults, the memory caps among them.
+static void AppendConfigured(cef_command_line_t* command_line) {
+  if (g_have_config && ConfiguredSwitches(NULL)) {
+    ConfiguredSwitches(command_line);
+    return;
+  }
+  if (g_have_config) Log("libcef-shim: libcef_shim.txt lists no switches, using the default ones\n");
+  for (int i = 0; kDefaultSwitches[i]; ++i) {
+    const char* name = kDefaultSwitches[i];
+    size_t length = Length(name), equals = 0;
+    while (equals < length && name[equals] != '=') ++equals;
+    if (equals < length)
+      Append(command_line, name, equals, name + equals + 1, length - equals - 1);
+    else
+      Append(command_line, name, length, NULL, 0);
   }
 }
 
@@ -848,6 +864,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 #include "vk_hook.c"
 #include "overlay.c"
 #include "paint_hook.c"
+#include "sampler.c"
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
@@ -860,10 +877,11 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 20)\n");
+    Log("libcef-shim: loaded (build 21)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
+    if (!g_no_sample) CreateThread(NULL, 0, (void*)SampleLater, NULL, 0, NULL);
   }
   return 1;
 }

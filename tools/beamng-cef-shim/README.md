@@ -32,7 +32,8 @@ In `/data/playden-games/284160/Bin64/`:
 1. Rename `libcef.dll` to `libcef_real.dll`.
 2. Upload the built `libcef.dll`.
 3. Optional: upload `libcef_shim.txt` with one switch per line (`name` or `name=value`, `#` comments)
-   to replace the default switches.
+   to replace the default switches. Lines starting with `shim:` are options for the shim itself; a
+   file with only those keeps the default switches.
 
 With Playden's kit 0.15 the shim also watches the game's Vulkan swapchains through winevulkan's
 Unix call dispatcher. On the PS5, swapchains of one size share their display buffers, and BeamNG
@@ -67,12 +68,23 @@ the Khronos validation layer and its synchronization checks).
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). Every
 10 seconds a `pace:` line counts the frames presented, how many took over 17, 34 and 100 ms, and how
-long each frame waited in acquire (for a free display buffer) and spent in present. Every
-half minute it also copies BeamNG's own log, `beamng.log` in the game's user folder inside the
-bottle (which FTP cannot read), to `libcef_shim_beamng.log` beside the DLL. `shim:save-frames` saves
-CEF frames 20, 100, 300 and 600 as `libcef_ui_frame_<n>.bmp`, and `shim:dump-after=N` lists every
-thread's stack N seconds after CEF starts, twice; both hold up the game while they run, so they are
-off unless asked for.
+long each frame waited in acquire (for a free display buffer) and spent in present. A second `pace:`
+line splits the rest of the frame on the thread that presents: waiting for the GPU (fences,
+semaphores, idle queues), submitting, polling fences, the other Vulkan calls (recording, mostly),
+and what is left, the game's own work; it also counts the Vulkan calls of other threads.
+
+For 30 seconds of every minute, ten times a second, the shim also stops that thread for a moment
+and notes where it is (`sampler.c`): after each 30 seconds a `sample:` line lists the modules (and
+for Windows' and Wine's, the function) it was found in most, with the Vulkan call when it was in
+one, and a second line the game modules that called into Windows, Wine and Vulkan. Each stop holds
+the thread for a fraction of a millisecond (the line says how long), so the pace lines of the other
+30 seconds are the ones without it. `shim:no-sample` turns it off.
+
+Every half minute the shim also copies BeamNG's own log, `beamng.log` in the game's user folder
+inside the bottle (which FTP cannot read), to `libcef_shim_beamng.log` beside the DLL.
+`shim:save-frames` saves CEF frames 20, 100, 300 and 600 as `libcef_ui_frame_<n>.bmp`, and
+`shim:dump-after=N` lists every thread's stack N seconds after CEF starts, twice; both hold up the
+game while they run, so they are off unless asked for.
 
 To undo, delete the shim and rename `libcef_real.dll` back. A Steam update or file check puts the
 original back.

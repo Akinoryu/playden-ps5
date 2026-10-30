@@ -306,13 +306,13 @@ static int64_t PaceNow(void) {
 
 // Appends text, or ticks as milliseconds with one decimal, or a count.
 static void PaceText(char* line, size_t* n, const char* text) {
-  while (*text && *n < 300) line[(*n)++] = *text++;
+  while (*text && *n < 380) line[(*n)++] = *text++;
 }
 static void PaceCount(char* line, size_t* n, uint64_t value) {
   char digits[24];
   int d = 0;
   do digits[d++] = (char)('0' + value % 10), value /= 10; while (value && d < 24);
-  while (d && *n < 300) line[(*n)++] = digits[--d];
+  while (d && *n < 380) line[(*n)++] = digits[--d];
 }
 static void PaceMs(char* line, size_t* n, int64_t ticks) {
   uint64_t tenths = ticks > 0 ? (uint64_t)ticks * 10000 / (uint64_t)g_pace.frequency : 0;
@@ -321,10 +321,71 @@ static void PaceMs(char* line, size_t* n, int64_t ticks) {
   PaceCount(line, n, tenths % 10);
 }
 
+// The calls of the thread that presents, by kind, for a second pace line: waits for the GPU
+// (fences, semaphores, idle queues and devices), queue submits, polls of fences and timeline
+// semaphores, and every other call (recording, mostly). Timed with rdtsc, a few nanoseconds where
+// QueryPerformanceCounter may cross to the host, and turned into time with each window's ratio of
+// the two. Acquires and presents, and the overlay's calls inside a present, are the present
+// branch's to time (kVkOwn). Only that thread writes these, so they need no lock.
+enum { kVkOther, kVkWait, kVkSubmit, kVkPoll, kVkOwn, kVkKinds, kVkCodes = 1024 };
+static unsigned char g_call_kind[kVkCodes];
+static struct {
+  volatile DWORD thread;  // the thread that presents
+  int nested;             // in the present branch
+  uint64_t ticks[kVkKinds];
+  long calls[kVkKinds];
+  uint64_t tsc;           // at the start of the window
+  long all_calls;         // g_vk_calls then
+  volatile long total;    // its calls; g_vk_calls counts the other threads' once a thread presents
+} g_vkt;
+
+static uint64_t Tsc(void) { return __builtin_ia32_rdtsc(); }
+
+// The second pace line: per frame, the time and number of calls of each kind, the rest of the
+// frame (the game's own work, CEF's paints included when they run on this thread) and the calls
+// other threads made.
+static void PaceCalls(int64_t now, long frames) {
+  uint64_t tsc = Tsc(), elapsed = tsc - g_vkt.tsc;
+  int64_t window = now - g_pace.window;
+  long all_calls = g_vk_calls;
+  // TSC ticks per QueryPerformanceCounter tick, times 16.
+  uint64_t scale = window > 0 && (int64_t)elapsed > 0 ? elapsed * 16 / (uint64_t)window : 0;
+  if (scale) {
+    int64_t spent[kVkKinds], vulkan = 0;
+    for (int k = 0; k < kVkKinds; ++k) vulkan += spent[k] = (int64_t)(g_vkt.ticks[k] * 16 / scale);
+    int64_t rest = window - g_pace.acquire - g_pace.present - vulkan;
+    static const char* const label[] = {" ms in other Vulkan calls (", " ms waiting for the GPU (", " ms submitting (",
+                                        " ms polling ("};
+    static const int order[] = {kVkWait, kVkSubmit, kVkPoll, kVkOther};
+    char line[400];
+    size_t n = 0;
+    PaceText(line, &n, "libcef-shim: pace: per frame ");
+    for (int i = 0; i < 4; ++i) {
+      PaceMs(line, &n, spent[order[i]] / frames);
+      PaceText(line, &n, label[order[i]]);
+      PaceCount(line, &n, (uint64_t)((g_vkt.calls[order[i]] + frames / 2) / frames));
+      PaceText(line, &n, i < 3 ? " calls), " : " calls); ");
+    }
+    PaceMs(line, &n, rest > 0 ? rest / frames : 0);
+    PaceText(line, &n, " ms the game's own; ");
+    long others = all_calls - g_vkt.all_calls;
+    PaceCount(line, &n, (uint64_t)(others > 0 ? (others + frames / 2) / frames : 0));
+    PaceText(line, &n, " Vulkan calls on other threads\n");
+    line[n] = 0;
+    Log(line);
+  }
+  for (int k = 0; k < kVkKinds; ++k) g_vkt.ticks[k] = 0, g_vkt.calls[k] = 0;
+  g_vkt.tsc = tsc;
+  g_vkt.all_calls = all_calls;
+}
+
 static void PaceFrame(int64_t now) {
   if (!g_pace.frequency) {
     QueryPerformanceFrequency(&g_pace.frequency);
     g_pace.last = g_pace.window = now;
+    for (int k = 0; k < kVkKinds; ++k) g_vkt.ticks[k] = 0, g_vkt.calls[k] = 0;
+    g_vkt.tsc = Tsc();
+    g_vkt.all_calls = g_vk_calls;
     return;
   }
   int64_t interval = now - g_pace.last, ms = g_pace.frequency / 1000;
@@ -335,7 +396,7 @@ static void PaceFrame(int64_t now) {
   g_pace.over100 += interval > 100 * ms;
   if (interval > g_pace.longest) g_pace.longest = interval;
   if (now - g_pace.window < 10 * g_pace.frequency || !g_pace.frames) return;
-  char line[320];
+  char line[400];
   size_t n = 0;
   long frames = g_pace.frames, paints = g_pace.paints;
   PaceText(line, &n, "libcef-shim: pace: ");
@@ -361,6 +422,7 @@ static void PaceFrame(int64_t now) {
   PaceText(line, &n, " ms each\n");
   line[n] = 0;
   Log(line);
+  PaceCalls(now, frames);
   g_pace.window = now;
   g_pace.frames = g_pace.over17 = g_pace.over34 = g_pace.over100 = g_pace.paints = 0;
   g_pace.longest = g_pace.acquire = g_pace.present = g_pace.paint = 0;
@@ -388,9 +450,7 @@ static void HideSuboptimal(uint64_t swapchain, int32_t* result) {
     VkLog("Wine's suboptimal answers for the enlarged swapchain hidden from the game", swapchain, 0, 0);
 }
 
-static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
-  long calls = __sync_add_and_fetch(&g_vk_calls, 1);
-  if (calls <= 40) VkLog("call: number, code, caller", calls, code, (uint64_t)(uintptr_t)__builtin_return_address(0));
+static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
   if (code == g_code_acquire) {
     struct {
       uint64_t device, swapchain, timeout, semaphore, fence;
@@ -430,12 +490,15 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       int32_t result;
     }* p = args;
     const present_info_t* game_info = p->info;
+    g_vkt.thread = GetCurrentThreadId();
+    g_vkt.nested = 1;
     int64_t start = PaceNow();
     const present_info_t* overlay_info = OverlayPresent((void*)(uintptr_t)p->queue, p->info);
     if (overlay_info) p->info = overlay_info;
     long status = RealFor(handle)(handle, code, args);
     p->info = game_info;
     int64_t end = PaceNow();
+    g_vkt.nested = 0;
     g_pace.present += end - start;
     PaceFrame(end);
     g_present_handle = handle;
@@ -606,6 +669,25 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
   return RealFor(handle)(handle, code, args);
 }
 
+// Every call comes here: the thread that presents has its calls timed by kind (see g_vkt).
+static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
+  if (GetCurrentThreadId() != g_vkt.thread) {
+    long calls = __sync_add_and_fetch(&g_vk_calls, 1);
+    if (calls <= 40) VkLog("call: number, code, caller", calls, code, (uint64_t)(uintptr_t)__builtin_return_address(0));
+    return VkDispatch(handle, code, args);
+  }
+  // The thread that presents counts its own calls, without a locked add.
+  ++g_vkt.total;
+  unsigned kind = g_vkt.nested ? kVkOwn : code < kVkCodes ? g_call_kind[code] : kVkOther;
+  ++g_vkt.calls[kind];
+  if (kind == kVkOwn) return VkDispatch(handle, code, args);
+  uint64_t start = Tsc();
+  long status = VkDispatch(handle, code, args);
+  int64_t spent = (int64_t)(Tsc() - start);
+  if (spent > 0) g_vkt.ticks[kind] += (uint64_t)spent;  // not when a move to another core went back in time
+  return status;
+}
+
 // The Unix call code a winevulkan thunk passes ("mov edx, imm32", or "mov ecx,
 // imm32" for queue calls), and the dispatcher slot it calls through. 0 when
 // the thunk does not look as expected.
@@ -682,6 +764,29 @@ static void HookModule(HMODULE module) {
       *extra_codes[i] = extra_code;
     else
       VkLog("overlay: call not as expected, left alone", (uint64_t)i, extra_code, 0);
+  }
+  // For the second pace line: acquires and presents are timed where they are handled, and these
+  // wait for the GPU, submit to it or poll its progress. The KHR aliases are not exported; in this
+  // build each is the code after its core call's (read from the kit's winevulkan.dll).
+  g_call_kind[codes[0]] = g_call_kind[codes[1]] = g_call_kind[codes[4]] = kVkOwn;
+  const char* timing_names[] = {"vkWaitForFences", "vkWaitSemaphores", "vkQueueWaitIdle",
+                                "vkDeviceWaitIdle", "vkQueueSubmit",    "vkQueueSubmit2",
+                                "vkGetFenceStatus", "vkGetSemaphoreCounterValue"};
+  static const unsigned timing_expected[] = {0x2e0, 0x2e3, 0x2b1, 0x1ce, 0x2ae, 0x2af, 0x218, 0x288};
+  static const unsigned char timing_kind[] = {kVkWait,   kVkWait,   kVkWait, kVkWait,
+                                              kVkSubmit, kVkSubmit, kVkPoll, kVkPoll};
+  static const BOOL timing_alias[] = {0, 1, 0, 0, 0, 1, 0, 1};
+  for (int i = 0; i < 8; ++i) {
+    const unsigned char* thunk = GetProcAddress(module, timing_names[i]);
+    unsigned timing_code = ~0u;
+    unix_call_fn* timing_slot = slot;
+    if (thunk && DecodeThunk(thunk, 0, &timing_code, &timing_slot) && timing_slot == slot &&
+        timing_code == timing_expected[i]) {
+      g_call_kind[timing_code] = timing_kind[i];
+      if (timing_alias[i]) g_call_kind[timing_code + 1] = timing_kind[i];
+    } else {
+      VkLog("pace: call not as expected, counted with the others", (uint64_t)i, timing_code, 0);
+    }
   }
 
   // The unixlib handle: "mov rcx, [rip + rel32]" in the acquire thunk.
@@ -831,7 +936,8 @@ static DWORD WINAPI HookVulkanLater(void* unused) {
   static unsigned char entry[1080];  // MODULEENTRY32W
   for (int round = 0;; ++round) {
     if (g_vk_module_count) VerifyPatches();
-    if (round % 100 == 0 && g_vk_module_count) VkLog("calls through the shim so far", g_vk_calls, 0, 0);
+    if (round % 100 == 0 && g_vk_module_count)
+      VkLog("calls through the shim so far", (uint64_t)(g_vk_calls + g_vkt.total), 0, 0);
     if (round % 100 == 50)
       VkLog("cef frames so far: painted, of them empty, accelerated", g_paints, g_blank_paints, g_accelerated_paints);
     if (round % 300 == 299) CopyGameLog();
