@@ -6103,8 +6103,12 @@ void Simulation::rebuild_view() {
                 }
             } else if (action_key == "run-once") {
                 item.subtitle = "Starts a program from the game folder, such as its settings launcher, one time. Play doesn't change.";
+                // Only a game known to run waits: opening the list asks whether it runs, and Run once checks again.
                 std::string refusal;
-                if (live() && !game_closed(state_.navigation.selected_game_id, &refusal)) {
+                const auto runtime_game = state_.runtime_games.find(state_.navigation.selected_game_id);
+                const bool checking = runtime_game != state_.runtime_games.end() &&
+                                      runtime_game->second.activity == TitleActivity::Unknown;
+                if (live() && !checking && !game_closed(state_.navigation.selected_game_id, &refusal)) {
                     item.enabled = false;
                     item.subtitle = refusal;
                 }

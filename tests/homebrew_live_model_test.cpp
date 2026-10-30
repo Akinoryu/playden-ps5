@@ -703,6 +703,18 @@ void live_runs_setup_program_once(const std::filesystem::path& base) {
     activate(model, "details-more");
     check(find_row(model, "run-once") && !find_row(model, "run-once")->enabled, "setup program: waits while the game runs");
     model.action("circle");
+    // Not known yet: the list opens (and asks), and Run once waits for the answer.
+    runtime.activity = TitleActivity::Unknown;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
+    activate(model, "details-more");
+    check(find_row(model, "run-once")->enabled, "setup program: a game not known to run can open the list");
+    activate(model, "run-once");
+    check(model.TakeActivityRequests() == std::vector<GameId>{SteamId(35140)}, "setup program: the list asks whether it runs");
+    activate(model, "setup-program-0");
+    activate(model, "run-once-start");
+    check(model.TakeRuntimePlayRequests().empty() && !model.state().navigation.modals.empty(),
+          "setup program: Run once waits until the game is known to be closed");
+    while (!model.state().navigation.modals.empty()) model.action("circle");
     runtime.activity = TitleActivity::Stopped;
     model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
 
