@@ -119,6 +119,7 @@ static BOOL g_no_commit;
 static BOOL g_vk_fix;
 static BOOL g_vk_reuse;
 static BOOL g_no_shared_texture;
+static BOOL g_keep_begin_frame;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -413,6 +414,10 @@ static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char keep_begin[] = "shim:keep-begin-frame";
+      i = 0;
+      while (keep_begin[i] && p[i] == keep_begin[i]) ++i;
+      if (!keep_begin[i]) g_keep_begin_frame = 1;
       static const char no_shared[] = "shim:no-shared-texture";
       i = 0;
       while (no_shared[i] && p[i] == no_shared[i]) ++i;
@@ -438,23 +443,67 @@ static void LoadConfig(void) {
   CloseHandle(file);
 }
 
+// This CEF's string type. The C API passes cef_string_t, whose characters are UTF-16 in CEF's
+// default build and UTF-8 in BeamNG's (seen on the console: its command line came back as
+// bytes). Same layout either way: characters, their count, a destructor.
+static BOOL g_cef_utf8;
+
+// A CEF string of ASCII text, in storage (at least 2 * length bytes).
+static cef_string_t MakeCefString(const char* ascii, size_t length, void* storage) {
+  if (g_cef_utf8) {
+    char* bytes = storage;
+    for (size_t i = 0; i < length; ++i) bytes[i] = ascii[i];
+  } else {
+    WCHAR* wide = storage;
+    for (size_t i = 0; i < length; ++i) wide[i] = (unsigned char)ascii[i];
+  }
+  return (cef_string_t){storage, length, NULL};
+}
+
+static void LogCefString(const char* prefix, const cef_string_t* text) {
+  if (!text || !text->str) return;
+  if (!g_cef_utf8) {
+    LogWide(prefix, text->str, text->length);
+    return;
+  }
+  char line[1024];
+  size_t n = 0, p = Length(prefix);
+  const unsigned char* bytes = (const unsigned char*)text->str;
+  for (size_t i = 0; i < p && n < sizeof(line) - 2; ++i) line[n++] = prefix[i];
+  for (size_t i = 0; i < text->length && n < sizeof(line) - 2; ++i) line[n++] = bytes[i] < 0x80 && bytes[i] ? bytes[i] : '?';
+  line[n++] = '\n';
+  line[n] = 0;
+  Log(line);
+}
+
+// Reads the string type from a string CEF made: an ASCII character in UTF-16 has a zero high byte.
+static void DetectCefStringType(cef_command_line_t* command_line) {
+  cef_string_t* line = command_line->get_command_line_string(command_line);
+  if (!line || !line->str || line->length < 2) return;
+  const unsigned char* bytes = (const unsigned char*)line->str;
+  g_cef_utf8 = bytes[0] < 0x80 && bytes[1] != 0;
+  Log(g_cef_utf8 ? "libcef-shim: this CEF's strings are UTF-8\n" : "libcef-shim: this CEF's strings are UTF-16\n");
+  typedef void (*free_fn)(cef_string_t*);
+  free_fn free_string = (free_fn)GetProcAddress(
+      g_real, g_cef_utf8 ? "cef_string_userfree_utf8_free" : "cef_string_userfree_utf16_free");
+  if (free_string) free_string(line);
+}
+
 static void Append(cef_command_line_t* command_line, const char* name, size_t name_length, const char* value,
                    size_t value_length) {
-  WCHAR wide_name[256], wide_value[512];
+  WCHAR name_storage[256], value_storage[512];
   if (name_length >= 256 || value_length >= 512) return;
-  for (size_t i = 0; i < name_length; ++i) wide_name[i] = (unsigned char)name[i];
-  for (size_t i = 0; i < value_length; ++i) wide_value[i] = (unsigned char)value[i];
-  cef_string_t cef_name = {wide_name, name_length, NULL};
-  cef_string_t cef_value = {wide_value, value_length, NULL};
+  cef_string_t cef_name = MakeCefString(name, name_length, name_storage);
+  cef_string_t cef_value = MakeCefString(value ? value : "", value_length, value_storage);
   if (command_line->has_switch(command_line, &cef_name)) {
-    LogWide("libcef-shim: already set: ", wide_name, name_length);
+    LogCefString("libcef-shim: already set: ", &cef_name);
     if (!value) return;
   }
   if (value)
     command_line->append_switch_with_value(command_line, &cef_name, &cef_value);
   else
     command_line->append_switch(command_line, &cef_name);
-  LogWide("libcef-shim: appended ", wide_name, name_length);
+  LogCefString("libcef-shim: appended ", &cef_name);
 }
 
 static BOOL IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r'; }
@@ -516,10 +565,8 @@ static void LogHex(const char* prefix, const cef_string_t* text) {
 static void CheckSwitches(const char* where, cef_command_line_t* command_line) {
   static const char* const names[] = {"single-process", "in-process-gpu", "no-sandbox", NULL};
   for (int k = 0; names[k]; ++k) {
-    WCHAR wide[32];
-    size_t length = Length(names[k]);
-    for (size_t i = 0; i < length; ++i) wide[i] = (unsigned char)names[k][i];
-    cef_string_t name = {wide, length, NULL};
+    WCHAR storage[32];
+    cef_string_t name = MakeCefString(names[k], Length(names[k]), storage);
     char line[160];
     size_t n = 0;
     const char* parts[] = {"libcef-shim: ", where, ": ", names[k],
@@ -550,10 +597,11 @@ static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_strin
     return;
   }
   if (process_type && process_type->length) {
-    LogWide("libcef-shim: leaving a helper process alone: ", process_type->str, process_type->length);
+    LogCefString("libcef-shim: leaving a helper process alone: ", process_type);
   } else if (command_line->is_read_only(command_line)) {
     Log("libcef-shim: command line is read-only, nothing appended\n");
   } else {
+    DetectCefStringType(command_line);
     AppendAndLog(command_line);
   }
   ((release_fn)command_line->base.release)(command_line);
@@ -562,9 +610,8 @@ static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_strin
 // Chromium's stack sampling profiler, which BeamNG turns on, reads other threads' stacks; on the
 // PS5 a stack page not yet committed faults (read access at 0x1000114000) and ends the game.
 static void RemoveStackProfiler(cef_command_line_t* command_line) {
-  static const WCHAR wide[] = {'s', 't', 'a', 'r', 't', '-', 's', 't', 'a', 'c', 'k', '-',
-                               'p', 'r', 'o', 'f', 'i', 'l', 'e', 'r'};
-  cef_string_t name = {(WCHAR*)wide, 20, NULL};
+  WCHAR storage[32];
+  cef_string_t name = MakeCefString("start-stack-profiler", 20, storage);
   if (!command_line->has_switch(command_line, &name)) return;
   if (command_line->base.size < 0xb0) {
     Log("libcef-shim: start-stack-profiler is on and this CEF cannot remove it\n");
@@ -580,10 +627,11 @@ static void AppendAndLog(cef_command_line_t* command_line) {
   if (!g_keep_profiler) RemoveStackProfiler(command_line);
   CheckSwitches("after appending", command_line);
   cef_string_userfree_free_fn free_string =
-      (cef_string_userfree_free_fn)GetProcAddress(g_real, "cef_string_userfree_utf16_free");
+      (cef_string_userfree_free_fn)GetProcAddress(
+          g_real, g_cef_utf8 ? "cef_string_userfree_utf8_free" : "cef_string_userfree_utf16_free");
   cef_string_t* line = command_line->get_command_line_string(command_line);
   if (line) {
-    LogWide("libcef-shim: command line now: ", line->str, line->length);
+    LogCefString("libcef-shim: command line now: ", line);
     LogHex("libcef-shim: command line starts with", line);
     if (free_string) free_string(line);
   }
@@ -689,7 +737,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 12)\n");
+    Log("libcef-shim: loaded (build 13)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

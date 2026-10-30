@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// CEF paint watch, included by shim.c.
+// CEF browser setup and paint watch, included by shim.c.
 //
 // BeamNG draws its menus with a windowless (off-screen) CEF browser: CEF hands
 // each frame to the game's render handler, as pixels (OnPaint) or as a shared
@@ -8,6 +8,14 @@
 // and _sync, logs how the browser is set up, and puts its own functions in the
 // game's render handler for those two callbacks: it counts the frames, logs
 // whether they hold any picture, and passes each one on unchanged.
+//
+// BeamNG asks for external begin frames: CEF draws a frame only when the game
+// asks, and takes the next request only once the last one is acknowledged. In
+// the single-process, software-composited CEF the PS5 needs, that
+// acknowledgement never comes (on the console: one empty frame, then none), so
+// the shim creates the browser without external begin frames and CEF draws at
+// its own frame rate. The game's later requests are then kept pending by the
+// compositor and do nothing. shim:keep-begin-frame keeps BeamNG's setting.
 
 // Offsets in CEF 150's C structs (the order of the methods in cef_client.h and
 // cef_render_handler.h, after the 0x28 bytes of cef_base_ref_counted_t).
@@ -17,7 +25,7 @@ enum {
   kRenderOnPaint = 0x60,
   kRenderOnAcceleratedPaint = 0x68,
   kRenderMinSize = 0x70,
-  kMaxWrapped = 8,
+  kMaxClients = 8,
 };
 
 typedef void* (*get_render_handler_fn)(void* client);
@@ -29,12 +37,11 @@ typedef void (*on_accelerated_paint_fn)(void* self, void* browser, int type, siz
 static struct {
   void* client;
   get_render_handler_fn original;
-} g_clients[kMaxWrapped];
-static struct {
-  void* handler;
-  on_paint_fn paint;
-  on_accelerated_paint_fn accelerated;
-} g_handlers[kMaxWrapped];
+} g_clients[kMaxClients];
+// The game's own callbacks. CEF's C wrappers are made anew for each GetRenderHandler call, all
+// with the same functions; a wrapper with other functions is left alone.
+static on_paint_fn g_game_on_paint;
+static on_accelerated_paint_fn g_game_on_accelerated_paint;
 
 static void* Field(void* object, size_t offset) { return *(void**)((unsigned char*)object + offset); }
 
@@ -68,10 +75,7 @@ static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count,
     VkLog("cef paint: number, size, type", count, ((uint64_t)(uint32_t)width << 32) | (uint32_t)height, type);
     VkLog("cef paint: of 144 samples, coloured, opaque", (uint64_t)visible, (uint64_t)opaque, 0);
   }
-  on_paint_fn original = NULL;
-  for (int i = 0; i < kMaxWrapped; ++i)
-    if (g_handlers[i].handler == self) original = g_handlers[i].paint;
-  if (original) original(self, browser, type, dirty_count, dirty, buffer, width, height);
+  g_game_on_paint(self, browser, type, dirty_count, dirty, buffer, width, height);
 }
 
 static void OnAcceleratedPaintHook(void* self, void* browser, int type, size_t dirty_count, const void* dirty,
@@ -82,37 +86,38 @@ static void OnAcceleratedPaintHook(void* self, void* browser, int type, size_t d
     VkLog("cef accelerated paint: number, texture handle, format", count, p ? *(const uint64_t*)(p + 8) : 0,
           p ? *(const uint32_t*)(p + 16) : 0);
   }
-  on_accelerated_paint_fn original = NULL;
-  for (int i = 0; i < kMaxWrapped; ++i)
-    if (g_handlers[i].handler == self) original = g_handlers[i].accelerated;
-  if (original) original(self, browser, type, dirty_count, dirty, info);
+  g_game_on_accelerated_paint(self, browser, type, dirty_count, dirty, info);
+}
+
+// Puts the shim's callbacks in a render handler wrapper. The wrapper is CEF's heap memory.
+static void WrapRenderHandler(void* handler) {
+  if (*(size_t*)handler < kRenderMinSize) return;
+  on_paint_fn paint = (on_paint_fn)Field(handler, kRenderOnPaint);
+  on_accelerated_paint_fn accelerated = (on_accelerated_paint_fn)Field(handler, kRenderOnAcceleratedPaint);
+  if (paint == OnPaintHook) return;
+  VkLock();
+  if (!g_game_on_paint) {
+    g_game_on_paint = paint;
+    g_game_on_accelerated_paint = accelerated;
+    VkLog("cef render handler: OnPaint, OnAcceleratedPaint", (uint64_t)(uintptr_t)paint,
+          (uint64_t)(uintptr_t)accelerated, 0);
+  }
+  BOOL same = paint == g_game_on_paint && accelerated == g_game_on_accelerated_paint;
+  VkUnlock();
+  if (!same) {
+    VkLog("cef render handler with other callbacks left alone", (uint64_t)(uintptr_t)paint, 0, 0);
+    return;
+  }
+  *(void**)((unsigned char*)handler + kRenderOnPaint) = (void*)OnPaintHook;
+  *(void**)((unsigned char*)handler + kRenderOnAcceleratedPaint) = (void*)OnAcceleratedPaintHook;
 }
 
 static void* GetRenderHandlerHook(void* client) {
   get_render_handler_fn original = NULL;
-  for (int i = 0; i < kMaxWrapped; ++i)
+  for (int i = 0; i < kMaxClients; ++i)
     if (g_clients[i].client == client) original = g_clients[i].original;
   void* handler = original ? original(client) : NULL;
-  if (!handler) return handler;
-  VkLock();
-  BOOL known = 0;
-  int free_slot = -1;
-  for (int i = 0; i < kMaxWrapped; ++i) {
-    if (g_handlers[i].handler == handler) known = 1;
-    if (!g_handlers[i].handler && free_slot < 0) free_slot = i;
-  }
-  if (!known && free_slot >= 0 && *(size_t*)handler >= kRenderMinSize) {
-    g_handlers[free_slot].handler = handler;
-    g_handlers[free_slot].paint = (on_paint_fn)Field(handler, kRenderOnPaint);
-    g_handlers[free_slot].accelerated = (on_accelerated_paint_fn)Field(handler, kRenderOnAcceleratedPaint);
-    BOOL ok = SetField(handler, kRenderOnPaint, (void*)OnPaintHook) &&
-              SetField(handler, kRenderOnAcceleratedPaint, (void*)OnAcceleratedPaintHook);
-    VkLog(ok ? "cef render handler wrapped: handler, OnPaint, OnAcceleratedPaint"
-             : "cef render handler could not be wrapped",
-          (uint64_t)(uintptr_t)handler, (uint64_t)(uintptr_t)g_handlers[free_slot].paint,
-          (uint64_t)(uintptr_t)g_handlers[free_slot].accelerated);
-  }
-  VkUnlock();
+  if (handler) WrapRenderHandler(handler);
   return handler;
 }
 
@@ -125,12 +130,11 @@ static void WrapClient(void* client) {
     VkLog("cef client too small to wrap: size", *(size_t*)client, 0, 0);
     return;
   }
+  if (Field(client, kClientGetRenderHandler) == (void*)GetRenderHandlerHook) return;
   VkLock();
   int free_slot = -1;
-  for (int i = 0; i < kMaxWrapped; ++i) {
-    if (g_clients[i].client == client) free_slot = -2;
-    if (free_slot == -1 && !g_clients[i].client) free_slot = i;
-  }
+  for (int i = 0; i < kMaxClients && free_slot < 0; ++i)
+    if (!g_clients[i].client) free_slot = i;
   if (free_slot >= 0) {
     g_clients[free_slot].client = client;
     g_clients[free_slot].original = (get_render_handler_fn)Field(client, kClientGetRenderHandler);
@@ -139,24 +143,34 @@ static void WrapClient(void* client) {
   VkUnlock();
 }
 
-static void LogWindowInfo(const unsigned char* info) {
-  if (!info) return;
-  const int* bounds = (const int*)(info + 44);
-  VkLog("cef browser: windowless, shared texture, external begin frame", *(const int*)(info + 80),
-        *(const int*)(info + 84), *(const int*)(info + 88));
-  VkLog("cef browser: size", (uint64_t)(uint32_t)bounds[2], (uint64_t)(uint32_t)bounds[3], 0);
+// cef_window_info_t on Windows: size, ex_style, window_name, style, bounds (x, y, width,
+// height at 44), parent_window, menu, then windowless_rendering_enabled (80),
+// shared_texture_enabled (84) and external_begin_frame_enabled (88).
+static void LogWindowInfo(const unsigned char* info, const unsigned char* settings) {
+  if (info)
+    VkLog("cef browser: windowless, shared texture, external begin frame", *(const int*)(info + 80),
+          *(const int*)(info + 84), *(const int*)(info + 88));
+  if (settings && *(const size_t*)settings >= 12)
+    VkLog("cef browser: windowless frame rate", (uint64_t)*(const int*)(settings + 8), 0, 0);
 }
 
-static BOOL g_no_shared_texture;
-
-// A copy of the window info with shared textures off, when shim:no-shared-texture asks for it.
+// A copy of the window info without external begin frames (and, with shim:no-shared-texture,
+// without shared textures), or the game's own when there is nothing to change.
 static const void* AdjustWindowInfo(const unsigned char* info, unsigned char* copy, size_t capacity) {
-  if (!info || !g_no_shared_texture) return info;
+  if (!info) return info;
   size_t size = *(const size_t*)info;
-  if (size < 92 || size > capacity) return info;
+  BOOL begin_frame = !g_keep_begin_frame && *(const int*)(info + 88);
+  BOOL shared = g_no_shared_texture && *(const int*)(info + 84);
+  if ((!begin_frame && !shared) || size < 92 || size > capacity) return info;
   for (size_t i = 0; i < size; ++i) copy[i] = info[i];
-  *(int*)(copy + 84) = 0;
-  Log("libcef-shim: cef browser: shared texture turned off\n");
+  if (begin_frame) {
+    *(int*)(copy + 88) = 0;
+    Log("libcef-shim: cef browser: external begin frames turned off, CEF draws at its own rate\n");
+  }
+  if (shared) {
+    *(int*)(copy + 84) = 0;
+    Log("libcef-shim: cef browser: shared texture turned off\n");
+  }
   return copy;
 }
 
@@ -174,9 +188,8 @@ __declspec(dllexport) int cef_browser_host_create_browser(const void* window_inf
                                                           const void* settings, void* extra_info,
                                                           void* request_context) {
   create_browser_fn real = (create_browser_fn)GetProcAddress(RealLibrary(), "cef_browser_host_create_browser");
-  if (url) LogWide("libcef-shim: cef browser (async) for ", ((const cef_string_t*)url)->str,
-                   ((const cef_string_t*)url)->length);
-  LogWindowInfo(window_info);
+  LogCefString("libcef-shim: cef browser (async) for ", url);
+  LogWindowInfo(window_info, settings);
   WrapClient(client);
   static unsigned char copy[256];
   return real ? real(AdjustWindowInfo(window_info, copy, sizeof(copy)), client, url, settings, extra_info,
@@ -189,9 +202,8 @@ __declspec(dllexport) void* cef_browser_host_create_browser_sync(const void* win
                                                                  void* extra_info, void* request_context) {
   create_browser_sync_fn real =
       (create_browser_sync_fn)GetProcAddress(RealLibrary(), "cef_browser_host_create_browser_sync");
-  if (url) LogWide("libcef-shim: cef browser (sync) for ", ((const cef_string_t*)url)->str,
-                   ((const cef_string_t*)url)->length);
-  LogWindowInfo(window_info);
+  LogCefString("libcef-shim: cef browser (sync) for ", url);
+  LogWindowInfo(window_info, settings);
   WrapClient(client);
   static unsigned char copy[256];
   return real ? real(AdjustWindowInfo(window_info, copy, sizeof(copy)), client, url, settings, extra_info,
