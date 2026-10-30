@@ -19,7 +19,7 @@ for f in LoadLibraryW GetProcAddress GetModuleFileNameW GetStdHandle WriteFile R
     RtlLookupFunctionEntry RtlVirtualUnwind GetCurrentProcessId CreateThread Sleep CreateToolhelp32Snapshot \
     Thread32First Thread32Next OpenThread SuspendThread ResumeThread GetThreadContext GetModuleHandleW \
     GetTickCount64 FlushInstructionCache Module32FirstW Module32NextW VirtualAlloc GetEnvironmentVariableW \
-    QueryPerformanceCounter QueryPerformanceFrequency; do
+    QueryPerformanceCounter QueryPerformanceFrequency SwitchToThread; do
   printf '  %s\n' "$f" >>"$out/kernel32.def"
 done
 llvm-dlltool -m i386:x86-64 -d "$out/kernel32.def" -l "$out/kernel32.lib"

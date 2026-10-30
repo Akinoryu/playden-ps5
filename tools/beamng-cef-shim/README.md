@@ -93,6 +93,18 @@ how long the threads were held. It also times `cef_do_message_loop_work`, which 
 thread calls each frame, says whether the main thread was inside it during the stall, and logs every
 10 seconds how long those calls took. `shim:no-hitch` turns it off.
 
+In each stall it listed (build 23), the game's main thread was in `Sleep`, or reading
+`QueryPerformanceCounter`, in one function that waits for a time to come, while every other thread
+was idle: BeamNG was waiting for time to pass, not for work. So the shim also wraps the game's `Sleep`
+and `QueryPerformanceCounter` imports (`time_hook.c`): every 10 seconds a `sleep:` line counts the main
+thread's sleeps, what they asked for and took, and the longest with where it came from, the other
+threads' sleeps and the clock reads; a main-thread sleep that took 50 ms more than it asked for is
+logged as it happens, and so is a 2 ms sleep of a thread of the shim's own that took over 50 ms. The
+main thread's sleeps of 1 to 4 ms wait by yielding the CPU until the time has come, which needs no
+timer (`shim:real-sleep` turns that off). Half a minute after start it logs the code of the waiting
+function and of its callers in hex, with the game's imports that have to do with time, to read what
+it waits for.
+
 With `shim:sample`, for 30 seconds of every minute, ten times a second, the shim also stops the
 thread that submits for a moment and notes where it is (`sampler.c`): after each 30 seconds a
 `sample:` line lists the modules (and for Windows' and Wine's, the function) it was found in most,

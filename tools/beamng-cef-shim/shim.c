@@ -46,6 +46,7 @@ __declspec(dllimport) DWORD WINAPI GetCurrentThreadId(void);
 __declspec(dllimport) DWORD WINAPI GetCurrentProcessId(void);
 __declspec(dllimport) HANDLE WINAPI CreateThread(void*, size_t, void*, void*, DWORD, DWORD*);
 __declspec(dllimport) void WINAPI Sleep(DWORD);
+__declspec(dllimport) BOOL WINAPI SwitchToThread(void);
 __declspec(dllimport) HANDLE WINAPI CreateToolhelp32Snapshot(DWORD, DWORD);
 __declspec(dllimport) BOOL WINAPI Thread32First(HANDLE, void*);
 __declspec(dllimport) BOOL WINAPI Thread32Next(HANDLE, void*);
@@ -141,6 +142,7 @@ static BOOL g_sample;  // shim:sample: sample where the thread that submits spen
 static int64_t g_start_qpc;  // when the shim loaded
 static BOOL g_no_hitch;  // shim:no-hitch: no listing of the threads when a frame is late (hitch.c)
 static DWORD g_main_thread;  // the thread that called cef_initialize: CEF's UI thread, the game's main loop
+static BOOL g_real_sleep_only;  // shim:real-sleep: the main thread's short sleeps use Sleep (time_hook.c)
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -518,6 +520,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
       if (!keep[i]) g_keep_settings = 1;
+      static const char real_sleep[] = "shim:real-sleep";
+      i = 0;
+      while (real_sleep[i] && p[i] == real_sleep[i]) ++i;
+      if (!real_sleep[i]) g_real_sleep_only = 1;
       static const char no_hitch[] = "shim:no-hitch";
       i = 0;
       while (no_hitch[i] && p[i] == no_hitch[i]) ++i;
@@ -933,6 +939,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 #include "paint_hook.c"
 #include "sampler.c"
 #include "hitch.c"
+#include "time_hook.c"
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
@@ -946,9 +953,10 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 23)\n");
+    Log("libcef-shim: loaded (build 24)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
+    HookGameTime();
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
     if (g_sample) CreateThread(NULL, 0, (void*)SampleLater, NULL, 0, NULL);
     if (!g_no_hitch) CreateThread(NULL, 0, (void*)HitchWatch, NULL, 0, NULL);
