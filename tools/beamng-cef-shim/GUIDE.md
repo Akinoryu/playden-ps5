@@ -44,6 +44,7 @@ Open BeamNG.drive's **Game settings** in Playden and set:
 | **Program** | `Bin64/BeamNG.drive.x64.exe` |
 | **Extra arguments** | `-gfx vk --single-process --in-process-gpu --no-sandbox --disable-gpu --disable-gpu-compositing --disable-stack-profiler` |
 | **Advanced › Library overrides** | `crashrpt=d` |
+| **Resolution** | `1280×720` (recommended, see below) |
 
 Why each one is there:
 
@@ -58,6 +59,11 @@ Why each one is there:
 - **`crashrpt=d`** stops BeamNG's crash reporter from loading. The reporter tries to start a helper program, fails,
   unloads itself, and then the game crashed calling into it. BeamNG's log then says it could not install the crash
   reporter. That message is expected.
+- **Resolution `1280×720`** is the size of the Windows screen the game sees; the PS5 still shows the picture full
+  screen. At that size BeamNG cannot pick 1920x1080, whatever its own settings say. At 1920x1080 its interface takes
+  far more of the PS5's memory: menus and loading screens showed black squares and the game closed in Options and
+  during loading. This Playden setting avoids that without opening BeamNG's Options. It was not yet tested with the
+  shim on a console; if the picture looks wrong, set it back to 1920×1080 and use BeamNG's Window 1280x720 instead.
 
 ### 2. Install the shim (FTP)
 
@@ -73,9 +79,10 @@ In `/data/playden-games/284160/Bin64/`:
 These are the settings it was tested with:
 
 - **Display mode:** Window, 1280x720. The shim scales the picture to fill the TV. **Do not use 1920x1080:** at
-  that size BeamNG's interface takes much more of the PS5's memory, and opening Options ran out of it and closed
-  the game. It also costs more CPU time per frame (about 49 fps instead of 60). A lower 16:9 size (for example
-  960x540) should run faster and look softer; that was not tested.
+  that size BeamNG's interface takes much more of the PS5's memory: black squares showed in menus and loading
+  screens, and the game closed in Options and during loading. It also costs more CPU time per frame (about 49 fps
+  instead of 60). Playden's Resolution setting at 1280×720 (above) keeps BeamNG at that size even if its Options
+  cannot be reached. A lower 16:9 size (for example 960x540) should run faster and look softer; that was not tested.
 - **Graphics:** the lowest preset.
 - **FPS limit:** off. A 30 fps limit made the frame pacing worse.
 
@@ -294,7 +301,10 @@ a file with any such line replaces all of the default switches. None of these op
 - **The game freezes for a moment every 1.7 seconds.** You are on a shim older than build 25. Use the latest.
 - **Opening Options crashes the game.**
   - On a shim older than build 22, use the latest.
-  - In Fullscreen 1920x1080, switch BeamNG to Window 1280x720: Options ran out of memory at 1920x1080.
+  - At 1920x1080, Options ran out of memory: set Playden's Resolution to 1280×720.
+- **Black squares in menus or loading screens, or the game closes in menus or while loading.** BeamNG runs at
+  1920x1080 and its interface ran out of memory (`exception code 0xe0000008` in `libcef_shim.log`). Set Playden's
+  Resolution to 1280×720.
 - **The picture shakes, or jumps between two sizes.** You are on a shim older than build 27. Use the latest.
 - **A pop-up window crashes the game.** You are on a shim older than build 27. Use the latest.
 - **A black screen with sound.** Check that `-gfx vk` is in Extra arguments, and look for `vk` and `overlay` lines in
