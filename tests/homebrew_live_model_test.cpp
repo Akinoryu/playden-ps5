@@ -724,7 +724,7 @@ void live_runs_setup_program_once(const std::filesystem::path& base) {
           "setup program: Game actions offers it");
     activate(model, "run-once");
     check(model.state().navigation.modals.back().id == "setup-programs", "setup program: the picker opens");
-    check(find_row(model, "setup-program-0")->enabled && find_row(model, "setup-program-1")->value == "The game's program" &&
+    check(find_row(model, "setup-program-0")->enabled && find_row(model, "setup-program-1")->value == "The game" &&
               !find_row(model, "setup-program-2")->enabled,
           "setup program: the picker names the game's program and refuses what can't start");
     (void)model.TakeProgramScanRequests();

@@ -6126,7 +6126,7 @@ void Simulation::rebuild_view() {
                     rt::EffectiveSettings values;
                     if (EffectiveSettingsFor(state_.navigation.selected_game_id, &values) && values.launch &&
                         BottlePath(values.launch->executable) == BottlePath(program.path))
-                        item.value = "The game's program";
+                        item.value = "The game";
                 }
             } else if (action_key == "game-maintenance") {
                 if (live())
