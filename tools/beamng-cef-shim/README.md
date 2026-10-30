@@ -94,16 +94,27 @@ thread calls each frame, says whether the main thread was inside it during the s
 10 seconds how long those calls took. `shim:no-hitch` turns it off.
 
 In each stall it listed (build 23), the game's main thread was in `Sleep`, or reading
-`QueryPerformanceCounter`, in one function that waits for a time to come, while every other thread
-was idle: BeamNG was waiting for time to pass, not for work. So the shim also wraps the game's `Sleep`
-and `QueryPerformanceCounter` imports (`time_hook.c`): every 10 seconds a `sleep:` line counts the main
-thread's sleeps, what they asked for and took, and the longest with where it came from, the other
-threads' sleeps and the clock reads; a main-thread sleep that took 50 ms more than it asked for is
-logged as it happens, and so is a 2 ms sleep of a thread of the shim's own that took over 50 ms. The
-main thread's sleeps of 1 to 4 ms wait by yielding the CPU until the time has come, which needs no
-timer (`shim:real-sleep` turns that off). Half a minute after start it logs the code of the waiting
-function and of its callers in hex, with the game's imports that have to do with time, to read what
-it waits for.
+`QueryPerformanceCounter`, in `std::this_thread::sleep_for`, its wait between frames. So the shim
+also wraps the game's `Sleep` and `QueryPerformanceCounter` imports (`time_hook.c`): every 10
+seconds a `sleep:` line counts the main thread's sleeps, what they asked for and took, and the
+longest with where it came from, the other threads' sleeps and the clock reads, and how many times
+`GetTickCount64` stood still for over 50 ms; a main-thread sleep that took 50 ms more than it asked
+for is logged as it happens, and so is a 2 ms sleep of a thread of the shim's own that took over
+50 ms, or over which `GetTickCount64` and `QueryPerformanceCounter` disagree by as much. With
+`shim:yield-sleep`, the main thread's sleeps of 1 to 4 ms wait by yielding the CPU instead.
+
+Build 24 found the game's sleeps on time, and `GetTickCount64` standing still for about 212 ms in
+each stall while `QueryPerformanceCounter` went on. The console has no inotify, so prospero-win's
+server finds what changed in a folder a program watches by listing it, with the whole tree under it
+when the watch takes in subfolders. It lists on its own thread, which keeps that tick and answers
+every request of every thread of the game, and a listing that takes long is made less often: eight
+times as long between two. One listing of about 212 ms every 8 x 212 ms is the stutter. So the shim
+hooks the call that starts a watch (`NtNotifyChangeDirectoryFile`, as kernelbase calls it for
+`ReadDirectoryChangesW` and `FindFirstChangeNotificationW`; `watch_hook.c`): a watch of a whole tree
+watches only its folder, and changes further down are not reported. Each folder is logged the first
+time it is watched, in a `watch:` line with what was asked, how long the call took (the server makes
+its first listing in it) and who asked. `shim:watch-subtrees` keeps watches as asked;
+`shim:no-watch` refuses them all, as a network drive without change notification would.
 
 With `shim:sample`, for 30 seconds of every minute, ten times a second, the shim also stops the
 thread that submits for a moment and notes where it is (`sampler.c`): after each 30 seconds a
