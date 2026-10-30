@@ -302,7 +302,8 @@ static void HideSuboptimal(uint64_t swapchain, int32_t* result) {
   static long hidden;
   if (*result != kSuboptimal || !ChainEnlarged(swapchain)) return;
   *result = 0;
-  if (++hidden == 1) VkLog("Wine's suboptimal answers for the enlarged swapchain hidden from the game", swapchain, 0, 0);
+  if (++hidden == 1)
+    VkLog("Wine's suboptimal answers for the enlarged swapchain hidden from the game", swapchain, 0, 0);
 }
 
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
@@ -699,7 +700,9 @@ static DWORD WINAPI HookVulkanLater(void* unused) {
     if (round % 100 == 0 && g_vk_module_count) VkLog("calls through the shim so far", g_vk_calls, 0, 0);
     if (round % 100 == 50)
       VkLog("cef frames so far: painted, of them empty, accelerated", g_paints, g_blank_paints, g_accelerated_paints);
-    if (round >= 1800) {  // after three minutes only the checks go on
+    if (round % 300 == 299) CopyGameLog();
+    // Until winevulkan.dll is found, for three minutes at most: a module list every 100 ms is not free.
+    if (round >= 1800 || g_vk_module_count) {
       Sleep(100);
       continue;
     }

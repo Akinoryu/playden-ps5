@@ -131,10 +131,17 @@ void mainCRTStartup(void) {
   OverlayNoteSwapchain(device, (uint64_t)swapchain, width, height, small ? width : game_width, small ? height : game_height,
                        VK_FORMAT_B8G8R8A8_UNORM);
   if (!small && !OverlayCanScale(game_width, game_height, VK_FORMAT_B8G8R8A8_UNORM)) { Log("test: FAILED OverlayCanScale\n"); ExitProcess(4); }
+  /* frames the overlay must not take: another browser's (BeamNG's odometer), and a see-through HUD */
+  static uint32_t odometer[256 * 64];
+  for (int k = 0; k < 256 * 64; k++) odometer[k] = 0xffffffffu;
+  OverlayTakeFrame(odometer, 256, 64, 144);
+  if (g_frame || g_frame_opaque) { Log("test: FAILED, the overlay took another browser's frame\n"); ExitProcess(5); }
   /* the "menu": left half red, right half green, opaque BGRA, at the game's size */
   static uint32_t frame[1280 * 720];
   for (uint32_t y = 0; y < game_height; y++)
     for (uint32_t x = 0; x < game_width; x++) frame[y * game_width + x] = x < game_width / 2 ? 0xffff0000u : 0xff00ff00u;
+  OverlayTakeFrame(frame, (int)game_width, (int)game_height, 31);
+  if (g_frame || g_frame_opaque) { Log("test: FAILED, the overlay took a see-through frame\n"); ExitProcess(5); }
   /* the game's picture where it draws: left half blue, right half yellow (in a buffer, copied in each frame) */
   VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, (VkDeviceSize)game_width * game_height * 4,
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};

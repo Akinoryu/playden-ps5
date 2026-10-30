@@ -246,10 +246,19 @@ static void FrameLock(void) {
 }
 static void FrameUnlock(void) { __sync_lock_release(&g_frame_lock); }
 
-// Called from OnPaintHook with each full-view frame.
+// Called from OnPaintHook with each full-view frame, on the game's main thread (CEF's UI thread).
+// Only the main view, at the game's size, is taken: other browsers (BeamNG's analog odometer) draw
+// small textures. A see-through frame (a HUD over the game) is not copied, as it is not drawn.
 static void OverlayTakeFrame(const void* pixels, int width, int height, int opaque_samples) {
   if (g_no_overlay || width <= 0 || height <= 0 || width > kOvMaxWidth || height > kOvMaxHeight) return;
+  if (g_ov.game_width && ((uint32_t)width != g_ov.game_width || (uint32_t)height != g_ov.game_height)) return;
+  BOOL opaque = opaque_samples >= 135;  // of 144: a loading screen or menu, not a HUD
   FrameLock();
+  if (!opaque) {
+    g_frame_opaque = 0;
+    FrameUnlock();
+    return;
+  }
   if (!g_frame) g_frame = VirtualAlloc(NULL, (size_t)kOvMaxWidth * kOvMaxHeight * 4, 0x3000, PAGE_READWRITE);
   if (g_frame) {
     const unsigned char* from = pixels;
@@ -258,7 +267,7 @@ static void OverlayTakeFrame(const void* pixels, int width, int height, int opaq
     g_frame_width = (uint32_t)width;
     g_frame_height = (uint32_t)height;
     g_frame_dirty = 1;
-    g_frame_opaque = opaque_samples >= 135;  // of 144: a loading screen or menu, not a HUD
+    g_frame_opaque = 1;
   }
   FrameUnlock();
 }

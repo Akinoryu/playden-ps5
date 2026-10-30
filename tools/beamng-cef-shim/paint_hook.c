@@ -65,7 +65,8 @@ static void SampleFrame(const uint32_t* pixels, int width, int height, int* visi
     }
 }
 
-// Saves a frame as libcef_ui_frame_<number>.bmp beside this DLL, to see what CEF draws.
+// Saves a frame as libcef_ui_frame_<number>.bmp beside this DLL, to see what CEF draws (shim:save-frames:
+// each save holds up the game for the write).
 static void SaveFrame(long number, const void* pixels, int width, int height) {
   WCHAR path[1024];
   char name[64] = "libcef_ui_frame_000.bmp";
@@ -104,7 +105,7 @@ static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count,
   int visible = 0, opaque = 0;
   if (buffer && width > 0 && height > 0) SampleFrame(buffer, width, height, &visible, &opaque);
   if (!visible && !opaque) __sync_add_and_fetch(&g_blank_paints, 1);
-  if (buffer && width > 0 && height > 0 && width <= 4096 && height <= 4096 &&
+  if (g_save_frames && buffer && width > 0 && height > 0 && width <= 4096 && height <= 4096 &&
       (count == 20 || count == 100 || count == 300 || count == 600))
     SaveFrame(count, buffer, width, height);
   if (buffer && type == 0 /* PET_VIEW */) OverlayTakeFrame(buffer, width, height, opaque);

@@ -51,11 +51,19 @@ present it scales that part (or the menu) up over the whole image, aspect ratio 
 such a swapchain as suboptimal, since it is not the window's size; the shim reports success to
 BeamNG instead, or it would make its swapchain again at every frame. If the full size cannot be
 made, the shim makes BeamNG's size as before. `shim:no-vk-fullsize` keeps BeamNG's size, and
-`shim:vk-size=3840x2160` picks another full size.
+`shim:vk-size=3840x2160` picks another full size. With this, BeamNG's menus and its 3D world show on
+the console.
 
 `test/run.sh` checks the overlay and the scaling on real Vulkan (Mesa's lavapipe under Wine, with
 the Khronos validation layer and its synchronization checks).
 
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
-`libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). To undo, delete the
-shim and rename `libcef_real.dll` back. A Steam update or file check puts the original back.
+`libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). Every
+half minute it also copies BeamNG's own log, `beamng.log` in the game's user folder inside the
+bottle (which FTP cannot read), to `libcef_shim_beamng.log` beside the DLL. `shim:save-frames` saves
+CEF frames 20, 100, 300 and 600 as `libcef_ui_frame_<n>.bmp`, and `shim:dump-after=N` lists every
+thread's stack N seconds after CEF starts, twice; both hold up the game while they run, so they are
+off unless asked for.
+
+To undo, delete the shim and rename `libcef_real.dll` back. A Steam update or file check puts the
+original back.

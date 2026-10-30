@@ -59,6 +59,7 @@ __declspec(dllimport) BOOL WINAPI FlushInstructionCache(HANDLE, const void*, siz
 __declspec(dllimport) BOOL WINAPI Module32FirstW(HANDLE, void*);
 __declspec(dllimport) BOOL WINAPI Module32NextW(HANDLE, void*);
 __declspec(dllimport) void* WINAPI VirtualAlloc(void*, size_t, DWORD, DWORD);
+__declspec(dllimport) DWORD WINAPI GetEnvironmentVariableW(const WCHAR*, WCHAR*, DWORD);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -122,6 +123,7 @@ static BOOL g_vk_reuse;
 static BOOL g_no_shared_texture;
 static BOOL g_keep_begin_frame;
 static BOOL g_no_overlay;
+static BOOL g_save_frames;
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -392,7 +394,7 @@ static void DumpThreads(void) {
   Log("libcef-shim: thread dump ends\n");
 }
 
-static DWORD g_dump_seconds = 40;
+static DWORD g_dump_seconds;  // shim:dump-after=N; a dump stops every thread for a moment
 
 static DWORD WINAPI DumpLater(void* unused) {
   (void)unused;
@@ -449,6 +451,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char save_frames[] = "shim:save-frames";
+      i = 0;
+      while (save_frames[i] && p[i] == save_frames[i]) ++i;
+      if (!save_frames[i]) g_save_frames = 1;
       static const char no_overlay[] = "shim:no-overlay";
       i = 0;
       while (no_overlay[i] && p[i] == no_overlay[i]) ++i;
@@ -498,6 +504,45 @@ __attribute__((noinline)) static void LoadConfig(void) {
     }
   }
   CloseHandle(file);
+}
+
+// BeamNG's own log (its timings, warnings and errors), copied beside this DLL as
+// libcef_shim_beamng.log: the game's user folder is in the bottle, which FTP cannot read. Called every
+// half minute from the shim's background thread.
+static void CopyGameLog(void) {
+  static unsigned char buffer[65536];
+  static BOOL missing_logged;
+  static const char variable[] = "LOCALAPPDATA";
+  static const char tail[] = "\\BeamNG\\BeamNG.drive\\current\\beamng.log";
+  static const char name[] = "libcef_shim_beamng.log";
+  WCHAR from[512], to[1024], key[16];
+  for (size_t i = 0; i < sizeof(variable); ++i) key[i] = (WCHAR)variable[i];
+  DWORD n = GetEnvironmentVariableW(key, from, 400);
+  if (!n || n >= 400) return;
+  for (size_t i = 0; tail[i]; ++i) from[n++] = (WCHAR)tail[i];
+  from[n] = 0;
+  HANDLE in = CreateFileW(from, GENERIC_READ, 0x7 /* FILE_SHARE_READ | WRITE | DELETE */, NULL, OPEN_EXISTING, 0,
+                          NULL);
+  if (in == INVALID_HANDLE_VALUE) {
+    if (!missing_logged) LogWide("libcef-shim: BeamNG's log could not be opened: ", from, n);
+    missing_logged = 1;
+    return;
+  }
+  DWORD m = ModuleDirectory(to, 980);
+  for (size_t i = 0; name[i]; ++i) to[m++] = (WCHAR)name[i];
+  to[m] = 0;
+  HANDLE out = CreateFileW(to, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */, 0x80,
+                           NULL);
+  if (out != INVALID_HANDLE_VALUE) {
+    DWORD got, written;
+    uint64_t total = 0;
+    while (total < (64ull << 20) && ReadFile(in, buffer, sizeof(buffer), &got, NULL) && got) {
+      WriteFile(out, buffer, got, &written, NULL);
+      total += got;
+    }
+    CloseHandle(out);
+  }
+  CloseHandle(in);
 }
 
 // This CEF's string type. The C API passes cef_string_t, whose characters are UTF-16 in CEF's
@@ -794,7 +839,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 16)\n");
+    Log("libcef-shim: loaded (build 17)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
