@@ -4787,6 +4787,28 @@ bool Simulation::scenario(const std::string& name) {
             manage_tabs_[ManageTab::Uninstall].selected = {state_.games[1].id, state_.games[2].id};
             state_.navigation.focus_key = "manage-toggle-" + ToKey(state_.games[2].id);
         }
+    } else if (name == "queue-refused") {
+        // A downloaded game Playden refused to prepare (SteamStub it can't unpack), in Queue's Preparation with its
+        // actions open: Try again, Game details and Uninstall.
+        if (state_.games.size() < 5) return false;
+        const auto id = state_.games[4].id;
+        state_.account().authentication = AuthState::SignedIn;
+        state_.navigation.route = Route::Downloads;
+        state_.navigation.modals.clear();
+        state_.jobs.clear();
+        state_.runtime_games.clear();
+        state_.preparation_queue = {};
+        state_.queue_expanded.clear();
+        if (!is_installed(state_, id)) state_.installations.push_back({id, "internal", 1'900'000'000});
+        LiveRuntimeGame runtime;
+        runtime.game_id = id;
+        runtime.status = "Not prepared";
+        runtime.can_prepare = true;
+        state_.runtime_games[id] = runtime;
+        state_.preparation_queue.refused[id] = "This game's program has Steam DRM in a form Playden can't unpack yet.";
+        state_.navigation.focus_key = "prep-attn-" + ToKey(id);
+        rebuild_view();
+        activate();
     } else if (name.rfind("queue-", 0) == 0) {
         // Queue in the states of its mockup: each workflow empty, one game, or one running and three waiting,
         // with or without finished entries.
@@ -8545,6 +8567,18 @@ void Simulation::activate() {
             else if (runtime != state_.runtime_games.end() && runtime->second.can_prepare && !runtime->second.awaiting_registration)
                 actions.push_back("prep-retry-" + id);
             actions.push_back("prep-open-" + id);
+            // A game that can't be prepared (SteamStub Playden can't unpack) goes from here too, as from its page's
+            // More: Uninstall, or Remove from library for an imported game playing from its folder. Both act on the
+            // selected game; Remove from library on the page's game, and goes back to Queue once confirmed.
+            const bool in_place = external_game(selected.game_id) != nullptr;
+            if (in_place || is_installed(state_, selected.game_id)) {
+                state_.navigation.selected_game_id = selected.game_id;
+                if (in_place) {
+                    state_.navigation.detail_id = selected.game_id;
+                    state_.navigation.detail_origin = Route::Downloads;
+                }
+                actions.push_back(in_place ? "import-remove" : "uninstall");
+            }
         } else if (key.rfind("prep-active-", 0) == 0) {
             actions.push_back("prep-open-" + id);
         } else {
@@ -8888,6 +8922,8 @@ void Simulation::activate() {
         state_.navigation.route = Route::Downloads;
     } else if (action_name == "uninstall" || action_name == "reset-confirm" || action_name == "signout-confirm" || action_name == "quit-confirm" || action_name == "quit-game") {
         pending_destructive_action_ = action_name;
+        // The game is fixed now: the selection can change under the dialog (an organization load picks another).
+        if (action_name == "uninstall") destructive_target_ = state_.navigation.selected_game_id;
         std::string title;
         if (action_name == "uninstall") title = "Uninstall this fixture game? Saves are preserved.";
         else if (action_name == "reset-confirm") title = "Reset preferences and organization? Installs, saves, and history remain.";
@@ -9091,6 +9127,7 @@ void Simulation::activate() {
         const auto* game = find_game(state_, id);
         if (!game || !external_game(id)) return;
         pending_destructive_action_ = action_name;
+        destructive_target_ = id;
         ModalEntry confirmation{"confirmation", "Remove " + game->title + " from the library?", state_.navigation.focus_key,
                                 {"cancel", "confirm-destructive"}, 0, true};
         confirmation.body = "The game's folder and files stay where they are, and Import games can add it again. Its PS5 "
@@ -9203,7 +9240,8 @@ void Simulation::activate() {
             request_maintenance(state_.navigation.selected_game_id, kind);
         }
     } else if (action_name == "confirm-destructive" && pending_destructive_action_ == "import-remove") {
-        const auto id = state_.navigation.detail_id.value_or(state_.navigation.selected_game_id);
+        const auto id = destructive_target_.value_or(state_.navigation.detail_id.value_or(state_.navigation.selected_game_id));
+        destructive_target_.reset();
         pending_destructive_action_.clear();
         state_.navigation.modals.clear();
         RequestImport({ImportRequestKind::Remove, id});
@@ -9227,7 +9265,8 @@ void Simulation::activate() {
     } else if (action_name == "confirm-destructive" && live() &&
                (pending_destructive_action_.rfind("job-cancel-", 0) == 0 || pending_destructive_action_ == "uninstall")) {
         if (pending_destructive_action_ == "uninstall") {
-            request_uninstall(state_.navigation.selected_game_id, uninstall_delete_saves_, false);
+            request_uninstall(destructive_target_.value_or(state_.navigation.selected_game_id), uninstall_delete_saves_, false);
+            destructive_target_.reset();
             uninstall_delete_saves_ = false;
         } else if (const auto* job = find_job(state_, pending_destructive_action_.substr(11))) {
             pending_install_requests_.push_back({InstallRequestKind::Cancel, job->game_id});

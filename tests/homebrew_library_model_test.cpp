@@ -3119,6 +3119,58 @@ void live_queue_lists_preparations_needing_attention() {
           "closed, it counts what needs attention apart from the queue");
 }
 
+// A game Playden refused to prepare (SteamStub it can't unpack) is not stuck in Queue: its actions there uninstall it,
+// or take an imported game playing from its folder out of the library, after the same question as its page asks.
+void live_refused_preparation_offers_uninstall() {
+    using namespace playden::homebrew;
+    auto model = make_live();
+    model.UpdateAccount({AuthState::SignedIn, "123", "Synthetic", {}, {}, true});
+    const auto local = playden::GameId::Local("6d1f3a52-0c55-4f3e-9b2a-5d1c7e0a9f11");
+    check(model.UpdateLibrary({{game(SteamId(36), "Doom 3"), game(SteamId(37), "Elsewhere")}, false, {}, false, false, {}}),
+          "library loaded");
+    LibraryUpdate imported{{game(local, "Rally")}, false, {}, false, false, {}};
+    imported.source = playden::Store::kLocal;
+    check(model.UpdateLibrary(imported), "imported library");
+    model.UpdateInstalls({}, {{SteamId(36), 600'000'000}});
+    model.UpdateExternalGames({{local, "usb0", true, ""}});
+    const std::string drm = "This game's program has Steam DRM in a form Playden can't unpack yet.";
+    LiveRuntimeGame doom; doom.game_id = SteamId(36); doom.status = "Not prepared"; doom.can_prepare = true;
+    LiveRuntimeGame rally; rally.game_id = local; rally.status = "Not prepared"; rally.can_prepare = true;
+    LiveRuntimeGame other; other.game_id = SteamId(37); other.status = "Not prepared"; other.can_prepare = true;
+    model.UpdateRuntime(RuntimeState::Ready, {doom, rally, other});
+    model.UpdatePreparationQueue({std::nullopt, {}, {}, {{SteamId(36), drm}, {local, drm}, {SteamId(37), drm}}});
+    model.action("r1");
+    model.action("r1");
+    activate(model, "prep-attn-36");
+    check(has_row(model, "prep-retry-36") && has_row(model, "prep-open-36") && has_row(model, "uninstall") &&
+              find_row(model, "uninstall")->title == "Uninstall" && find_row(model, "uninstall")->enabled,
+          "a refused installed game can be uninstalled from Queue");
+    activate(model, "uninstall");
+    check(model.state().navigation.modals.size() == 2 && model.state().navigation.modals.back().title == "Uninstall this game?",
+          "it asks first, as the game page does");
+    while (!model.state().navigation.modals.empty()) model.action("circle");
+    check(model.state().navigation.route == Route::Downloads && model.TakeInstallRequests().empty(), "Cancel asks for nothing");
+    activate(model, "prep-attn-36");
+    activate(model, "uninstall");
+    activate(model, "confirm-destructive");
+    const auto requests = model.TakeInstallRequests();
+    check(requests.size() == 1 && requests[0].kind == InstallRequestKind::Uninstall && requests[0].game_id == SteamId(36) &&
+              model.state().navigation.modals.empty() && model.state().navigation.route == Route::Downloads,
+          "confirmed, that game is uninstalled and Queue stays open");
+    // An imported game playing from its folder leaves the library instead.
+    activate(model, "prep-attn-" + playden::ToKey(local));
+    check(has_row(model, "import-remove") && !has_row(model, "uninstall"), "an imported game is removed from the library");
+    activate(model, "import-remove");
+    activate(model, "confirm-destructive");
+    const auto removed = model.TakeImportRequests();
+    check(removed.size() == 1 && removed[0].kind == ImportRequestKind::Remove && removed[0].game_id == local &&
+              model.state().navigation.route == Route::Downloads,
+          "confirmed, that game leaves the library and Queue stays open");
+    // A game without files on this console has nothing to uninstall.
+    activate(model, "prep-attn-37");
+    check(!has_row(model, "uninstall") && !has_row(model, "import-remove"), "nothing to remove without its files");
+}
+
 // A setup an earlier kit left (its title or bottle from that kit) can't be finished by Try again: Queue and the
 // game page offer Recreate bottle instead, say so in plain words, and ask before it runs.
 void live_setup_from_an_earlier_kit_offers_recreate() {
@@ -3990,6 +4042,7 @@ int main() {
     live_queue_counts_copies();
     live_queue_history_and_empty_states();
     live_queue_lists_preparations_needing_attention();
+    live_refused_preparation_offers_uninstall();
     live_setup_from_an_earlier_kit_offers_recreate();
     live_queue_lists_uninstalls();
     live_details_prepare_next();

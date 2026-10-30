@@ -1470,6 +1470,18 @@ void synthetic_download_servers(const std::filesystem::path& fixtures, const std
     for (const auto& item : restarted.view().rows)
         if (item.key == "settings-download-server") check(item.value == "Fastest", "the row shows Fastest");
     // Queue: the download names its server before the rate.
+    // Queue: a game Playden refused to prepare offers Uninstall beside Try again.
+    check(restarted.scenario("queue-refused"), "refused preparation scenario exists");
+    {
+        const auto& modals = restarted.state().navigation.modals;
+        check(!modals.empty() && modals.back().id == "prep-actions" &&
+                  std::find(modals.back().action_keys.begin(), modals.back().action_keys.end(), "uninstall") !=
+                      modals.back().action_keys.end(),
+              "the refused game's actions include Uninstall");
+        check(restarted.action("focus:uninstall") && restarted.action("cross") &&
+                  restarted.state().navigation.modals.back().id == "confirmation",
+              "Uninstall asks first");
+    }
     check(restarted.scenario("queue-one-download"), "queue scenario exists");
     check(restarted.state().jobs.front().server_name == "Fastly" &&
               playden::homebrew::FormatDownloadRate(restarted.state().jobs.front().bytes_per_second,

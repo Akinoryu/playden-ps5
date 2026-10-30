@@ -1107,6 +1107,8 @@ private:
     ViewData route_view_;
     std::string last_error_;
     std::string pending_destructive_action_;
+    // The game a live Uninstall or Remove from library confirmation acts on, fixed when it opens.
+    std::optional<GameId> destructive_target_;
     std::vector<std::string> self_update_requests_;
     LiveDownloadServers download_servers_;
     std::vector<DownloadServerRequest> download_server_requests_;
