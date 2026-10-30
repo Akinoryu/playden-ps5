@@ -96,6 +96,7 @@ static const char* const kDefaultSwitches[] = {"single-process", "in-process-gpu
 static HMODULE g_real;
 static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line_t*);
 static BOOL g_no_hook;
+static BOOL g_keep_settings;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -237,6 +238,10 @@ static void LoadConfig(void) {
       size_t i = 0;
       while (option[i] && p[i] == option[i]) ++i;
       if (!option[i]) g_no_hook = 1;
+      static const char keep[] = "shim:keep-settings";
+      i = 0;
+      while (keep[i] && p[i] == keep[i]) ++i;
+      if (!keep[i]) g_keep_settings = 1;
     }
   }
   CloseHandle(file);
@@ -299,6 +304,42 @@ static void AppendConfigured(cef_command_line_t* command_line) {
 
 static void AppendAndLog(cef_command_line_t* command_line);
 
+// "prefix" and the first code units of a CEF string in hex, to see what the string really holds.
+static void LogHex(const char* prefix, const cef_string_t* text) {
+  char line[400];
+  size_t n = 0, p = Length(prefix);
+  for (size_t i = 0; i < p && n < 80; ++i) line[n++] = prefix[i];
+  size_t count = text && text->str ? (text->length < 40 ? text->length : 40) : 0;
+  for (size_t i = 0; i < count; ++i) {
+    WCHAR c = text->str[i];
+    line[n++] = ' ';
+    for (int shift = 12; shift >= 0; shift -= 4) line[n++] = "0123456789abcdef"[(c >> shift) & 15];
+  }
+  line[n++] = '\n';
+  line[n] = 0;
+  Log(line);
+  LogNumber("libcef-shim:   string length ", text ? text->length : 0);
+}
+
+// Logs whether each wanted switch is on command_line.
+static void CheckSwitches(const char* where, cef_command_line_t* command_line) {
+  static const char* const names[] = {"single-process", "in-process-gpu", "no-sandbox", NULL};
+  for (int k = 0; names[k]; ++k) {
+    WCHAR wide[32];
+    size_t length = Length(names[k]);
+    for (size_t i = 0; i < length; ++i) wide[i] = (unsigned char)names[k][i];
+    cef_string_t name = {wide, length, NULL};
+    char line[160];
+    size_t n = 0;
+    const char* parts[] = {"libcef-shim: ", where, ": ", names[k],
+                           command_line->has_switch(command_line, &name) ? " present\n" : " MISSING\n", NULL};
+    for (int j = 0; parts[j]; ++j)
+      for (const char* c = parts[j]; *c && n < sizeof(line) - 1; ++c) line[n++] = *c;
+    line[n] = 0;
+    Log(line);
+  }
+}
+
 static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_string_t* process_type,
                                                 cef_command_line_t* command_line) {
   Log("libcef-shim: CEF asked for the command line; calling BeamNG's handler first\n");
@@ -329,11 +370,13 @@ static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_strin
 
 static void AppendAndLog(cef_command_line_t* command_line) {
   AppendConfigured(command_line);
+  CheckSwitches("after appending", command_line);
   cef_string_userfree_free_fn free_string =
       (cef_string_userfree_free_fn)GetProcAddress(g_real, "cef_string_userfree_utf16_free");
   cef_string_t* line = command_line->get_command_line_string(command_line);
   if (line) {
     LogWide("libcef-shim: command line now: ", line->str, line->length);
+    LogHex("libcef-shim: command line starts with", line);
     if (free_string) free_string(line);
   }
 }
@@ -386,9 +429,37 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
       Log("libcef-shim: could not hook OnBeforeCommandLineProcessing\n");
     }
   }
+  // cef_settings_t: size, no_sandbox, three strings, then four ints (CEF 150).
+  static _Alignas(16) unsigned char settings_copy[2048];
+  const unsigned char* given = (const unsigned char*)settings;
+  size_t settings_size = given ? *(const size_t*)given : 0;
+  if (given && settings_size >= 104 && settings_size <= sizeof(settings_copy)) {
+    for (size_t i = 0; i < settings_size; ++i) settings_copy[i] = given[i];
+    int* ints = (int*)(settings_copy + 88);
+    LogNumber("libcef-shim: settings size ", settings_size);
+    LogNumber("libcef-shim: settings no_sandbox ", (uintptr_t)*(int*)(settings_copy + 8));
+    LogNumber("libcef-shim: settings multi_threaded_message_loop ", (uintptr_t)ints[0]);
+    LogNumber("libcef-shim: settings external_message_pump ", (uintptr_t)ints[1]);
+    LogNumber("libcef-shim: settings windowless_rendering_enabled ", (uintptr_t)ints[2]);
+    LogNumber("libcef-shim: settings command_line_args_disabled ", (uintptr_t)ints[3]);
+    if (!g_keep_settings && ints[3]) {
+      ints[3] = 0;  // let CEF read the switches from the game's own command line too
+      Log("libcef-shim: cleared command_line_args_disabled\n");
+    }
+    settings = settings_copy;
+  } else {
+    LogNumber("libcef-shim: settings left alone, size ", settings_size);
+  }
   Log("libcef-shim: calling the real cef_initialize\n");
   int result = real(args, settings, app, sandbox_info);
   LogNumber("libcef-shim: cef_initialize returned ", (uintptr_t)result);
+  typedef cef_command_line_t* (*get_global_fn)(void);
+  get_global_fn get_global = (get_global_fn)GetProcAddress(g_real, "cef_command_line_get_global");
+  cef_command_line_t* global = get_global ? get_global() : NULL;
+  if (global) {
+    CheckSwitches("global command line after cef_initialize", global);
+    ((int (*)(void*))global->base.release)(global);
+  }
   return result;
 }
 
@@ -396,7 +467,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
-    Log("libcef-shim: loaded (build 3)\n");
+    Log("libcef-shim: loaded (build 4)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
   }
   return 1;
