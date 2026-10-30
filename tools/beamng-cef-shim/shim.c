@@ -55,6 +55,7 @@ __declspec(dllimport) DWORD WINAPI ResumeThread(HANDLE);
 __declspec(dllimport) BOOL WINAPI GetThreadContext(HANDLE, void*);
 __declspec(dllimport) HMODULE WINAPI GetModuleHandleW(const WCHAR*);
 __declspec(dllimport) uint64_t WINAPI GetTickCount64(void);
+__declspec(dllimport) BOOL WINAPI FlushInstructionCache(HANDLE, const void*, size_t);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -92,6 +93,7 @@ typedef struct cef_command_line_t {
   void* get_switches;
   void (*append_switch)(struct cef_command_line_t*, const cef_string_t*);
   void (*append_switch_with_value)(struct cef_command_line_t*, const cef_string_t*, const cef_string_t*);
+  void (*remove_switch)(struct cef_command_line_t*, const cef_string_t*);  // CEF 141 and later
 } cef_command_line_t;
 
 typedef struct cef_app_t {
@@ -109,6 +111,7 @@ static HMODULE g_real;
 static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line_t*);
 static BOOL g_no_hook;
 static BOOL g_keep_settings;
+static BOOL g_keep_profiler;
 static BOOL g_vk_fix;
 static char g_config[4096];
 static DWORD g_config_size;
@@ -374,6 +377,10 @@ static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char keep_profiler[] = "shim:keep-profiler";
+      i = 0;
+      while (keep_profiler[i] && p[i] == keep_profiler[i]) ++i;
+      if (!keep_profiler[i]) g_keep_profiler = 1;
       static const char keep[] = "shim:keep-settings";
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
@@ -504,8 +511,25 @@ static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_strin
   ((release_fn)command_line->base.release)(command_line);
 }
 
+// Chromium's stack sampling profiler, which BeamNG turns on, reads other threads' stacks; on the
+// PS5 a stack page not yet committed faults (read access at 0x1000114000) and ends the game.
+static void RemoveStackProfiler(cef_command_line_t* command_line) {
+  static const WCHAR wide[] = {'s', 't', 'a', 'r', 't', '-', 's', 't', 'a', 'c', 'k', '-',
+                               'p', 'r', 'o', 'f', 'i', 'l', 'e', 'r'};
+  cef_string_t name = {(WCHAR*)wide, 20, NULL};
+  if (!command_line->has_switch(command_line, &name)) return;
+  if (command_line->base.size < 0xb0) {
+    Log("libcef-shim: start-stack-profiler is on and this CEF cannot remove it\n");
+    return;
+  }
+  command_line->remove_switch(command_line, &name);
+  Log(command_line->has_switch(command_line, &name) ? "libcef-shim: start-stack-profiler is still on\n"
+                                                   : "libcef-shim: removed start-stack-profiler\n");
+}
+
 static void AppendAndLog(cef_command_line_t* command_line) {
   AppendConfigured(command_line);
+  if (!g_keep_profiler) RemoveStackProfiler(command_line);
   CheckSwitches("after appending", command_line);
   cef_string_userfree_free_fn free_string =
       (cef_string_userfree_free_fn)GetProcAddress(g_real, "cef_string_userfree_utf16_free");
@@ -616,7 +640,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 7)\n");
+    Log("libcef-shim: loaded (build 8)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

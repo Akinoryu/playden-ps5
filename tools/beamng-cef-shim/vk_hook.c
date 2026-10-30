@@ -204,7 +204,11 @@ static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapcha
   }
 }
 
+static volatile long g_vk_calls;
+
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
+  long calls = __sync_add_and_fetch(&g_vk_calls, 1);
+  if (calls == 1 || calls == 1000 || calls == 100000) VkLog("calls seen so far, latest code", calls, code, 0);
   if (code == g_code_acquire) {
     struct {
       uint64_t device, swapchain, timeout, semaphore, fence;
@@ -338,16 +342,67 @@ static DWORD WINAPI HookVulkanLater(void* unused) {
     VkLog(names[i], *codes[i], 0, 0);
   }
   g_queue_present = (int32_t (*)(uint64_t, const void*))GetProcAddress(module, "vkQueuePresentKHR");
-  DWORD old_protect;
-  if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protect)) {
-    Log("libcef-shim: vk: could not write the dispatcher slot\n");
-    return 0;
-  }
-  g_dispatcher_slot = slot;
   g_real_dispatcher = *slot;
-  __sync_synchronize();
-  *slot = VkDispatcher;
-  VirtualProtect(slot, sizeof(*slot), old_protect, &old_protect);
+  g_dispatcher_slot = slot;
+  VkLog("module, slot, dispatcher", (uint64_t)(uintptr_t)module, (uint64_t)(uintptr_t)slot,
+        (uint64_t)(uintptr_t)g_real_dispatcher);
+
+  // Each thunk calls through the slot: point its call straight at VkDispatcher ("call rel32"),
+  // and the present thunk's helper too, whose calls through the slot are a call and a jump.
+  int patched = 0;
+  for (int i = 0; i < 5; ++i) {
+    unsigned char* thunk = GetProcAddress(module, names[i]);
+    unsigned char* sites[4];
+    int site_count = 0;
+    unsigned char* scan[2] = {thunk, NULL};
+    for (int k = 0; k < 0x60; ++k)
+      if (i == 4 && thunk[k] == 0xe8) {  // the present thunk's call to its helper
+        scan[1] = thunk + k + 5 + *(int32_t*)(thunk + k + 1);
+        break;
+      }
+    for (int part = 0; part < 2; ++part) {
+      unsigned char* code = scan[part];
+      if (!code) continue;
+      for (int k = 0; k < 0x70 && site_count < 4; ++k)
+        if (code[k] == 0xff && (code[k + 1] == 0x15 || code[k + 1] == 0x25) &&
+            code + k + 6 + *(int32_t*)(code + k + 2) == (unsigned char*)slot)
+          sites[site_count++] = code + k;
+    }
+    for (int k = 0; k < site_count; ++k) {
+      unsigned char* site = sites[k];
+      int64_t distance = (int64_t)((uintptr_t)VkDispatcher - (uintptr_t)(site + 5));
+      if (distance != (int32_t)distance) {
+        VkLog("call site too far from the shim", (uint64_t)(uintptr_t)site, 0, 0);
+        continue;
+      }
+      DWORD old_protect;
+      if (!VirtualProtect(site, 6, 0x40 /* PAGE_EXECUTE_READWRITE */, &old_protect)) {
+        VkLog("could not write call site", (uint64_t)(uintptr_t)site, 0, 0);
+        continue;
+      }
+      unsigned char bytes[6] = {site[1] == 0x15 ? 0xe8 : 0xe9, 0, 0, 0, 0, 0x90};
+      *(int32_t*)(bytes + 1) = (int32_t)distance;
+      // A thread may run this code meanwhile: park it on a two-byte jump to itself, write the
+      // rest, then put the new first two bytes in place.
+      *(volatile uint16_t*)site = 0xfeeb;
+      __sync_synchronize();
+      for (int b = 2; b < 6; ++b) site[b] = bytes[b];
+      __sync_synchronize();
+      *(volatile uint16_t*)site = (uint16_t)(bytes[0] | bytes[1] << 8);
+      VirtualProtect(site, 6, old_protect, &old_protect);
+      FlushInstructionCache((HANDLE)(intptr_t)-1, site, 6);
+      ++patched;
+    }
+  }
+  VkLog("call sites patched", patched, 0, 0);
+
+  DWORD old_protect;
+  if (VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protect)) {
+    __sync_synchronize();
+    *slot = VkDispatcher;
+    VirtualProtect(slot, sizeof(*slot), old_protect, &old_protect);
+  }
+  VkLog("slot now, shim dispatcher", (uint64_t)(uintptr_t)*(void* volatile*)slot, (uint64_t)(uintptr_t)VkDispatcher, 0);
   Log(g_vk_fix ? "libcef-shim: vk: swapchain watch on, with the fix\n" : "libcef-shim: vk: swapchain watch on, log only\n");
   return 0;
 }
