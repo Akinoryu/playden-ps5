@@ -107,6 +107,7 @@ static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count,
   if (buffer && width > 0 && height > 0 && width <= 4096 && height <= 4096 &&
       (count == 20 || count == 100 || count == 300 || count == 600))
     SaveFrame(count, buffer, width, height);
+  if (buffer && type == 0 /* PET_VIEW */) OverlayTakeFrame(buffer, width, height, opaque);
   if (count <= 5 || count % 600 == 0) {
     VkLog("cef paint: number, size, type", count, ((uint64_t)(uint32_t)width << 32) | (uint32_t)height, type);
     VkLog("cef paint: of 144 samples, coloured, opaque", (uint64_t)visible, (uint64_t)opaque, 0);

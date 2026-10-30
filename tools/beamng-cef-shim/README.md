@@ -36,6 +36,14 @@ those leftover images on the replaced swapchains, which frees their buffers. `sh
 keeps the log and turns that off. A Mesa fix in PS5_Mesa's `wsi_common_videoout.c` would make
 this unnecessary.
 
+## Menu overlay
+
+On the console CEF draws BeamNG's menus correctly but BeamNG's own frames stay black. While CEF's
+latest frame is opaque (loading screens, menus), the shim copies it into each swapchain image just
+before BeamNG presents it (`overlay.c`); see-through frames (the in-game HUD) leave BeamNG's frame
+alone. `shim:no-overlay` turns it off. `test/run.sh` checks the overlay on real Vulkan (Mesa's
+lavapipe under Wine, with the Khronos validation layer).
+
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). To undo, delete the
 shim and rename `libcef_real.dll` back. A Steam update or file check puts the original back.

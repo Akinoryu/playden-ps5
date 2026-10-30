@@ -121,6 +121,7 @@ static BOOL g_vk_fix;
 static BOOL g_vk_reuse;
 static BOOL g_no_shared_texture;
 static BOOL g_keep_begin_frame;
+static BOOL g_no_overlay;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -444,6 +445,10 @@ static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char no_overlay[] = "shim:no-overlay";
+      i = 0;
+      while (no_overlay[i] && p[i] == no_overlay[i]) ++i;
+      if (!no_overlay[i]) g_no_overlay = 1;
       static const char keep_begin[] = "shim:keep-begin-frame";
       i = 0;
       while (keep_begin[i] && p[i] == keep_begin[i]) ++i;
@@ -754,6 +759,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 }
 
 #include "vk_hook.c"
+#include "overlay.c"
 #include "paint_hook.c"
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
@@ -767,7 +773,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 14)\n");
+    Log("libcef-shim: loaded (build 15)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

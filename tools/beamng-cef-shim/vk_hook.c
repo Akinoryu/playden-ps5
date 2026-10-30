@@ -121,6 +121,14 @@ typedef struct {
   int32_t* results;
 } present_info_t;
 
+// overlay.c
+static const present_info_t* OverlayPresent(void* queue, const present_info_t* info);
+static void OverlayNoteQueue(void* queue, uint32_t family);
+static void OverlayNotePhysical(void* physical);
+static void OverlayNoteSwapchain(void* device, uint64_t swapchain, uint32_t width, uint32_t height, uint32_t format);
+static void OverlayForgetSwapchain(uint64_t swapchain);
+static unsigned g_code_get_queue = ~0u, g_code_get_queue2 = ~0u, g_code_surface_caps = ~0u;
+
 // Presents every image still acquired on a replaced swapchain, which frees its
 // display buffer. Called with the lock not held. Goes through winevulkan's own
 // vkQueuePresentKHR, which does more around the Unix call than the call itself.
@@ -305,7 +313,11 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       const present_info_t* info;
       int32_t result;
     }* p = args;
+    const present_info_t* game_info = p->info;
+    const present_info_t* overlay_info = OverlayPresent((void*)(uintptr_t)p->queue, p->info);
+    if (overlay_info) p->info = overlay_info;
     long status = RealFor(handle)(handle, code, args);
+    p->info = game_info;
     g_present_handle = handle;
     NotePresent(p->queue, p->info, status ? -1 : p->result);
     for (uint32_t i = 0; !status && p->info && i < p->info->swapchain_count; ++i)
@@ -363,9 +375,19 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       VkLog("destroying the kept swapchain first", kept_handles[i], 0, 0);
       RealFor(handle)(handle, g_code_destroy, &destroy);
     }
+    // The overlay copies into the images: they need TRANSFER_DST usage.
+    unsigned char info_copy[104];
+    const unsigned char* game_info = p->info;
+    for (int i = 0; i < 104; ++i) info_copy[i] = game_info[i];
+    *(uint32_t*)(info_copy + 56) |= 0x2 /* VK_IMAGE_USAGE_TRANSFER_DST_BIT */;
+    p->info = info_copy;
     long status = RealFor(handle)(handle, code, args);
+    p->info = game_info;
+    if (!status && p->result == 0 && p->swapchain)
+      OverlayNoteSwapchain((void*)(uintptr_t)p->device, *p->swapchain, width, height, format);
     VkLock();
     VkLog("create swapchain: old, size, result", old, ((uint64_t)width << 32) | height, (uint32_t)p->result);
+    VkLog("  usage asked, format", usage, format, 0);
     if (!status && p->result == 0 && p->swapchain) {
       chain_t* previous = FindChain(g_current_chain);
       if (previous) previous->retired = 1;
@@ -407,6 +429,31 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
     }
     if (g_current_chain == p->swapchain) g_current_chain = 0;
     VkUnlock();
+    OverlayForgetSwapchain(p->swapchain);
+    return RealFor(handle)(handle, code, args);
+  }
+  if (code == g_code_get_queue) {
+    struct {
+      void* device;
+      uint32_t family, index;
+      void** queue;
+    }* p = args;
+    long status = RealFor(handle)(handle, code, args);
+    if (!status && p->queue && *p->queue) OverlayNoteQueue(*p->queue, p->family);
+    return status;
+  }
+  if (code == g_code_get_queue2) {
+    struct {
+      void* device;
+      const unsigned char* info;  // VkDeviceQueueInfo2: queueFamilyIndex at 20
+      void** queue;
+    }* p = args;
+    long status = RealFor(handle)(handle, code, args);
+    if (!status && p->queue && *p->queue && p->info) OverlayNoteQueue(*p->queue, *(const uint32_t*)(p->info + 20));
+    return status;
+  }
+  if (code == g_code_surface_caps) {
+    OverlayNotePhysical(*(void**)args);  // its first parameter is the physical device
     return RealFor(handle)(handle, code, args);
   }
   return RealFor(handle)(handle, code, args);
@@ -452,6 +499,19 @@ static void HookModule(HMODULE module) {
   }
   g_code_acquire = codes[0], g_code_acquire2 = codes[1], g_code_create = codes[2], g_code_destroy = codes[3];
   g_code_present = codes[4];
+  // For the overlay: the calls that name a queue's family and the physical device.
+  const char* extra_names[] = {"vkGetDeviceQueue", "vkGetDeviceQueue2", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"};
+  static const unsigned extra_expected[] = {0x211, 0x212, 0x267};
+  unsigned* extra_codes[] = {&g_code_get_queue, &g_code_get_queue2, &g_code_surface_caps};
+  for (int i = 0; i < 3; ++i) {
+    const unsigned char* thunk = GetProcAddress(module, extra_names[i]);
+    unsigned extra_code = ~0u;
+    unix_call_fn* extra_slot = slot;
+    if (thunk && DecodeThunk(thunk, 0, &extra_code, &extra_slot) && extra_slot == slot && extra_code == extra_expected[i])
+      *extra_codes[i] = extra_code;
+    else
+      VkLog("overlay: call not as expected, left alone", (uint64_t)i, extra_code, 0);
+  }
 
   // The unixlib handle: "mov rcx, [rip + rel32]" in the acquire thunk.
   const uint64_t* handle_cell = NULL;
