@@ -68,6 +68,15 @@ you sign in:
 - **Your Steam session stays on the console.** Playden stores a Steam sign-in token on the PS5, **without encryption**.
   On a jailbroken console, anyone with file access (for example through FTP) can read it. To keep it off the console, turn off "Stay
   signed in", then sign in again each time Playden starts.
+- **It replaces a game's Steam API.** When Playden prepares a game, it puts
+  [gbe_fork](https://github.com/Detanup01/gbe_fork), a Steamworks emulator, in place of the game's `steam_api.dll` and
+  `steam_api64.dll`. The original files are kept next to them as `.orig`. gbe_fork is set to offline mode with its
+  networking turned off. The game then runs without the Steam client and without Steam's checks. This is the default
+  for most games; Game settings › Steam features › **Game's own files** puts the original files back. Replacing a
+  game's Steam API can be against the Steam Subscriber Agreement. In some countries, it can also count as getting
+  around a protection measure. Decide for yourself if you accept this.
+- **No online play.** Online multiplayer does not work, and games with anti-cheat do not work. If you want to try
+  them anyway, use a separate Steam account.
 - **It writes to your Steam Cloud saves.** Playden uploads saves after you play. A bug can overwrite good saves with
   older or broken ones. Back up saves you care about. When Playden shows a conflict, read it before you choose.
 - **It needs a jailbroken console with root-level helpers.** A running game can get elevated rights on the console.
@@ -312,6 +321,7 @@ build/homebrew-host/playden-homebrew --simulation --scenario signed-out
 
 ## Known issues
 
+- Online multiplayer and games with anti-cheat do not work. See [Before you use it](#before-you-use-it).
 - Uninstall games from Playden. Title folders belong to Playden; FTP and file managers can't delete them.
   Leftover titles appear in Settings › Storage. Deleting a leftover removes its title folder and Home tile;
   its saves and settings move to Kept game data, where you can delete them or get them back by installing the game
@@ -407,9 +417,14 @@ I keep a fork of each, with Playden's changes on the fork's `main` branch, and s
 - [Wine](https://www.winehq.org/) — runs Windows programs.
 - [DXVK](https://github.com/doitsujin/dxvk) — turns Direct3D 8–11 into Vulkan.
 - [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) — turns Direct3D 12 into Vulkan (kit 0.11 and later).
-- [PS5_Mesa](https://github.com/mpereiraesaa/PS5_Mesa) and [PS5_Vulkan](https://github.com/mpereiraesaa/PS5_Vulkan) —
-  [Mesa](https://mesa3d.org/) for the PS5: RADV, the AMD Vulkan driver, for the PS5 GPU, and Zink with WGL, which
-  runs Windows OpenGL games on top of Vulkan.
+- [PS5_Mesa](https://github.com/mihawk-99/PS5_Mesa) and [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) by
+  Mihawk — [Mesa](https://mesa3d.org/) for the PS5: RADV, the AMD Vulkan driver, for the PS5 GPU, and Zink with WGL,
+  which runs Windows OpenGL games on top of Vulkan. The kit builds Zink from
+  [mpereiraesaa/PS5_Mesa](https://github.com/mpereiraesaa/PS5_Mesa), and RADV from the fork
+  [leolobato/PS5_Mesa](https://github.com/leolobato/PS5_Mesa) with
+  [mpereiraesaa/PS5_Vulkan](https://github.com/mpereiraesaa/PS5_Vulkan).
+- [MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen) by Mihawk — frame generation, for Game settings › Frame
+  generation (kit 0.15 and later).
 
 ### Small libraries
 
