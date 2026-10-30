@@ -23,13 +23,15 @@ for f in LoadLibraryW GetProcAddress GetModuleFileNameW GetStdHandle WriteFile R
 done
 llvm-dlltool -m i386:x86-64 -d "$out/kernel32.def" -l "$out/kernel32.lib"
 
-# cef_initialize is the shim's own; everything else goes to libcef_real.dll.
+# The shim's own exports; everything else goes to libcef_real.dll.
+own="cef_initialize cef_browser_host_create_browser cef_browser_host_create_browser_sync"
 {
-  printf 'LIBRARY libcef.dll\nEXPORTS\n  cef_initialize\n'
-  tr -d '\r' <"$exports" | grep -E '^[A-Za-z_][A-Za-z0-9_@?$]*$' | grep -vx cef_initialize | sort -u |
+  printf 'LIBRARY libcef.dll\nEXPORTS\n'
+  for name in $own; do printf '  %s\n' "$name"; done
+  tr -d '\r' <"$exports" | grep -E '^[A-Za-z_][A-Za-z0-9_@?$]*$' | grep -vxF "$(printf '%s\n' $own)" | sort -u |
     while read -r name; do printf '  %s=libcef_real.%s\n' "$name" "$name"; done
 } >"$out/libcef.def"
-echo "forwarding $(($(wc -l <"$out/libcef.def") - 3)) exports"
+echo "forwarding $(grep -c '=libcef_real' "$out/libcef.def") exports"
 
 clang --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin -fno-stack-protector -Wall -Wextra \
   -c "$here/shim.c" -o "$out/shim.obj"

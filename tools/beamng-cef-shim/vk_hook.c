@@ -267,6 +267,7 @@ static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapcha
 }
 
 static volatile long g_vk_calls;
+static volatile long g_paints, g_accelerated_paints, g_blank_paints;  // paint_hook.c
 
 
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
@@ -581,6 +582,8 @@ static DWORD WINAPI HookVulkanLater(void* unused) {
   for (int round = 0;; ++round) {
     if (g_vk_module_count) VerifyPatches();
     if (round % 100 == 0 && g_vk_module_count) VkLog("calls through the shim so far", g_vk_calls, 0, 0);
+    if (round % 100 == 50)
+      VkLog("cef frames so far: painted, of them empty, accelerated", g_paints, g_blank_paints, g_accelerated_paints);
     if (round >= 1800) {  // after three minutes only the checks go on
       Sleep(100);
       continue;

@@ -118,6 +118,7 @@ static BOOL g_keep_profiler;
 static BOOL g_no_commit;
 static BOOL g_vk_fix;
 static BOOL g_vk_reuse;
+static BOOL g_no_shared_texture;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -412,6 +413,10 @@ static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char no_shared[] = "shim:no-shared-texture";
+      i = 0;
+      while (no_shared[i] && p[i] == no_shared[i]) ++i;
+      if (!no_shared[i]) g_no_shared_texture = 1;
       static const char no_reuse[] = "shim:no-vk-reuse";
       i = 0;
       while (no_reuse[i] && p[i] == no_reuse[i]) ++i;
@@ -671,6 +676,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 }
 
 #include "vk_hook.c"
+#include "paint_hook.c"
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
@@ -683,7 +689,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 11)\n");
+    Log("libcef-shim: loaded (build 12)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }
