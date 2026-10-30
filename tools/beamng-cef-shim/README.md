@@ -113,8 +113,12 @@ hooks the call that starts a watch (`NtNotifyChangeDirectoryFile`, as kernelbase
 `ReadDirectoryChangesW` and `FindFirstChangeNotificationW`; `watch_hook.c`): a watch of a whole tree
 watches only its folder, and changes further down are not reported. Each folder is logged the first
 time it is watched, in a `watch:` line with what was asked, how long the call took (the server makes
-its first listing in it) and who asked. `shim:watch-subtrees` keeps watches as asked;
-`shim:no-watch` refuses them all, as a network drive without change notification would.
+its first listing in it) and who asked. `shim:watch-subtrees` keeps watches as asked.
+
+On the console (build 25) BeamNG asked for two such watches at start-up, both now watching their
+folder alone, and the stutter was gone: while driving, about 60 frames a second and no frame over
+100 ms, and `GetTickCount64` never stood still. Refusing those watches (build 25's
+`shim:no-watch`) keeps BeamNG from starting, so that switch is gone.
 
 With `shim:sample`, for 30 seconds of every minute, ten times a second, the shim also stops the
 thread that submits for a moment and notes where it is (`sampler.c`): after each 30 seconds a

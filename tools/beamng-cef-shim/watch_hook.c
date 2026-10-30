@@ -9,10 +9,10 @@
 // GetTickCount64, which that thread keeps, stood still for about 212 ms every 1.7 s while
 // QueryPerformanceCounter went on, and each time a frame took about 240 ms: a listing of 212 ms,
 // 8 x 212 ms apart, is the stutter. So a watch of a whole tree watches only its folder (shim:
-// watch-subtrees keeps it as asked), and with shim:no-watch every watch is refused as a network
-// drive without change notification would refuse it (ERROR_INVALID_FUNCTION), so the server lists
-// nothing. Each folder is logged the first time it is watched, with what was asked, who asked and
-// how long the call took: the server makes its first listing in it.
+// watch-subtrees keeps it as asked). On the console (build 25) that left no frame over 100 ms, and
+// GetTickCount64 never stood still; BeamNG asks for two such watches at start-up and does not start
+// when they are refused. Each folder is logged the first time it is watched, with what was asked,
+// who asked and how long the call took: the server makes its first listing in it.
 
 typedef long(WINAPI* notify_fn)(HANDLE, HANDLE, void*, void*, void*, void*, DWORD, DWORD, unsigned char);
 typedef long(WINAPI* notify_ex_fn)(HANDLE, HANDLE, void*, void*, void*, void*, DWORD, DWORD, unsigned char, int);
@@ -20,7 +20,6 @@ typedef DWORD(WINAPI* final_path_fn)(HANDLE, WCHAR*, DWORD, DWORD);
 static notify_fn g_real_notify;
 static notify_ex_fn g_real_notify_ex;
 static final_path_fn g_final_path;
-static const long kWatchRefused = (long)0xc0000010;  // STATUS_INVALID_DEVICE_REQUEST
 static HANDLE volatile g_watch_seen[32];
 static volatile long g_watch_logged;
 
@@ -67,10 +66,9 @@ static void WatchLog(HANDLE folder, DWORD filter, unsigned char asked, unsigned 
   else
     n = SampleAppend(line, n, sizeof(line), "a folder whose name is unknown");
   n = SampleAppend(line, n, sizeof(line),
-                   g_no_watch ? (asked ? " and all below it: refused" : ", the folder alone: refused")
-                   : !asked   ? ", the folder alone"
-                   : watched  ? " and all below it, as asked"
-                              : ": asked with all below it, watching the folder alone");
+                   !asked    ? ", the folder alone"
+                   : watched ? " and all below it, as asked"
+                             : ": asked with all below it, watching the folder alone");
   n = SampleAppend(line, n, sizeof(line), "; changes ");
   n = HitchHex(line, n, sizeof(line), filter);
   if (status != 0x103 /* STATUS_PENDING */ && status) {
@@ -97,8 +95,7 @@ static long WINAPI WatchFolder(HANDLE folder, HANDLE event, void* apc, void* apc
   BOOL log = WatchFirstTime(folder) && g_watch_logged < 24;
   int64_t start = 0, end = 0;
   if (log) RealQpc(&start);
-  long status = g_no_watch ? kWatchRefused
-                           : g_real_notify(folder, event, apc, apc_context, io, buffer, length, filter, subtree);
+  long status = g_real_notify(folder, event, apc, apc_context, io, buffer, length, filter, subtree);
   if (log) {
     RealQpc(&end);
     __sync_add_and_fetch(&g_watch_logged, 1);
@@ -115,9 +112,7 @@ static long WINAPI WatchFolderEx(HANDLE folder, HANDLE event, void* apc, void* a
   BOOL log = WatchFirstTime(folder) && g_watch_logged < 24;
   int64_t start = 0, end = 0;
   if (log) RealQpc(&start);
-  long status = g_no_watch ? kWatchRefused
-                           : g_real_notify_ex(folder, event, apc, apc_context, io, buffer, length, filter, subtree,
-                                              information);
+  long status = g_real_notify_ex(folder, event, apc, apc_context, io, buffer, length, filter, subtree, information);
   if (log) {
     RealQpc(&end);
     __sync_add_and_fetch(&g_watch_logged, 1);
@@ -148,8 +143,7 @@ static void HookFolderWatches(void) {
     if (g_real_notify && PatchImport(modules[i], "NtNotifyChangeDirectoryFile", (void*)WatchFolder)) ++patched;
     if (g_real_notify_ex && PatchImport(modules[i], "NtNotifyChangeDirectoryFileEx", (void*)WatchFolderEx)) ++patched;
   }
-  Log(!patched          ? "libcef-shim: watch: folder watches could not be hooked; they are as asked\n"
-      : g_no_watch       ? "libcef-shim: watch: folder watches are logged and refused\n"
+  Log(!patched           ? "libcef-shim: watch: folder watches could not be hooked; they are as asked\n"
       : g_watch_subtrees ? "libcef-shim: watch: folder watches are logged and kept as asked\n"
                          : "libcef-shim: watch: folder watches are logged; a watch of a whole tree watches only its "
                            "folder\n");

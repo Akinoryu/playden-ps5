@@ -144,7 +144,6 @@ static BOOL g_no_hitch;  // shim:no-hitch: no listing of the threads when a fram
 static DWORD g_main_thread;  // the thread that called cef_initialize: CEF's UI thread, the game's main loop
 static BOOL g_yield_sleep;  // shim:yield-sleep: the main thread's short sleeps yield instead (time_hook.c)
 static BOOL g_watch_subtrees;  // shim:watch-subtrees: watches of whole trees stay as asked (watch_hook.c)
-static BOOL g_no_watch;  // shim:no-watch: folder watches are refused (watch_hook.c)
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -530,10 +529,6 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (watch_subtrees[i] && p[i] == watch_subtrees[i]) ++i;
       if (!watch_subtrees[i]) g_watch_subtrees = 1;
-      static const char no_watch[] = "shim:no-watch";
-      i = 0;
-      while (no_watch[i] && p[i] == no_watch[i]) ++i;
-      if (!no_watch[i]) g_no_watch = 1;
       static const char no_hitch[] = "shim:no-hitch";
       i = 0;
       while (no_hitch[i] && p[i] == no_hitch[i]) ++i;
@@ -964,7 +959,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 25)\n");
+    Log("libcef-shim: loaded (build 26)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     HookGameTime();
