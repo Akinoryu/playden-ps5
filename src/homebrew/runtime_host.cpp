@@ -1833,8 +1833,6 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
     overrides["program"] = setup_program;
     overrides["controller_preset"] = "mouse";
     for (const auto& [id, value] : rt::ControllerPresetInputs().at("mouse")) overrides[id] = value;
-    for (const char* id : {"launch_option", "program", "controller_preset", "controller", "pointer_stick", "pointer_speed"})
-      overrides[std::string(rt::kUnlockPrefix) + id] = "on";
   }
   // A game whose folder moved (RuntimeInstall::moved_from) is published again at its revision, so
   // its descriptor, profile and dxvk.conf name the new folder.
@@ -1858,6 +1856,26 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   const rt::SettingsPreset* preset = nullptr;
   for (const auto& candidate : c.presets)
     if (candidate.id == saved.preset_id) preset = &candidate;
+  // The run's buttons are the Mouse preset's (runtime/input/mouse.input): the recipe's and the settings preset's
+  // bindings stay out of it, and the recipe's locks don't keep its program or controls.
+  std::optional<rt::GameRecipe> run_recipe;
+  std::optional<rt::SettingsPreset> run_preset;
+  if (!setup_program.empty()) {
+    const auto button = [](const auto& entry) { return entry.first.rfind("button.", 0) == 0; };
+    run_recipe = *recipe;
+    std::erase_if(run_recipe->defaults, button);
+    std::erase_if(run_recipe->locked, [](const std::string& id) {
+      static const std::set<std::string> controls = {"launch_option", "program", "controller_preset", "controller",
+                                                     "pointer_stick", "pointer_speed"};
+      return controls.count(id) || id.rfind("button.", 0) == 0;
+    });
+    recipe = &*run_recipe;
+    if (preset) {
+      run_preset = *preset;
+      std::erase_if(run_preset->settings, button);
+      preset = &*run_preset;
+    }
+  }
   const auto kit = TitleKit(c, record);
   // Another program or folder chosen in Game settings: the PS5 title and the bottle stay, and
   // the install record names the new program when this publication commits (Reconcile), so a
@@ -2500,6 +2518,14 @@ bool RuntimeHost::PollLaunch(Composition& c) {
         std::to_string(static_cast<int>(snapshot.state)) + " code=" + snapshot.code + " exit=" +
         (snapshot.exit_code ? std::to_string(*snapshot.exit_code) : std::string("unknown")) +
         " cleared=" + std::to_string(finished.accepted) + " " + finished.code);
+    // A program's run ended (one closed from the PS5 menu is seen only now, after a restart): the game's own
+    // settings go back at once, so its Home tile starts the game again.
+    if (finished.accepted)
+      if (const auto record = c.records.Find(snapshot.install_id);
+          record && !record->setup_program.empty() && MaintenanceRefusal(c, *record).empty()) {
+        const auto refused = RepublishSettings(c, *record, nullptr, false);
+        if (!refused.empty()) Log("setup program app=" + std::to_string(record->runtime_number) + " kept: " + refused);
+      }
     PublishLaunch(c, snapshot);
     return !finished.accepted;
   }

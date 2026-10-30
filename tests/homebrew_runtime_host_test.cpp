@@ -1682,10 +1682,25 @@ void UpdatedFilesSetUpTheLaunchAgain() {
 }
 
 // Run a program once: Play with a program from the game folder publishes it, with the Mouse preset, for one start. The
-// game's own settings come back with the next publication: the next start of Playden, or the next Play.
+// game's own settings come back with the next publication: when Playden sees the run end, on its next start, or on
+// the next Play.
 void RunsSetupProgramOnce() {
   Fixture fixture;
   auto config = fixture.Config();
+  // A shipped recipe that binds buttons, one of them locked: the run has the Mouse preset's instead.
+  const auto runtime = fixture.root / "runtime";
+  Write(runtime / "presets.json", Read(fs::path(g_runtime_dir) / "presets.json"), 0644);
+  for (const auto& entry : fs::directory_iterator(fs::path(g_runtime_dir) / "input"))
+    Write(runtime / "input" / entry.path().filename(), Read(entry.path()), 0644);
+  Write(runtime / "recipes/steam-4300-setuptest-v1.json", R"({
+  "recipe_id": "steam-4300-setuptest-v1", "recipe_version": 1, "app_id": 4300, "name": "Setup Game",
+  "launch_entries": [{"id": "game", "label": "Setup Game", "executable": "Binaries/Game.exe"}],
+  "arguments": "", "dll_overrides": "", "architecture": "pe32", "runtime": "wine-wow64", "prefix": "game",
+  "graphics": "dxvk", "defaults": {"button.options": "escape", "button.cross": "space"}, "locked": ["button.cross"]
+})", 0644);
+  Write(runtime / "recipes/recipes.lst", "steam-4300-setuptest-v1.json\n", 0644);
+  config.runtime_dir = runtime.string();
+  config.steamworks_dir = (fs::path(g_runtime_dir) / "steamworks").string();
   config.host_namespace_prefix = fixture.root;
   config.session_data_root = fixture.root / "data";
   config.package_paths.console_data_root = "/data";
@@ -1711,7 +1726,7 @@ void RunsSetupProgramOnce() {
     return TitleResult{true, 0, "launch"};
   };
   GameSettingsRecord saved;
-  saved.overrides = {{"controller_preset", "gamepad"}, {"button.cross", "key:space"}};
+  saved.overrides = {{"controller_preset", "gamepad"}, {"button.square", "e"}};
   config.settings_record = [&](const playden::GameId&) -> std::optional<GameSettingsRecord> { return saved; };
   const auto game = fixture.root / "data/homebrew/FAKE77031/games/4300";
   std::string pe(0x80 + 26, '\0');
@@ -1724,14 +1739,14 @@ void RunsSetupProgramOnce() {
   const auto profile = fixture.root / "data/playden/games/steam-4300/library/profiles/playden-steam-4300.profile";
   const auto installs = config.state_root / "installs.json";
   const auto sessions = fixture.root / "data/playden/games/steam-4300/logs/sessions";
-  // The program quits: its session record says so, as the title shell writes it.
-  const auto exited = [&](const std::string& argument) {
+  // The session record the title shell writes for a run.
+  const auto session = [&](const std::string& argument, const char* phase) {
     const auto id = argument.substr(argument.find('=') + 1);
     fs::create_directories(sessions);
     CHECK(chmod(sessions.parent_path().c_str(), 0700) == 0 && chmod(sessions.c_str(), 0700) == 0);
     Write(sessions / (id + ".json"),
           R"({"schema_version":1,"session_id":")" + id + R"(","install_id":"steam-4300","title_id":"FAKE78001",)"
-          R"("origin":"playden","settings_revision":0,"runtime_bundle_id":"wine-wow64","phase":"exited"})" "\n", 0600);
+          R"("origin":"playden","settings_revision":0,"runtime_bundle_id":"wine-wow64","phase":")" + phase + "\"}\n", 0600);
   };
   const auto ended = [](const RuntimeSnapshot& s) { return s.launch && s.launch->state == LaunchState::kExited; };
   const auto handed_off = [&](RuntimeHost& host) {
@@ -1741,7 +1756,18 @@ void RunsSetupProgramOnce() {
   const auto game_published = [&] {
     const auto text = Read(profile);
     return text.find("\\Binaries\\Game.exe\n") != std::string::npos && text.find("preset = gamepad") != std::string::npos &&
-           Read(installs).find("setup_program") == std::string::npos;
+           text.find("cross = space\n") != std::string::npos && text.find("options = escape\n") != std::string::npos &&
+           text.find("square = e\n") != std::string::npos && Read(installs).find("setup_program") == std::string::npos;
+  };
+  const auto launcher_published = [&] {
+    const auto text = Read(profile);
+    return text.find("\\Binaries\\Launcher.exe\n") != std::string::npos && text.find("preset = mouse") != std::string::npos &&
+           text.find("cross = ") == std::string::npos && text.find("options = ") == std::string::npos &&
+           text.find("square = ") == std::string::npos &&
+           Read(installs).find("\"setup_program\":\"Binaries/Launcher.exe\"") != std::string::npos;
+  };
+  const auto restored = [](const RuntimeSnapshot& s) {
+    return !s.installs.empty() && s.installs[0].launch_path == "Binaries/Game.exe";
   };
   {
     RuntimeHost host(config);
@@ -1754,37 +1780,47 @@ void RunsSetupProgramOnce() {
     if (done.refusals.count(4300)) std::fprintf(stderr, "Prepare refused: %s\n", done.refusals.at(4300).c_str());
     CHECK(!done.refusals.count(4300) && game_published());
     fixture.activity->store(static_cast<int>(NativeActivity::kStopped));
-    // The launcher starts with the Mouse preset; the player's buttons and the game's program don't come along.
+    // The launcher starts with the Mouse preset alone; the game's program and every button binding stay out.
     host.Play(4300, "Binaries/Launcher.exe");
     handed_off(host);
-    const auto text = Read(profile);
-    CHECK(text.find("\\Binaries\\Launcher.exe\n") != std::string::npos && text.find("preset = mouse") != std::string::npos);
-    CHECK(text.find("space") == std::string::npos);
-    CHECK(Read(installs).find("\"setup_program\":\"Binaries/Launcher.exe\"") != std::string::npos);
-    CHECK(host.Snapshot().installs[0].launch_path == "Binaries/Launcher.exe");
-    CHECK(launches.size() == 1);
-    exited(launches[0][0]);
-    WaitFor(host, ended, 30);
-    // Starting the game ends Playden; it starts again once the program quit.
+    CHECK(launcher_published() && host.Snapshot().installs[0].launch_path == "Binaries/Launcher.exe" && launches.size() == 1);
+    // Closed from the PS5 menu: its record still says running when the system ends Playden.
+    session(launches[0][0], "running");
+    host.Shutdown();
+  }
+  {
+    // Playden starts again and sees the title stopped: once the session ends, the game's settings are back.
+    RuntimeHost host(config);
+    CHECK(host.Start());
+    CHECK(WaitFor(host, [&](const RuntimeSnapshot& s) { return restored(s) && ended(s); }, 60).installs[0].launch_path ==
+          "Binaries/Game.exe");
+    CHECK(game_published());
+    // The program quits by itself this time, while Playden is closed: its next start puts the game back.
+    host.Play(4300, "Binaries/Launcher.exe");
+    handed_off(host);
+    CHECK(launcher_published() && launches.size() == 2);
+    session(launches[1][0], "exited");
+    WaitFor(host, [](const RuntimeSnapshot& s) { return s.launch && s.launch->state == LaunchState::kExited; }, 30);
     host.Shutdown();
   }
   RuntimeHost host(config);
   CHECK(host.Start());
-  const auto restored = WaitFor(host, [](const RuntimeSnapshot& s) {
-    return !s.installs.empty() && s.installs[0].launch_path == "Binaries/Game.exe";
-  }, 60);
-  CHECK(restored.installs[0].launch_path == "Binaries/Game.exe" && game_published());
+  CHECK(WaitFor(host, restored, 60).installs[0].launch_path == "Binaries/Game.exe" && game_published());
 
-  // The program's run again, and this time the next Play puts the game back before it starts.
+  // The next Play puts the game back before it starts, too.
   host.Play(4300, "Binaries/Launcher.exe");
   handed_off(host);
-  CHECK(Read(profile).find("\\Binaries\\Launcher.exe\n") != std::string::npos && launches.size() == 2);
-  exited(launches[1][0]);
+  CHECK(launcher_published() && launches.size() == 3);
+  host.Play(4300);
+  const auto busy = WaitFor(host, [](const RuntimeSnapshot& s) { return s.play_refusals.count(4300) != 0; }, 30);
+  CHECK(busy.play_refusals.count(4300) && launcher_published());  // not while the program's session is open
+  session(launches[2][0], "exited");
   WaitFor(host, ended, 30);
+  CHECK(WaitFor(host, restored, 30).installs[0].launch_path == "Binaries/Game.exe" && game_published());
   host.Play(4300);
   handed_off(host);
-  CHECK(game_published() && host.Snapshot().installs[0].launch_path == "Binaries/Game.exe");
-  exited(launches[2][0]);
+  CHECK(game_published() && launches.size() == 4);
+  session(launches[3][0], "exited");
   WaitFor(host, ended, 30);
 
   // A program that isn't there is refused, and the game's settings stay.
@@ -1792,7 +1828,7 @@ void RunsSetupProgramOnce() {
   host.Play(4300, "Binaries/Missing.exe");
   const auto refused = WaitFor(host, [handled](const RuntimeSnapshot& s) { return s.plays_handled > handled; }, 30);
   CHECK(refused.play_refusals.count(4300) && refused.play_refusals.at(4300).find("missing") != std::string::npos);
-  CHECK(game_published() && launches.size() == 3);
+  CHECK(game_published() && launches.size() == 4);
   host.Shutdown();
 }
 
