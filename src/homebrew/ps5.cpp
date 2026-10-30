@@ -354,6 +354,7 @@ int main() {
         playden::steam::EntitledLibraryBackend library_backend(owned_library, cm_client);
         playden::steam::LicensedDepots licensed_depots;
         library_backend.SetLicensedDepots(&licensed_depots);
+        library_backend.SetAppNameStorage(&library_storage);
         // Family sharing diagnostics, with the CM license lines.
         library_backend.SetFamilyDiagnostics(paths.trust_store, [](const std::string& line) {
             playden::app::AppendLogLine(log_root, "steam-cm.log", line);

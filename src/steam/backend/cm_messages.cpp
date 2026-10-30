@@ -260,6 +260,22 @@ bool DecodePicsResponse(const std::vector<std::uint8_t>& body, PicsResponse* res
       decoded.response_pending = field.value != 0;
       continue;
     }
+    if (field.number == 2) {
+      if (!IsVarint(field)) return false;
+      if (decoded.unknown_apps.size() >= kMaxRepeatedEntries) return false;
+      decoded.unknown_apps.push_back(static_cast<std::uint32_t>(field.value));
+      continue;
+    }
+    if (field.number == 7) {
+      if (!IsVarint(field)) return false;
+      decoded.http_min_size = static_cast<std::uint32_t>(field.value);
+      continue;
+    }
+    if (field.number == 8) {
+      if (!IsBytes(field)) return false;
+      decoded.http_host.assign(reinterpret_cast<const char*>(field.data), field.size);
+      continue;
+    }
     if (field.number == 1) {
       if (decoded.apps.size() >= kMaxRepeatedEntries) return false;
       proto::Reader child;
@@ -273,9 +289,18 @@ bool DecodePicsResponse(const std::vector<std::uint8_t>& body, PicsResponse* res
         } else if (entry.number == 3) {
           if (!IsVarint(entry)) return false;
           app.missing_token = entry.value != 0;
+        } else if (entry.number == 4) {
+          if (!IsBytes(entry)) return false;
+          app.sha = Bytes(entry);
         } else if (entry.number == 5) {
           if (!IsBytes(entry)) return false;
           app.buffer = Bytes(entry);
+        } else if (entry.number == 6) {
+          if (!IsVarint(entry)) return false;
+          app.only_public = entry.value != 0;
+        } else if (entry.number == 7) {
+          if (!IsVarint(entry)) return false;
+          app.size = static_cast<std::uint32_t>(entry.value);
         }
       }
       if (!child.ok()) return false;
@@ -328,11 +353,18 @@ std::vector<std::uint8_t> EncodePicsAccessTokenRequest(const std::vector<std::ui
 }
 
 bool DecodePicsAccessTokenResponse(const std::vector<std::uint8_t>& body,
-                                   std::vector<AppRequest>* tokens) {
+                                   std::vector<AppRequest>* tokens,
+                                   std::vector<std::uint32_t>* denied) {
   proto::Reader reader(body, kLimits);
   proto::Field field;
   std::vector<AppRequest> decoded;
+  std::vector<std::uint32_t> refused;
   while (reader.Next(&field)) {
+    if (field.number == 4 && IsVarint(field)) {
+      if (refused.size() >= kMaxRepeatedEntries) return false;
+      refused.push_back(static_cast<std::uint32_t>(field.value));
+      continue;
+    }
     if (field.number != 3) continue;
     if (decoded.size() >= kMaxRepeatedEntries) return false;
     proto::Reader child;
@@ -349,6 +381,7 @@ bool DecodePicsAccessTokenResponse(const std::vector<std::uint8_t>& body,
   }
   if (!reader.ok()) return false;
   *tokens = std::move(decoded);
+  if (denied) *denied = std::move(refused);
   return true;
 }
 

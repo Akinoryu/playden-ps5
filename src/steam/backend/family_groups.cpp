@@ -17,6 +17,7 @@ constexpr std::uint32_t kRequestTimeoutMs = 6000;
 constexpr std::size_t kMemberLimit = 32;
 constexpr std::size_t kAppLimit = 20000;
 constexpr std::size_t kOwnerLimit = 32;
+constexpr std::size_t kNameLimit = 1024;
 constexpr std::size_t kAppLineLimit = 200;
 
 bool Unreserved(unsigned char byte) {
@@ -148,6 +149,12 @@ std::optional<SharedLibrary> ParseSharedLibraryApps(std::string_view body) {
       }
     }
     app.exclude_reason = Id(item.Find("exclude_reason")).value_or(0);
+    if (const auto* name = item.Find("name"); name && name->is_string() && name->text().size() <= kNameLimit)
+      app.name = name->text();
+    app.app_type = Id(item.Find("app_type")).value_or(kFamilyAppTypeGame);
+    if (const auto acquired = Id(item.Find("rt_time_acquired"));
+        acquired && *acquired <= std::numeric_limits<std::uint32_t>::max())
+      app.rt_time_acquired = static_cast<std::uint32_t>(*acquired);
     library.apps.push_back(std::move(app));
   }
   return library;

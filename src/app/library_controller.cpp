@@ -70,7 +70,7 @@ void LibraryController::Refresh(Store store) {
   for(auto& other:others_) if(other.source->store()==store) RefreshOther(other);
 }
 void LibraryController::Reset() {
-  steam_.Invalidate(++generation_);request_=0;account_=0;clearing_=false;clear_result_.reset();offline_=false;needs_renewal_=false;
+  steam_.Invalidate(++generation_);request_=0;completed_request_=0;account_=0;clearing_=false;clear_result_.reset();offline_=false;needs_renewal_=false;
 }
 void LibraryController::Clear() {
   clear_result_.reset();clearing_=true;
@@ -111,6 +111,16 @@ void LibraryController::TickOther(Other& other,LibraryEvent& event) {
   else other.request=0;
 }
 void LibraryController::TickSteam(LibraryEvent& event) {
+  if(event.kind==LibraryEventKind::kUpdated) {
+    // Games named in the background after the last load completed: the whole library again, status untouched.
+    if(request_ || clearing_ || !completed_request_ || event.request_id!=completed_request_ ||
+       event.account_id!=account_ || event.account_generation!=generation_) return;
+    // Keeps the status line, unless saving the bigger library failed.
+    const std::string status=event.cache_error!=StorageError::kNone ? "Library loaded, but saving failed. Retry to save."
+        : model_.state().account().error;
+    model_.UpdateLibrary({std::move(event.games),false,status,false,event.cache_available,Time(event)});
+    return;
+  }
   if(!request_ || event.request_id!=request_ || event.account_id!=account_ || event.account_generation!=generation_) return;
   if(clearing_) {
     if(event.kind==LibraryEventKind::kCleared || event.kind==LibraryEventKind::kFailure) {
@@ -145,6 +155,7 @@ void LibraryController::TickSteam(LibraryEvent& event) {
     const char* warning=event.cache_error!=StorageError::kNone ? "Library loaded, but saving failed. Retry to save."
         : event.metadata_partial ? "Some game details are unavailable." : "";
     if(*warning) model_.UpdateLibrary({{},false,warning,cached,event.cache_available,time});
+    completed_request_=cached ? 0 : request_;
     request_=0;
   }
 }

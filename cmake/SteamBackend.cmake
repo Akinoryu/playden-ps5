@@ -147,6 +147,8 @@ endif()
 # Authenticated CM session for the CM-only library facts (acquisition dates).
 add_library(playden_steam_cm STATIC
     "${CMAKE_SOURCE_DIR}/src/steam/backend/cm_client.cpp"
+    "${CMAKE_SOURCE_DIR}/src/steam/backend/app_info_http.cpp"
+    "${CMAKE_SOURCE_DIR}/src/steam/backend/app_names.cpp"
     "${CMAKE_SOURCE_DIR}/src/steam/backend/entitled_library.cpp"
     "${CMAKE_SOURCE_DIR}/src/steam/backend/family_groups.cpp"
     "${CMAKE_SOURCE_DIR}/src/steam/backend/cm_app_details.cpp"

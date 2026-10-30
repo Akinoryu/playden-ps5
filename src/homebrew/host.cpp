@@ -552,6 +552,7 @@ int main(int argc, char** argv) {
         cm_client->SetSharedSession(steam_cm);
         library_backend = std::make_unique<playden::steam::EntitledLibraryBackend>(*owned_library, *cm_client);
         library_backend->SetLicensedDepots(&licensed_depots);
+        library_backend->SetAppNameStorage(library_storage.get());
         // Family sharing diagnostics.
         library_backend->SetFamilyDiagnostics(PLAYDEN_HOMEBREW_CA_BUNDLE, [log_directory](const std::string& line) {
             playden::app::AppendLogLine(log_directory, "steam-cm.log", line);

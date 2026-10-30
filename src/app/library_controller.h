@@ -51,6 +51,8 @@ class LibraryController {
   stores::LibrarySource& steam_;
   std::vector<Other> others_;
   std::uint64_t account_=0,generation_=0,request_=0;
+  // The last load that completed, for the games its backend names later (kUpdated).
+  std::uint64_t completed_request_=0;
   std::uint64_t licenses_generation_=0,licenses_read_=0;
   bool offline_=false,clearing_=false;
   bool needs_renewal_=false;

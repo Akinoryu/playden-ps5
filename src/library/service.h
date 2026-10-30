@@ -14,7 +14,9 @@
 
 namespace playden {
 
-enum class LibraryEventKind { kLoading, kCached, kComplete, kFailure, kCleared };
+// kUpdated follows a kComplete of the same request: the whole library again, with games the backend named
+// in the background since.
+enum class LibraryEventKind { kLoading, kCached, kComplete, kFailure, kCleared, kUpdated };
 
 struct LibraryEvent {
   LibraryEventKind kind = LibraryEventKind::kFailure;
@@ -50,11 +52,14 @@ class LibraryService {
                            std::uint64_t account_generation);
   std::uint64_t Clear(std::uint64_t account_id, std::uint64_t account_generation);
   void Invalidate(std::uint64_t account_generation);
+  // From any thread (the backend's late-games callback): queues adding the backend's late games to the last
+  // completed refresh, unless something else is queued or that refresh is no longer current.
+  void NotifyLateGames();
   void Shutdown();
   std::vector<LibraryEvent> Pump(std::size_t max_events);
 
  private:
-  enum class Command { kRefresh, kLoadCached, kClear };
+  enum class Command { kRefresh, kLoadCached, kClear, kMerge };
   struct Job {
     Command command;
     std::uint64_t request;
@@ -70,6 +75,8 @@ class LibraryService {
   void ExecuteRefresh(const Job&);
   void ExecuteLoadCached(const Job&);
   void ExecuteClear(const Job&);
+  void ExecuteMerge(const Job&);
+  void QueueMergeLocked();
   void EmitFailure(const Job&, steam::LibraryError, StorageError = StorageError::kNone,
                    bool cache_available = false);
   void PushEvent(LibraryEvent, bool destructive_terminal = false);
@@ -92,6 +99,11 @@ class LibraryService {
   bool clear_barrier_ = false;
   bool stopping_ = false;
   bool joined_ = false;
+  // The last refresh that completed (worker thread only), for late games.
+  std::optional<LibrarySnapshot> completed_;
+  std::uint64_t completed_request_ = 0;
+  std::uint64_t completed_account_ = 0;
+  bool completed_cache_available_ = false;
   std::thread worker_;
 };
 

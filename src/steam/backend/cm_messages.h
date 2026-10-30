@@ -139,12 +139,19 @@ struct PicsPackage {
 struct PicsApp {
   std::uint32_t app_id = 0;
   bool missing_token = false;
+  bool only_public = false;
   std::vector<std::uint8_t> buffer;  // text VDF, possibly NUL-terminated
+  std::vector<std::uint8_t> sha;     // SHA-1 of the VDF; with no buffer, the copy over HTTP is named by it
+  std::uint32_t size = 0;
 };
 struct PicsResponse {
   std::vector<PicsPackage> packages;
   std::vector<PicsApp> apps;
+  std::vector<std::uint32_t> unknown_apps;
   bool response_pending = false;
+  // Apps whose VDF is at least this big may come without a buffer, to be fetched from http_host instead.
+  std::uint32_t http_min_size = 0;
+  std::string http_host;
 };
 
 struct AppRequest {
@@ -153,9 +160,10 @@ struct AppRequest {
 };
 std::vector<std::uint8_t> EncodePicsAppsRequest(const std::vector<AppRequest>& apps);
 std::vector<std::uint8_t> EncodePicsAccessTokenRequest(const std::vector<std::uint32_t>& app_ids);
-// App ID -> access token, for apps Steam granted tokens to (denied apps are absent).
+// App ID -> access token, for apps Steam granted tokens to (denied apps are absent, listed in `denied`).
 bool DecodePicsAccessTokenResponse(const std::vector<std::uint8_t>& body,
-                                   std::vector<AppRequest>* tokens);
+                                   std::vector<AppRequest>* tokens,
+                                   std::vector<std::uint32_t>* denied = nullptr);
 bool DecodePicsResponse(const std::vector<std::uint8_t>& body, PicsResponse* response);
 
 std::vector<std::uint8_t> EncodeDepotKeyRequest(std::uint32_t depot_id, std::uint32_t app_id);

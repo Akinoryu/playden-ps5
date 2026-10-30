@@ -15,8 +15,8 @@
 
 namespace playden::steam {
 
-// Diagnostics only: what IFamilyGroupsService says about the account's Steam family, to compare with the
-// licenses the CM sent. Nothing here adds games or affects a library load.
+// What IFamilyGroupsService says about the account's Steam family: the games it shares, by name (the Library
+// adds them without a PICS lookup), and log lines comparing them with the licenses the CM sent.
 
 using FamilyPerform = std::function<HttpResponse(const HttpRequest&, const std::atomic<bool>&)>;
 using FamilyLog = std::function<void(const std::string& line)>;
@@ -34,10 +34,17 @@ struct FamilyGroup {
   std::vector<FamilyMember> members;
 };
 
+// EAppType values in SharedApp.app_type.
+inline constexpr std::uint64_t kFamilyAppTypeGame = 1;
+inline constexpr std::uint64_t kFamilyAppTypeDemo = 8;
+
 struct SharedLibraryApp {
   std::uint32_t appid = 0;
   std::vector<std::uint64_t> owners;
   std::uint64_t exclude_reason = 0;  // 0: shared; anything else is Steam's reason it is not
+  std::string name;
+  std::uint64_t app_type = kFamilyAppTypeGame;  // Steam's default when the field is absent
+  std::uint32_t rt_time_acquired = 0;
 };
 
 // GetSharedLibraryApps.

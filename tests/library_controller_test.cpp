@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <functional>
+#include <utility>
 #include <mutex>
 #include <thread>
 #include "fake_library_source.h"
@@ -195,4 +197,77 @@ void UpdateRefusesAnotherStoresGames() {
   assert(model.state().games.empty());
 }
 }
-int main(){OtherSourceSurvivesSteam();StaleSteamCompletionKeepsOtherSource();UpdateRefusesAnotherStoresGames();FreshRefreshAndFailure();OfflineCacheAndClear();StaleCompletionCannotRepopulate();RejectedCacheStillAcceptsFreshResult();RejectedRequestStopsLoading();}
+// A backend whose games named after the load arrive through the callback.
+struct LateBackend final : LibraryBackend {
+  std::mutex mutex;
+  std::function<void()> callback;
+  std::vector<GameSummary> late;
+  std::uint64_t late_account=123;
+  std::atomic<int> calls{0};
+  LibraryResult Fetch(const StoredSession&,const std::atomic<bool>&) override {
+    ++calls;
+    return {LibraryError::kNone,{{SteamId(42),"Synthetic title",{},{},{}}},false,true};
+  }
+  std::vector<GameSummary> TakeLateGames(std::uint64_t account) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    if(account!=late_account) return {};
+    return std::exchange(late,{});
+  }
+  void SetLateGamesCallback(std::function<void()> value) override { std::lock_guard<std::mutex> lock(mutex);callback=std::move(value); }
+  void Name(GameSummary game) {
+    std::function<void()> notify;
+    { std::lock_guard<std::mutex> lock(mutex);late.push_back(std::move(game));notify=callback; }
+    if(notify) notify();
+  }
+};
+// Games the backend names after a load completed join the Library and the cache, without a Loading state or
+// a status change; a sign-out drops them.
+void LateGamesJoinTheLibrary() {
+  Simulation model({}, {},ModelMode::Live);
+  model.UpdateAccount({AuthState::SignedIn,"123","Synthetic",{},{},true});
+  Sessions sessions;Cache cache;LateBackend backend;
+  {
+    LibraryService service(backend,sessions,&cache,[]{return 12345;});
+    app::LibraryController controller(model,service);
+    controller.Activate(123,false);
+    Wait(controller,[&]{return !model.state().library_loading && model.state().games.size()==1;});
+    GameSummary late{SteamId(43),"Synthetic late",{},{},{}};late.family_shared=true;
+    backend.Name(late);
+    Wait(controller,[&]{return model.state().games.size()==2;});
+    assert(!model.state().library_loading && model.state().account().error.empty());
+    assert(cache.value && cache.value->games.size()==2 && cache.value->schema_version==7);
+    // The same game again, or one for another account, changes nothing.
+    backend.Name(late);
+    backend.late_account=456;
+    backend.Name({SteamId(44),"Synthetic other",{},{},{}});
+    for(int i=0;i<50;++i){controller.Tick();std::this_thread::sleep_for(1ms);}
+    assert(model.state().games.size()==2 && cache.value->games.size()==2);
+    backend.late_account=123;
+    // After a sign-out, late games are not shown.
+    controller.Reset();
+    backend.Name({SteamId(45),"Synthetic after reset",{},{},{}});
+    for(int i=0;i<50;++i){controller.Tick();std::this_thread::sleep_for(1ms);}
+    assert(std::none_of(model.state().games.begin(),model.state().games.end(),
+                        [](const auto& game){return game.id==SteamId(45);}));
+  }
+  // The service's shutdown unhooked the callback.
+  assert(!backend.callback);
+}
+// Many late games while the UI isn't pumping: the updates collapse into one, so the completion isn't pushed out.
+void ManyLateGamesKeepTheCompletion() {
+  Simulation model({}, {},ModelMode::Live);
+  model.UpdateAccount({AuthState::SignedIn,"123","Synthetic",{},{},true});
+  Sessions sessions;Cache cache;LateBackend backend;
+  LibraryService service(backend,sessions,&cache,[]{return 12345;});
+  app::LibraryController controller(model,service);
+  controller.Activate(123,false);
+  const auto deadline=std::chrono::steady_clock::now()+2s;
+  while(backend.calls==0 && std::chrono::steady_clock::now()<deadline) std::this_thread::sleep_for(1ms);
+  std::this_thread::sleep_for(50ms);
+  for(std::uint32_t app=100;app<200;++app) {
+    backend.Name({SteamId(app),"Synthetic late "+std::to_string(app),{},{},{}});
+    std::this_thread::sleep_for(1ms);
+  }
+  Wait(controller,[&]{return !model.state().library_loading && model.state().games.size()==101;});
+}
+int main(){OtherSourceSurvivesSteam();StaleSteamCompletionKeepsOtherSource();UpdateRefusesAnotherStoresGames();FreshRefreshAndFailure();OfflineCacheAndClear();StaleCompletionCannotRepopulate();RejectedCacheStillAcceptsFreshResult();RejectedRequestStopsLoading();LateGamesJoinTheLibrary();ManyLateGamesKeepTheCompletion();}

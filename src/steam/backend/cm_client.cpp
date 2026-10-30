@@ -1,5 +1,6 @@
 #include "steam/backend/cm_client.h"
 
+#include "steam/backend/app_info_http.h"
 #include "steam/backend/auth_messages.h"
 #include "steam/backend/binary_kv.h"
 #include "steam/backend/gzip.h"
@@ -1070,6 +1071,16 @@ CmError CmClient::WithServiceSession(const StoredSession& stored, std::uint32_t 
 AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored,
                                      const std::vector<std::uint32_t>& app_ids,
                                      const std::atomic<bool>& cancel) {
+  return FetchAppInfo(stored, app_ids, cancel, true);
+}
+
+AppInfoBuffers CmClient::FetchAppInfoPics(const StoredSession& stored, const std::vector<std::uint32_t>& app_ids,
+                                          const std::atomic<bool>& cancel) {
+  return FetchAppInfo(stored, app_ids, cancel, false);
+}
+
+AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored, const std::vector<std::uint32_t>& app_ids,
+                                     const std::atomic<bool>& cancel, bool by_hash) {
   AppInfoBuffers result;
   if (app_ids.empty() || app_ids.size() > kMaxAppInfoBatch) return result;  // kProtocol
   const auto deadline = Clock::now() + std::chrono::milliseconds(hooks_.deadline_ms);
@@ -1094,12 +1105,13 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored,
     // A kept session the server dropped while idle: one fresh try, since this call only reads.
     if (reused && (call == CmError::kNetwork || call == CmError::kTimeout)) {
       CloseSession(&lease);
-      return FetchAppInfo(stored, app_ids, cancel);
+      return FetchAppInfo(stored, app_ids, cancel, by_hash);
     }
     return finish(call == CmError::kRejected ? CmError::kProtocol : call);
   }
   std::vector<cm::AppRequest> tokens;
-  if (!cm::DecodePicsAccessTokenResponse(reply, &tokens)) return finish(CmError::kProtocol);
+  std::vector<std::uint32_t> denied;
+  if (!cm::DecodePicsAccessTokenResponse(reply, &tokens, &denied)) return finish(CmError::kProtocol);
   std::vector<cm::AppRequest> requests;
   for (const auto id : app_ids) {
     cm::AppRequest request{id, 0};
@@ -1112,15 +1124,72 @@ AppInfoBuffers CmClient::FetchAppInfo(const StoredSession& stored,
       pics != CmError::kNone)
     return finish(pics);
   const std::set<std::uint32_t> wanted(app_ids.begin(), app_ids.end());
+  std::map<std::uint32_t, std::string> why;
+  std::map<std::uint32_t, const cm::PicsApp*> offloaded;
+  std::uint32_t http_min_size = 0;
+  std::string http_host;
   for (const auto& part : parts) {
+    if (part.http_min_size) http_min_size = part.http_min_size;
+    if (!part.http_host.empty()) http_host = part.http_host;
+    for (const auto app : part.unknown_apps)
+      if (wanted.count(app)) why.emplace(app, "unknown");
     for (const auto& app : part.apps) {
-      if (!wanted.count(app.app_id) || app.missing_token || app.buffer.empty()) continue;
+      if (!wanted.count(app.app_id)) continue;
+      if (app.missing_token || app.buffer.empty()) {
+        why[app.app_id] = app.missing_token ? "missing_token" : !app.sha.empty() ? "http" : "empty";
+        if (!app.missing_token && !app.sha.empty()) offloaded[app.app_id] = &app;
+        continue;
+      }
       std::string text(app.buffer.begin(), app.buffer.end());
       while (!text.empty() && text.back() == '\0') text.pop_back();
       result.buffers[app.app_id] = std::move(text);
     }
   }
-  return finish(CmError::kNone);
+  // The CM is done with: the session goes back before any HTTP.
+  finish(CmError::kNone);
+
+  // Steam answers most apps with only the SHA-1 and size of their VDF, fetched by hash from its HTTP host.
+  for (const auto& [id, app] : offloaded) result.hashed[id] = HashedAppInfo{app->sha, app->size};
+  result.http_host = http_host;
+  AppInfoHttpStats http;
+  if (by_hash && !result.hashed.empty()) {
+    const auto make_perform = [this]() -> AppInfoPerform {
+      if (hooks_.app_info) return hooks_.app_info;
+      if (ca_bundle_.empty()) return nullptr;
+      auto client = std::make_shared<HttpClient>(ca_bundle_);
+      return [client](const HttpRequest& request, const std::atomic<bool>& stop) { return client->Perform(request, stop); };
+    };
+    for (auto& [id, text] : FetchAppInfoByHash(make_perform, http_host, result.hashed, kAppInfoHttpWorkers, cancel, &http)) {
+      result.hashed.erase(id);
+      result.buffers[id] = std::move(text);
+    }
+  }
+
+  for (const auto id : app_ids) {
+    if (result.buffers.count(id)) continue;
+    auto reason = why.count(id) ? why[id] : std::string("absent");
+    if (std::find(denied.begin(), denied.end(), id) != denied.end()) reason = "token_denied";
+    result.unanswered[id] = std::move(reason);
+  }
+  if (!offloaded.empty() || !result.unanswered.empty()) {
+    // One line per batch Steam didn't answer in full, so the log tells a refused token from an HTTP-only answer.
+    std::map<std::string, std::size_t> counts;
+    for (const auto& [id, reason] : result.unanswered) ++counts[reason];
+    std::string line = "step=app_info requested=" + std::to_string(app_ids.size()) +
+                       " answered=" + std::to_string(result.buffers.size()) + " parts=" + std::to_string(parts.size()) +
+                       " tokens=" + std::to_string(tokens.size()) + " denied=" + std::to_string(denied.size()) +
+                       " offloaded=" + std::to_string(offloaded.size());
+    if (by_hash)
+      line += " http_fetched=" + std::to_string(http.fetched) + " http_failed=" + std::to_string(http.failed) +
+              " http_skipped=" + std::to_string(http.skipped) + " http_connections=" + std::to_string(http.new_connections) +
+              " http_ms=" + std::to_string(http.total_ms);
+    if (!http.error.empty()) line += " http_error=" + http.error;
+    for (const auto& [reason, count] : counts) line += " " + reason + "=" + std::to_string(count);
+    if (http_min_size) line += " http_min_size=" + std::to_string(http_min_size);
+    if (!http_host.empty()) line += " http_host=" + http_host.substr(0, 64);
+    Log(line);
+  }
+  return result;
 }
 
 FreeLicenseResult CmClient::RequestFreeLicenses(const StoredSession& stored, const std::vector<std::uint32_t>& app_ids,

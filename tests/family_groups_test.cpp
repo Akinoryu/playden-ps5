@@ -94,6 +94,11 @@ void ParsesSharedApps() {
   assert(library->apps[0].appid == 620 && library->apps[0].owners == std::vector<std::uint64_t>{76561198000000002ULL});
   assert(library->apps[1].appid == 730 && library->apps[1].owners.size() == 2 && !library->apps[1].exclude_reason);
   assert(library->apps[2].appid == 440 && library->apps[2].exclude_reason == 3);
+  // The name, type and acquisition time name a game without PICS; a missing type is Steam's default, a game.
+  assert(library->apps[0].name == "Synthetic Shared" && library->apps[0].app_type == kFamilyAppTypeGame &&
+         library->apps[0].rt_time_acquired == 1600000000u);
+  assert(library->apps[1].name.empty() && library->apps[1].app_type == kFamilyAppTypeGame &&
+         !library->apps[1].rt_time_acquired);
   const auto empty = ParseSharedLibraryApps(R"({"response":{}})");
   assert(empty && empty->apps.empty());
   assert(!ParseSharedLibraryApps("not json"));

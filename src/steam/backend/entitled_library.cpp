@@ -1,6 +1,7 @@
 #include "steam/backend/entitled_library.h"
 
 #include "steam/backend/app_info.h"
+#include "steam/backend/app_info_http.h"
 
 #include <algorithm>
 #include <cctype>
@@ -28,7 +29,10 @@ FamilyLog Serialized(FamilyLog log) {
 
 }  // namespace
 
-EntitledLibraryBackend::~EntitledLibraryBackend() { StopFamilyProbe(); }
+EntitledLibraryBackend::~EntitledLibraryBackend() {
+  StopLookups();
+  StopFamilyProbe();
+}
 
 void EntitledLibraryBackend::StopFamilyProbe() {
   std::lock_guard<std::mutex> guard(family_start_mutex_);
@@ -44,6 +48,7 @@ void EntitledLibraryBackend::StopFamilyProbe() {
 void EntitledLibraryBackend::SetFamilyDiagnostics(std::string ca_bundle, FamilyLog log) {
   StopFamilyProbe();
   family_answered_.store(false);
+  family_no_group_.store(0);
   family_ca_bundle_ = std::move(ca_bundle);
   family_perform_ = nullptr;
   family_log_ = Serialized(std::move(log));
@@ -52,6 +57,7 @@ void EntitledLibraryBackend::SetFamilyDiagnostics(std::string ca_bundle, FamilyL
 void EntitledLibraryBackend::SetFamilyDiagnostics(FamilyPerform perform, FamilyLog log) {
   StopFamilyProbe();
   family_answered_.store(false);
+  family_no_group_.store(0);
   family_ca_bundle_.clear();
   family_perform_ = std::move(perform);
   family_log_ = Serialized(std::move(log));
@@ -62,11 +68,13 @@ void EntitledLibraryBackend::SetFamilyDiagnostics(FamilyPerform perform, FamilyL
 bool EntitledLibraryBackend::StartFamilyProbe(const StoredSession& session) {
   if (!family_log_ || (!family_perform_ && family_ca_bundle_.empty())) return false;
   std::lock_guard<std::mutex> guard(family_start_mutex_);
-  if (family_running_.load() || family_answered_.load()) return false;
+  if (family_running_.load() || family_no_group_.load() == session.steam_id) return false;
   if (family_thread_.joinable()) family_thread_.join();  // finished
   {
     std::lock_guard<std::mutex> lock(family_mutex_);
     family_licenses_published_ = false;
+    family_probe_done_ = false;
+    family_web_fresh_ = false;
   }
   family_running_.store(true);
   family_thread_ = std::thread([this, session, perform = family_perform_, ca_bundle = family_ca_bundle_,
@@ -81,10 +89,22 @@ bool EntitledLibraryBackend::StartFamilyProbe(const StoredSession& session) {
     const FamilyProbe probe = ProbeFamily(session, request, log, family_stop_);
     const auto elapsed_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
-    // Only Steam's answer ends the probing for this run: no family, or a family compared with known
-    // licenses. A failure, or a family whose load had no licenses, is tried again by the next load.
-    if (probe.outcome == FamilyProbe::Outcome::kNoGroup) family_answered_.store(true);
-    if (probe.outcome == FamilyProbe::Outcome::kGroup && probe.library) {
+    // The family's games, for the load waiting on them (and later loads, until the next answer).
+    {
+      std::lock_guard<std::mutex> lock(family_mutex_);
+      if (probe.outcome == FamilyProbe::Outcome::kGroup && probe.library) {
+        family_web_account_ = session.steam_id;
+        family_web_fresh_ = true;
+        family_web_apps_.clear();
+        for (const auto& app : probe.library->apps) family_web_apps_[app.appid] = app;
+      }
+      family_probe_done_ = true;
+    }
+    family_cv_.notify_all();
+    // No family ends the probing for this run and account. A family is asked again by every load, since a
+    // member can share a game at any time; it is compared with known licenses in the log once per run.
+    if (probe.outcome == FamilyProbe::Outcome::kNoGroup) family_no_group_.store(session.steam_id);
+    if (probe.outcome == FamilyProbe::Outcome::kGroup && probe.library && !family_answered_.load()) {
       // Compared with the licenses of the load that started the probe, once that load has them.
       AcquisitionResult licenses;
       bool known = false;
@@ -120,6 +140,10 @@ void EntitledLibraryBackend::PublishFamilyLicenses(const AcquisitionResult* lice
 
 LibraryResult EntitledLibraryBackend::Fetch(const StoredSession& session,
                                             const std::atomic<bool>& cancel) {
+  // The background lookup shares the CM client: it stops here, and the load starts it again with what is
+  // still unknown.
+  StopLookups();
+  const auto started = std::chrono::steady_clock::now();
   // The CM side gets its own flag so a failed or canceled owned fetch stops it promptly.
   std::atomic<bool> stop{false};
   std::atomic<bool> done{false};
@@ -152,13 +176,113 @@ LibraryResult EntitledLibraryBackend::Fetch(const StoredSession& session,
     if (found != acquisitions.acquired_at.end()) game.added_at_unix_seconds = found->second;
   }
   if (probing) PublishFamilyLicenses(&acquisitions);
-  AddLicensedGames(session, acquisitions, cancel, &result);
+  bool family_fresh = false;
+  const auto family = FamilyApps(session.steam_id, probing, started, &family_fresh);
+  AddLicensedGames(session, acquisitions, family ? &*family : nullptr, family_fresh, cancel, &result);
   return result;
+}
+
+std::optional<std::map<std::uint32_t, SharedLibraryApp>> EntitledLibraryBackend::FamilyApps(
+    std::uint64_t steam_id, bool probing, std::chrono::steady_clock::time_point started, bool* fresh) {
+  *fresh = false;
+  if (!family_log_) return std::nullopt;
+  std::unique_lock<std::mutex> lock(family_mutex_);
+  // A load waits a little for its own probe (counted from the load's start); a slower answer is used by the
+  // next one. A load that started none uses the last answer.
+  if (probing)
+    family_cv_.wait_until(lock, started + family_wait_, [&] { return family_stop_.load() || family_probe_done_; });
+  if (family_web_account_ != steam_id) return std::nullopt;
+  *fresh = probing && family_web_fresh_;
+  return family_web_apps_;
+}
+
+namespace {
+
+std::uint64_t UnixNow() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// The Library's entry for a licensed app it knows the name of.
+GameSummary LicensedGame(std::uint32_t app, const AppName& name, bool shared,
+                         const std::map<std::uint32_t, std::uint32_t>& acquired_at, std::uint32_t family_acquired) {
+  GameSummary game{GameId::Steam(app), name.name, {}, {}, {}};
+  game.demo = name.kind == AppName::Kind::kDemo;
+  game.family_shared = shared;
+  if (!name.icon.empty())
+    game.artwork_source = "https://media.steampowered.com/steamcommunity/public/images/apps/" + std::to_string(app) +
+                          "/" + name.icon + ".jpg";
+  if (const auto added = acquired_at.find(app); added != acquired_at.end()) game.added_at_unix_seconds = added->second;
+  else if (family_acquired) game.added_at_unix_seconds = family_acquired;
+  return game;
+}
+
+// What PICS says an app is: a named game or demo, or something the Library leaves out (and why).
+std::optional<AppName> NameFromAppInfo(std::uint32_t app, const std::string& text, std::string* reason) {
+  const auto info = ParseAppInfo(app, text);
+  if (!info) {
+    *reason = "app_info_unreadable";
+    return std::nullopt;
+  }
+  std::string type = info->type;
+  std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) { return std::tolower(c); });
+  AppName name;
+  if ((type == "game" || type == "demo") && !info->name.empty() && info->name != "app_" + std::to_string(app)) {
+    name.kind = type == "demo" ? AppName::Kind::kDemo : AppName::Kind::kGame;
+    name.name = info->name;
+    name.icon = info->icon.size() <= 64 ? info->icon : std::string();
+  } else {
+    *reason = type != "game" && type != "demo" ? "type=" + (type.empty() ? std::string("none") : type.substr(0, 32))
+                                               : "no_name";
+  }
+  name.learned_at = UnixNow();
+  return name;
+}
+
+}  // namespace
+
+void EntitledLibraryBackend::SetAppNameStorage(const Storage* storage) {
+  StopLookups();
+  std::lock_guard<std::mutex> lock(names_mutex_);
+  names_storage_ = storage;
+  names_loaded_ = false;
+}
+
+void EntitledLibraryBackend::SetLateGamesCallback(std::function<void()> callback) {
+  std::lock_guard<std::mutex> lock(late_callback_mutex_);
+  late_callback_ = std::move(callback);
+}
+
+std::vector<GameSummary> EntitledLibraryBackend::TakeLateGames(std::uint64_t steam_id) {
+  std::lock_guard<std::mutex> lock(names_mutex_);
+  if (late_context_.steam_id != steam_id) return {};
+  return std::exchange(late_games_, {});
+}
+
+void EntitledLibraryBackend::LoadNamesLocked() {
+  if (names_loaded_) return;
+  names_loaded_ = true;
+  if (names_storage_) names_ = LoadAppNames(*names_storage_);
+}
+
+void EntitledLibraryBackend::SaveNames() {
+  AppNames copy;
+  const Storage* storage = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(names_mutex_);
+    if (!names_dirty_ || !names_storage_) return;
+    names_dirty_ = false;
+    copy = names_;
+    storage = names_storage_;
+  }
+  if (!SaveAppNames(*storage, copy) && family_log_) family_log_("family names save=failed");
 }
 
 void EntitledLibraryBackend::AddLicensedGames(const StoredSession& session,
                                               const AcquisitionResult& acquisitions,
-                                              const std::atomic<bool>& cancel, LibraryResult* result) {
+                                              const std::map<std::uint32_t, SharedLibraryApp>* family,
+                                              bool family_fresh, const std::atomic<bool>& cancel,
+                                              LibraryResult* result) {
   const auto& shared = acquisitions.shared_apps;
   std::set<std::uint32_t> listed;
   for (const auto& game : result->games) listed.insert(*game.id.steam_app());
@@ -175,52 +299,16 @@ void EntitledLibraryBackend::AddLicensedGames(const StoredSession& session,
       if (!listed.count(app)) candidates.insert(app);
   }
 
-  std::lock_guard<std::mutex> lock(looked_up_mutex_);
-  std::vector<std::uint32_t> unknown;
-  for (const auto app : candidates)
-    if (!looked_up_.count(app)) unknown.push_back(app);
-  for (std::size_t start = 0; start < unknown.size() && !cancel.load(); start += kMaxAppInfoBatch) {
-    const std::vector<std::uint32_t> batch(
-        unknown.begin() + static_cast<std::ptrdiff_t>(start),
-        unknown.begin() + static_cast<std::ptrdiff_t>(std::min(start + kMaxAppInfoBatch, unknown.size())));
-    const auto fetched = acquisitions_.FetchAppInfo(session, batch, cancel);
-    // Unanswered apps are asked again on the next refresh.
-    if (!fetched.ok()) break;
-    for (const auto app : batch) {
-      std::string name;
-      std::string type;
-      const auto found = fetched.buffers.find(app);
-      const auto info = found != fetched.buffers.end() ? ParseAppInfo(app, found->second) : std::nullopt;
-      if (info) {
-        type = info->type;
-        std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) { return std::tolower(c); });
-        if ((type == "game" || type == "demo") && info->name != "app_" + std::to_string(app)) name = info->name;
-        if (!name.empty() && type == "demo") demos_.insert(app);
-        if (!name.empty() && !info->icon.empty())
-          icons_[app] = "https://media.steampowered.com/steamcommunity/public/images/apps/" + std::to_string(app) +
-                        "/" + info->icon + ".jpg";
-      }
-      if (name.empty() && shared.count(app)) {
-        // Why a shared app stays out of the Library, for the family log.
-        std::string reason = found == fetched.buffers.end() ? "no_app_info"
-                             : !info                         ? "app_info_unreadable"
-                             : type != "game" && type != "demo"
-                                 ? "type=" + (type.empty() ? std::string("none") : type.substr(0, 32))
-                                 : "no_name";
-        family_left_out_[app] = std::move(reason);
-      }
-      looked_up_[app] = name;
-    }
-  }
   std::size_t added = 0;
   std::size_t left_out = 0;
-  std::size_t pending = 0;
+  std::size_t named_family = 0;
+  std::size_t named_saved = 0;
   // Per-app lines are capped per load so a big family library can't rotate the license dump out of the
   // log. An app's line counts as logged only once written, so the rest follow on later loads.
   std::size_t written = 0;
   std::size_t truncated = 0;
   const auto detail = [&](std::set<std::uint32_t>& logged, std::uint32_t app, const std::string& line) {
-    if (logged.count(app)) return;
+    if (!family_log_ || logged.count(app)) return;
     if (written == kFamilyAppLineLimit) {
       ++truncated;
       return;
@@ -229,46 +317,226 @@ void EntitledLibraryBackend::AddLicensedGames(const StoredSession& session,
     logged.insert(app);
     family_log_(line);
   };
-  for (const auto app : candidates) {
-    const auto found = looked_up_.find(app);
-    const bool is_shared = shared.count(app) != 0;
-    if (found == looked_up_.end() || found->second.empty()) {
-      if (!is_shared || !family_log_) continue;
-      if (found == looked_up_.end()) {
-        // PICS did not answer (or the load was canceled): asked again on the next refresh. Logged once per
-        // app; a repeated failure only counts as pending.
-        ++pending;
-        if (!cancel.load())
-          detail(family_failed_logged_, app, "family library left_out app=" + std::to_string(app) + " reason=app_info_failed");
+  std::vector<std::uint32_t> unknown;
+  {
+    std::lock_guard<std::mutex> lock(names_mutex_);
+    LoadNamesLocked();
+    for (const auto app : candidates) {
+      const bool is_shared = shared.count(app) != 0;
+      std::uint32_t family_acquired = 0;
+      if (is_shared && family) {
+        // Steam's family service lists the family's games (and demos) by name. A shared app this load's
+        // answer leaves out is DLC or another non-game, and is not looked up. An older answer only names
+        // games: a game shared since then is looked up.
+        const auto found = family->find(app);
+        const bool game = found != family->end() && (found->second.app_type == kFamilyAppTypeGame ||
+                                                     found->second.app_type == kFamilyAppTypeDemo);
+        if (game && !found->second.name.empty()) {
+          AppName& name = names_[app];
+          const auto kind = found->second.app_type == kFamilyAppTypeDemo ? AppName::Kind::kDemo : AppName::Kind::kGame;
+          if (name.kind != kind || name.name != found->second.name) {
+            name.kind = kind;
+            name.name = found->second.name;
+            name.learned_at = UnixNow();
+            names_dirty_ = true;
+          }
+          ++added;
+          ++named_family;
+          if (name.kind == AppName::Kind::kDemo) demos_.insert(app);
+          result->games.push_back(LicensedGame(app, name, true, acquisitions.acquired_at, found->second.rt_time_acquired));
+          detail(family_logged_, app, "family library added app=" + std::to_string(app) + " demo=" +
+                                          (name.kind == AppName::Kind::kDemo ? "1" : "0") + " source=family");
+          continue;
+        }
+        if (!game && !names_.count(app) && family_fresh) {
+          ++left_out;
+          detail(family_logged_, app, "family library left_out app=" + std::to_string(app) + " reason=" +
+                                          (found == family->end() ? std::string("not_in_family_list")
+                                                                  : "app_type=" + std::to_string(found->second.app_type)));
+          continue;
+        }
+        family_acquired = found != family->end() ? found->second.rt_time_acquired : 0;
+      }
+      const auto known = names_.find(app);
+      if (known == names_.end()) {
+        unknown.push_back(app);
         continue;
       }
-      ++left_out;
-      const auto reason = family_left_out_.find(app);
-      detail(family_logged_, app, "family library left_out app=" + std::to_string(app) +
-                                      " reason=" + (reason != family_left_out_.end() ? reason->second : std::string("no_name")));
-      continue;
+      if (known->second.kind == AppName::Kind::kOther) {
+        if (is_shared) {
+          ++left_out;
+          const auto reason = family_left_out_.find(app);
+          detail(family_logged_, app, "family library left_out app=" + std::to_string(app) + " reason=" +
+                                          (reason != family_left_out_.end() ? reason->second : std::string("not_a_game")));
+        }
+        continue;
+      }
+      if (is_shared) {
+        ++added;
+        ++named_saved;
+        detail(family_logged_, app, "family library added app=" + std::to_string(app) + " demo=" +
+                                        (known->second.kind == AppName::Kind::kDemo ? "1" : "0") + " source=saved");
+      }
+      result->games.push_back(LicensedGame(app, known->second, is_shared, acquisitions.acquired_at, family_acquired));
     }
-    GameSummary game{GameId::Steam(app), found->second, {}, {}, {}};
-    game.demo = demos_.count(app) != 0;
-    game.family_shared = is_shared;
-    if (const auto icon = icons_.find(app); icon != icons_.end()) game.artwork_source = icon->second;
-    if (const auto added_at = acquisitions.acquired_at.find(app); added_at != acquisitions.acquired_at.end())
-      game.added_at_unix_seconds = added_at->second;
-    if (is_shared) {
-      ++added;
-      if (family_log_)
-        detail(family_logged_, app, "family library added app=" + std::to_string(app) + " demo=" + (game.demo ? "1" : "0"));
-    }
-    result->games.push_back(std::move(game));
+    // What the background lookup still has to name, and what the Library needs to add each one.
+    late_context_ = {};
+    late_context_.steam_id = session.steam_id;
+    late_context_.shared = shared;
+    late_context_.acquired_at = acquisitions.acquired_at;
+    late_context_.wanted.insert(unknown.begin(), unknown.end());
+    if (family)
+      for (const auto app : unknown)
+        if (const auto found = family->find(app); found != family->end())
+          late_context_.family_acquired[app] = found->second.rt_time_acquired;
+    late_games_.clear();
   }
   if (family_log_) {
     if (truncated) family_log_("family library truncated=" + std::to_string(truncated));
     std::size_t in_owned_list = 0;
     for (const auto app : shared) in_owned_list += listed.count(app);
+    std::size_t pending = 0;
+    for (const auto app : unknown) pending += shared.count(app);
     family_log_("family library shared=" + std::to_string(shared.size()) + " added=" + std::to_string(added) +
                 " left_out=" + std::to_string(left_out) + " pending=" + std::to_string(pending) +
-                " in_owned_list=" + std::to_string(in_owned_list));
+                " in_owned_list=" + std::to_string(in_owned_list) + " named_family=" + std::to_string(named_family) +
+                " named_saved=" + std::to_string(named_saved) +
+                " family_list=" + (!family ? "n" : family_fresh ? "y" : "stale") +
+                " lookups=" + std::to_string(unknown.size()));
   }
+  if (unknown.empty() || cancel.load()) {
+    SaveNames();
+    return;
+  }
+  StartLookups(session, std::move(unknown));
+}
+
+void EntitledLibraryBackend::StopLookups() {
+  std::lock_guard<std::mutex> guard(lookup_start_mutex_);
+  lookup_stop_.store(true);
+  if (lookup_thread_.joinable()) lookup_thread_.join();
+  lookup_stop_.store(false);
+}
+
+void EntitledLibraryBackend::StartLookups(const StoredSession& session, std::vector<std::uint32_t> apps) {
+  std::lock_guard<std::mutex> guard(lookup_start_mutex_);
+  if (lookup_thread_.joinable()) lookup_thread_.join();
+  lookup_running_.store(true);
+  lookup_thread_ = std::thread([this, session, apps = std::move(apps)] {
+    RunLookups(session, apps);
+    lookup_running_.store(false);
+  });
+}
+
+bool EntitledLibraryBackend::WaitForLookups(std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (lookup_running_.load()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+// Names one app from its app info, and queues it for the Library when it is a game this load wanted.
+bool EntitledLibraryBackend::Record(std::uint32_t app, const std::string& text) {
+  std::string reason;
+  auto name = NameFromAppInfo(app, text, &reason);
+  std::lock_guard<std::mutex> lock(names_mutex_);
+  if (!name) {
+    if (late_context_.shared.count(app)) family_left_out_[app] = reason;
+    return false;
+  }
+  if (name->kind == AppName::Kind::kOther && late_context_.shared.count(app)) family_left_out_[app] = reason;
+  if (name->kind == AppName::Kind::kDemo) demos_.insert(app);
+  const bool wanted = late_context_.wanted.erase(app) != 0;
+  names_[app] = *name;
+  names_dirty_ = true;
+  if (!wanted || name->kind == AppName::Kind::kOther) return false;
+  const auto family_acquired = late_context_.family_acquired.find(app);
+  late_games_.push_back(LicensedGame(app, *name, late_context_.shared.count(app) != 0, late_context_.acquired_at,
+                                     family_acquired != late_context_.family_acquired.end() ? family_acquired->second
+                                                                                             : 0));
+  return true;
+}
+
+void EntitledLibraryBackend::RecordOther(std::uint32_t app, const std::string& reason) {
+  std::lock_guard<std::mutex> lock(names_mutex_);
+  if (late_context_.shared.count(app)) family_left_out_[app] = reason;
+  late_context_.wanted.erase(app);
+  AppName name;
+  name.learned_at = UnixNow();
+  names_[app] = std::move(name);
+  names_dirty_ = true;
+}
+
+void EntitledLibraryBackend::PublishLateGames() {
+  {
+    std::lock_guard<std::mutex> lock(names_mutex_);
+    if (late_games_.empty()) return;
+  }
+  std::lock_guard<std::mutex> lock(late_callback_mutex_);
+  if (late_callback_) late_callback_();
+}
+
+// Names the apps a load could not, off the load: PICS in batches, then the hash-only ones over HTTP a few at
+// a time. Games are handed to the Library after each batch. A failed batch ends the pass; what is still
+// unknown is asked again by the next load.
+void EntitledLibraryBackend::RunLookups(const StoredSession& session, const std::vector<std::uint32_t>& apps) {
+  const auto start = std::chrono::steady_clock::now();
+  if (family_log_) family_log_("family lookup start apps=" + std::to_string(apps.size()));
+  std::size_t games = 0;
+  std::size_t by_hash = 0;
+  std::size_t unanswered = 0;
+  std::string error;
+  const auto make_perform = [this]() -> AppInfoPerform {
+    if (family_perform_) return family_perform_;
+    if (family_ca_bundle_.empty()) return nullptr;
+    auto client = std::make_shared<HttpClient>(family_ca_bundle_);
+    return [client](const HttpRequest& request, const std::atomic<bool>& stop) { return client->Perform(request, stop); };
+  };
+  for (std::size_t first = 0; first < apps.size() && !lookup_stop_.load(); first += kMaxAppInfoBatch) {
+    const std::vector<std::uint32_t> batch(
+        apps.begin() + static_cast<std::ptrdiff_t>(first),
+        apps.begin() + static_cast<std::ptrdiff_t>(std::min(first + kMaxAppInfoBatch, apps.size())));
+    const auto fetched = acquisitions_.FetchAppInfoPics(session, batch, lookup_stop_);
+    if (!fetched.ok()) {
+      if (fetched.error != CmError::kCanceled) error = CmErrorName(fetched.error);
+      break;
+    }
+    std::size_t answered = fetched.buffers.size();
+    for (const auto& [app, text] : fetched.buffers) games += Record(app, text);
+    // Apps Steam doesn't know, or describes with nothing, are no games; a refused token is asked again.
+    for (const auto& [app, reason] : fetched.unanswered)
+      if (reason == "unknown" || reason == "empty") {
+        RecordOther(app, "no_app_info:" + reason);
+        ++answered;
+      }
+    if (!fetched.hashed.empty()) {
+      AppInfoHttpStats http;
+      const auto texts = FetchAppInfoByHash(make_perform, fetched.http_host, fetched.hashed, kAppInfoHttpWorkers,
+                                            lookup_stop_, &http, [&](std::uint32_t app, const std::string& text) {
+                                              games += Record(app, text);
+                                            });
+      by_hash += texts.size();
+      answered += texts.size();
+      if (family_log_)
+        family_log_("family lookup http=" + std::to_string(fetched.hashed.size()) + " fetched=" +
+                    std::to_string(http.fetched) + " failed=" + std::to_string(http.failed) + " skipped=" +
+                    std::to_string(http.skipped) + " connections=" + std::to_string(http.new_connections) +
+                    " ms=" + std::to_string(http.total_ms) + (http.error.empty() ? "" : " error=" + http.error));
+    }
+    unanswered += batch.size() - answered;
+    SaveNames();
+    PublishLateGames();
+  }
+  SaveNames();
+  PublishLateGames();
+  if (family_log_)
+    family_log_("family lookup end games=" + std::to_string(games) + " by_hash=" + std::to_string(by_hash) +
+                " unanswered=" + std::to_string(unanswered) + (error.empty() ? "" : " error=" + error) +
+                (lookup_stop_.load() ? " stopped=1" : "") + " elapsed_ms=" +
+                std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - start).count()));
 }
 
 }  // namespace playden::steam

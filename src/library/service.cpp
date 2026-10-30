@@ -4,6 +4,7 @@
 #include <chrono>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace playden {
 namespace {
@@ -12,6 +13,16 @@ constexpr std::size_t kMaximumEvents = 64;
 constexpr std::uint64_t kMaximumTimestamp =
     static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
 
+// Only a library with demos needs schema 6, and one with family-shared games schema 7; one without stays
+// readable by older versions.
+void SetSchema(LibrarySnapshot* snapshot) {
+  const auto& games = snapshot->games;
+  if (std::any_of(games.begin(), games.end(), [](const GameSummary& game) { return game.demo; }))
+    snapshot->schema_version = 6;
+  if (std::any_of(games.begin(), games.end(), [](const GameSummary& game) { return game.family_shared; }))
+    snapshot->schema_version = 7;
+}
+
 }  // namespace
 
 LibraryService::LibraryService(steam::LibraryBackend& backend,
@@ -19,7 +30,9 @@ LibraryService::LibraryService(steam::LibraryBackend& backend,
                                LibraryRepository* cache,
                                std::function<std::uint64_t()> unix_seconds)
     : backend_(backend), sessions_(sessions), cache_(cache),
-      unix_seconds_(std::move(unix_seconds)), worker_([this] { Run(); }) {}
+      unix_seconds_(std::move(unix_seconds)), worker_([this] { Run(); }) {
+  backend_.SetLateGamesCallback([this] { NotifyLateGames(); });
+}
 
 LibraryService::~LibraryService() { Shutdown(); }
 
@@ -108,7 +121,22 @@ bool LibraryService::Current(const Job& job) const {
          !job.cancel->load();
 }
 
+void LibraryService::NotifyLateGames() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // A refresh in flight starts its lookups again, and asks for a merge itself once it completes.
+  if (active_command_ && *active_command_ != Command::kMerge) return;
+  QueueMergeLocked();
+}
+
+void LibraryService::QueueMergeLocked() {
+  if (stopping_ || clear_barrier_ || !pending_.empty()) return;
+  pending_.push_back(Job{Command::kMerge, request_, 0, generation_, std::make_shared<std::atomic<bool>>(false)});
+  wake_.notify_one();
+}
+
 void LibraryService::Shutdown() {
+  // Waits for a running callback; none comes after this.
+  backend_.SetLateGamesCallback(nullptr);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (joined_) return;
@@ -203,6 +231,7 @@ void LibraryService::Run() {
 void LibraryService::Execute(const Job& job) {
   if (job.command == Command::kRefresh) ExecuteRefresh(job);
   else if (job.command == Command::kLoadCached) ExecuteLoadCached(job);
+  else if (job.command == Command::kMerge) ExecuteMerge(job);
   else ExecuteClear(job);
 }
 
@@ -294,13 +323,7 @@ void LibraryService::ExecuteRefresh(const Job& job) {
     if (previous != previous_added_at.end()) game.added_at_unix_seconds = previous->second;
   }
   snapshot.metadata_partial = result.metadata_partial;
-  // Only a library with demos needs schema 6, and one with family-shared games schema 7; one without stays
-  // readable by older versions.
-  if (std::any_of(snapshot.games.begin(), snapshot.games.end(), [](const GameSummary& game) { return game.demo; }))
-    snapshot.schema_version = 6;
-  if (std::any_of(snapshot.games.begin(), snapshot.games.end(),
-                  [](const GameSummary& game) { return game.family_shared; }))
-    snapshot.schema_version = 7;
+  SetSchema(&snapshot);
   if (cache_) {
     const auto saved = cache_->Save(job.account, snapshot);
     if (!Current(job)) return;
@@ -310,6 +333,16 @@ void LibraryService::ExecuteRefresh(const Job& job) {
     } else {
       cache_error = saved.error();
     }
+  }
+
+  completed_ = snapshot;
+  completed_request_ = job.request;
+  completed_account_ = job.account;
+  completed_cache_available_ = cache_available;
+  {
+    // Late games named before completed_ was set would otherwise wait for the next load.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (job.request == request_ && job.generation == generation_) QueueMergeLocked();
   }
 
   LibraryEvent event;
@@ -326,6 +359,44 @@ void LibraryService::ExecuteRefresh(const Job& job) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!stopping_ && job.request == request_ && job.generation == generation_ &&
       !job.cancel->load()) PushEvent(std::move(event));
+}
+
+void LibraryService::ExecuteMerge(const Job& job) {
+  if (!Current(job) || !completed_ || completed_request_ != job.request) return;
+  auto late = backend_.TakeLateGames(completed_account_);
+  std::unordered_set<GameId> present;
+  for (const auto& game : completed_->games) present.insert(game.id);
+  std::size_t added = 0;
+  for (auto& game : late)
+    if (present.insert(game.id).second) {
+      completed_->games.push_back(std::move(game));
+      ++added;
+    }
+  if (!added) return;
+  SetSchema(&*completed_);
+  StorageError cache_error = StorageError::kNone;
+  if (cache_) {
+    const auto saved = cache_->Save(completed_account_, *completed_);
+    if (saved.ok()) completed_cache_available_ = true;
+    else cache_error = saved.error();
+  }
+  LibraryEvent event;
+  event.kind = LibraryEventKind::kUpdated;
+  event.request_id = job.request;
+  event.account_id = completed_account_;
+  event.account_generation = job.generation;
+  event.games = completed_->games;
+  event.metadata_partial = completed_->metadata_partial;
+  event.retrieved_at_unix_seconds = completed_->retrieved_at_unix_seconds;
+  event.cache_available = completed_cache_available_;
+  event.cache_error = cache_error;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (stopping_ || job.request != request_ || job.generation != generation_ || job.cancel->load()) return;
+  // Each update carries the whole library: one waiting is enough, and they can't crowd out the completion.
+  events_.erase(std::remove_if(events_.begin(), events_.end(), [&](const LibraryEvent& queued) {
+                  return queued.kind == LibraryEventKind::kUpdated && queued.request_id == job.request;
+                }), events_.end());
+  PushEvent(std::move(event));
 }
 
 void LibraryService::ExecuteClear(const Job& job) {

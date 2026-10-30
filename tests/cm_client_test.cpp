@@ -982,6 +982,137 @@ void AppInfoUsesAccessTokensAndCollectsMultipartBuffers() {
   assert(client.FetchAppInfo(Session(), {}, cancel).error == CmError::kProtocol);
 }
 
+// Apps that come back without a buffer are named with the reason, and the batch gets one log line.
+void AppInfoNamesWhyAppsWereNotAnswered() {
+  auto script = std::make_shared<Script>();
+  script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+  proto::Writer tokens;
+  tokens.AddVarint(4, 50);  // token denied
+  script->on_emsg[cm::kEMsgClientPICSAccessTokenRequest] = {
+      ServerFrame(cm::kEMsgClientPICSAccessTokenResponse, tokens.bytes(), std::nullopt, 1)};
+  proto::Writer response;
+  auto add_app = [&](std::uint32_t id, bool missing_token, bool sha, const std::string& text) {
+    proto::Writer app;
+    app.AddVarint(1, id);
+    if (missing_token) app.AddVarint(3, 1);
+    if (sha) app.AddBytes(4, std::vector<std::uint8_t>{0xab, 0x01});
+    if (!text.empty()) app.AddBytes(5, std::vector<std::uint8_t>(text.begin(), text.end()));
+    if (sha) app.AddVarint(7, 4096);
+    response.AddMessage(1, app);
+  };
+  add_app(10, false, false, "\"appinfo\" { }");
+  add_app(20, true, false, "");
+  add_app(30, false, true, "");
+  add_app(50, true, false, "");
+  response.AddVarint(2, 40);
+  response.AddVarint(7, 2048);
+  response.AddString(8, "cache.example");
+  script->on_emsg[cm::kEMsgClientPICSProductInfoRequest] = {
+      ServerFrame(cm::kEMsgClientPICSProductInfoResponse, response.bytes(), std::nullopt, 2)};
+  std::vector<std::string> lines;
+  SetCmLog([&](const std::string& line) { lines.push_back(line); });
+  auto client = MakeClient(script);
+  std::atomic<bool> cancel{false};
+  const auto result = client.FetchAppInfo(Session(), {10, 20, 30, 40, 50, 60}, cancel);
+  SetCmLog(nullptr);
+  assert(result.ok() && result.buffers.size() == 1 && result.buffers.count(10));
+  assert((result.unanswered == std::map<std::uint32_t, std::string>{
+              {20, "missing_token"}, {30, "http"}, {40, "unknown"}, {50, "token_denied"}, {60, "absent"}}));
+  const auto line = std::find_if(lines.begin(), lines.end(),
+                                 [](const std::string& l) { return l.find("step=app_info ") != std::string::npos; });
+  assert(line != lines.end());
+  // App 30's two-byte hash can't name a copy, so nothing is fetched over HTTP.
+  assert(line->find("requested=6 answered=1 parts=1 tokens=0 denied=1 offloaded=1 http_fetched=0 http_failed=1 http_skipped=0 "
+                    "http_connections=0 http_ms=0 "
+                    "absent=1 http=1 missing_token=1 token_denied=1 unknown=1 http_min_size=2048 "
+                    "http_host=cache.example") != std::string::npos);
+}
+
+// A VDF Steam serves only by hash is fetched from the clientconfig host and kept when it matches.
+void AppInfoFetchesHashOnlyAppsOverHttp() {
+  // gzip of "\"appinfo\" { \"appid\" \"30\" }" plus its NUL (27 bytes), and the SHA-1 of the text.
+  const std::vector<std::uint8_t> gz = {
+      0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x53, 0x4a, 0x2c, 0x28, 0xc8,
+      0xcc, 0x4b, 0xcb, 0x57, 0x52, 0xa8, 0x56, 0x50, 0x02, 0xb1, 0x53, 0x94, 0x14, 0x94, 0x8c,
+      0x0d, 0x94, 0x14, 0x6a, 0x19, 0x00, 0xd1, 0x24, 0x53, 0xe3, 0x1b, 0x00, 0x00, 0x00};
+  const std::vector<std::uint8_t> sha = {0x32, 0x58, 0xf0, 0xc7, 0xb5, 0xd5, 0x30, 0xaf, 0x77, 0xca,
+                                         0x1d, 0xb0, 0x54, 0x58, 0xcb, 0xe8, 0x60, 0xf7, 0x47, 0xa8};
+  auto run = [&](const std::vector<std::uint8_t>& pics_sha, std::function<HttpResponse(const HttpRequest&)> serve,
+                 std::vector<std::string>* urls, std::vector<std::string>* lines) {
+    auto script = std::make_shared<Script>();
+    script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
+    script->on_emsg[cm::kEMsgClientPICSAccessTokenRequest] = {
+        ServerFrame(cm::kEMsgClientPICSAccessTokenResponse, {}, std::nullopt, 1)};
+    proto::Writer response;
+    for (const std::uint32_t id : {30u, 31u}) {
+      proto::Writer app;
+      app.AddVarint(1, id);
+      app.AddBytes(4, pics_sha);
+      app.AddVarint(7, 27);
+      response.AddMessage(1, app);
+    }
+    script->on_emsg[cm::kEMsgClientPICSProductInfoRequest] = {
+        ServerFrame(cm::kEMsgClientPICSProductInfoResponse, response.bytes(), std::nullopt, 2)};
+    CmClientHooks hooks;
+    hooks.directory = [](const HttpRequest&, const std::atomic<bool>&) { return Directory(kTwoEndpoints); };
+    auto urls_mutex = std::make_shared<std::mutex>();
+    hooks.app_info = [&, urls_mutex](const HttpRequest& request, const std::atomic<bool>&) {
+      {
+        // Fetches run on several workers at once.
+        std::lock_guard<std::mutex> lock(*urls_mutex);
+        urls->push_back(request.url);
+      }
+      return serve(request);
+    };
+    hooks.transport = [script] { return std::make_unique<FakeTransport>(script); };
+    hooks.unix_now = [] { return std::uint64_t{1700000000}; };
+    hooks.deadline_ms = 3000;
+    CmClient client(hooks, MakeDeviceIdentity(kSeed));
+    SetCmLog([lines](const std::string& line) { lines->push_back(line); });
+    std::atomic<bool> cancel{false};
+    auto result = client.FetchAppInfo(Session(), {30, 31}, cancel);
+    SetCmLog(nullptr);
+    return result;
+  };
+  auto has = [](const std::vector<std::string>& lines, const std::string& text) {
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return l.find(text) != std::string::npos; });
+  };
+
+  // App 30's copy matches; app 31 shares the hash, so its copy (also app 30's text) matches too.
+  std::vector<std::string> urls, lines;
+  auto result = run(sha, [&](const HttpRequest&) {
+    HttpResponse ok;
+    ok.status_code = 200;
+    ok.body = gz;
+    return ok;
+  }, &urls, &lines);
+  assert(result.ok() && result.buffers.size() == 2 && result.unanswered.empty());
+  assert(result.buffers.at(30) == "\"appinfo\" { \"appid\" \"30\" }");
+  assert(urls.size() == 2 && std::count(urls.begin(), urls.end(),
+                                       "https://clientconfig.akamai.steamstatic.com/appinfo/30/sha/"
+                                       "3258f0c7b5d530af77ca1db05458cbe860f747a8.txt.gz") == 1);
+  assert(has(lines, "offloaded=2 http_fetched=2 http_failed=0"));
+
+  // A copy that doesn't match the hash is refused; a host that can't be reached stops the rest.
+  urls.clear();
+  lines.clear();
+  auto other = sha;
+  other[0] ^= 1;
+  result = run(other, [&](const HttpRequest& request) {
+    HttpResponse response;
+    if (request.url.find("/appinfo/31/") != std::string::npos) {
+      response.error = HttpError::kConnectionFailed;
+      return response;
+    }
+    response.status_code = 200;
+    response.body = gz;
+    return response;
+  }, &urls, &lines);
+  assert(result.ok() && result.buffers.empty());
+  assert((result.unanswered == std::map<std::uint32_t, std::string>{{30, "http"}, {31, "http"}}));
+  assert(urls.size() == 2 && has(lines, "offloaded=2 http_fetched=0 http_failed=1 http_skipped=1 ") && has(lines, "http_error="));
+}
+
 std::shared_ptr<Script> DepotScript(std::int32_t key_result, std::uint64_t code) {
   auto script = std::make_shared<Script>();
   script->on_logon = {ServerFrame(cm::kEMsgClientLogOnResponse, LogonResponseBody(1, 9))};
@@ -1236,6 +1367,8 @@ int main(int argc, char** argv) {
   RefusedServiceCallIsNotARefusedLogon();
   ResetCmBackoff();
   AppInfoUsesAccessTokensAndCollectsMultipartBuffers();
+  AppInfoNamesWhyAppsWereNotAnswered();
+  AppInfoFetchesHashOnlyAppsOverHttp();
   ResetCmBackoff();
   DepotAccessReturnsKeysAndManifestCodes();
   ResetCmBackoff();

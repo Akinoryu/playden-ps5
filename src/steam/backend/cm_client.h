@@ -2,6 +2,7 @@
 
 #include "platform/storage.h"
 #include "steam/backend/cm_messages.h"
+#include "steam/backend/app_info_http.h"
 #include "steam/backend/http_client.h"
 #include "steam/backend/ws_client.h"
 #include "steam/auth_backend.h"
@@ -108,10 +109,19 @@ struct TokenRenewal {
 };
 
 inline constexpr std::size_t kMaxAppInfoBatch = 50;
+// By-hash app info fetches at once.
+inline constexpr std::size_t kAppInfoHttpWorkers = 4;
 
 struct AppInfoBuffers {
   CmError error = CmError::kProtocol;
   std::map<std::uint32_t, std::string> buffers;  // app ID -> VDF text (trailing NULs removed)
+  // Asked-for apps still without a buffer, and why: token_denied, missing_token, http (only a hash, and
+  // the copy on Steam's HTTP host was not fetched or did not match), unknown, empty, or absent (not in any
+  // response part).
+  std::map<std::uint32_t, std::string> unanswered;
+  // The "http" ones: what to fetch them by, from http_host (empty: Steam named none, use the default).
+  std::map<std::uint32_t, HashedAppInfo> hashed;
+  std::string http_host;
   bool ok() const { return error == CmError::kNone; }
 };
 
@@ -152,6 +162,12 @@ class AcquisitionSource {
                                       const std::atomic<bool>&) {
     return {};
   }
+  // The same without fetching the hash-only apps over HTTP: they come back in `hashed`, for a caller that
+  // fetches them itself (FetchAppInfoByHash).
+  virtual AppInfoBuffers FetchAppInfoPics(const StoredSession& session, const std::vector<std::uint32_t>& app_ids,
+                                          const std::atomic<bool>& cancel) {
+    return FetchAppInfo(session, app_ids, cancel);
+  }
 };
 
 // Derives the stable logon device fields from a per-install seed, as the reference
@@ -163,6 +179,7 @@ std::string LoadOrCreateDeviceSeed(const Storage& storage);
 
 struct CmClientHooks {
   std::function<HttpResponse(const HttpRequest&, const std::atomic<bool>&)> directory;
+  std::function<HttpResponse(const HttpRequest&, const std::atomic<bool>&)> app_info;  // VDFs Steam serves over HTTP
   std::function<std::unique_ptr<MessageTransport>()> transport;
   std::function<std::uint64_t()> unix_now;
   std::uint32_t deadline_ms = 25'000;
@@ -212,6 +229,8 @@ class CmClient final : public AcquisitionSource {
 
   AppInfoBuffers FetchAppInfo(const StoredSession& session, const std::vector<std::uint32_t>& app_ids,
                               const std::atomic<bool>& cancel) override;
+  AppInfoBuffers FetchAppInfoPics(const StoredSession& session, const std::vector<std::uint32_t>& app_ids,
+                                  const std::atomic<bool>& cancel) override;
 
   // Asks Steam to add free apps (free DLC) to the account in one ClientRequestFreeLicense. When it
   // grants anything, waits up to `license_wait_ms` (cancelable) for the license list Steam pushes
@@ -231,6 +250,8 @@ class CmClient final : public AcquisitionSource {
                              const std::function<CmError(const ServiceCall& call, std::uint64_t steam_id)>& work);
 
  private:
+  AppInfoBuffers FetchAppInfo(const StoredSession& session, const std::vector<std::uint32_t>& app_ids,
+                              const std::atomic<bool>& cancel, bool by_hash);
   friend class CmSharedSession;
   class Session;
   // The session one call runs on: its own, or the shared one held for the call's duration.
