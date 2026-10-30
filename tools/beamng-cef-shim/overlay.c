@@ -4,14 +4,17 @@
 //
 // On the console CEF draws BeamNG's menus correctly (frames saved by
 // paint_hook.c), BeamNG gets every frame through OnPaint and presents at 60 fps,
-// yet the screen stays black. So while CEF's latest frame is opaque (loading
-// screens and menus cover the whole screen), the shim copies it into each
-// swapchain image just before the game presents it: one buffer-to-image copy on
-// the presenting queue, after the game's rendering (its present semaphores) and
-// before the present (a semaphore of the shim's). While the UI is see-through (a
-// HUD over the game) the game's own frame is shown. shim:no-overlay turns it off.
+// yet the screen stayed black. With shim:menu-copy, while CEF's latest frame is
+// opaque (loading screens and menus cover the whole screen), the shim copies it
+// into each swapchain image just before the game presents it: one buffer-to-image
+// copy on the presenting queue, after the game's rendering (its present
+// semaphores) and before the present (a semaphore of the shim's). While the UI is
+// see-through (a HUD over the game) the game's own frame is shown. It is off by
+// default: the black screen was Mesa's scaled path (below), and BeamNG draws its
+// menus itself into the full-size swapchain (build 25 showed them with no copy).
+// shim:no-overlay turns the overlay off altogether.
 //
-// That alone still showed black (build 15): the 1280x720 swapchain went through
+// The copy alone still showed black (build 15): the 1280x720 swapchain went through
 // Mesa's scaled path, its own images blitted into 1920x1080 framebuffers. So
 // vk_hook.c makes the swapchain at the full size (1920x1080, or shim:vk-size=),
 // whose images are VideoOut's framebuffers, and here each present scales the
@@ -204,6 +207,8 @@ static struct {
   void (*cmd_blit_image)(vk_dispatch_t, vk_handle_t, uint32_t, vk_handle_t, uint32_t, uint32_t, const void*,
                          uint32_t);
   void (*cmd_clear_color_image)(vk_dispatch_t, vk_handle_t, uint32_t, const void*, uint32_t, const void*);
+  void (*destroy_image)(vk_dispatch_t, vk_handle_t, const void*);  // standin.c
+  void (*free_memory)(vk_dispatch_t, vk_handle_t, const void*);
 } g_vkf;
 
 static struct {
@@ -250,7 +255,7 @@ static void FrameUnlock(void) { __sync_lock_release(&g_frame_lock); }
 // Only the main view, at the game's size, is taken: other browsers (BeamNG's analog odometer) draw
 // small textures. A see-through frame (a HUD over the game) is not copied, as it is not drawn.
 static void OverlayTakeFrame(const void* pixels, int width, int height, int opaque_samples) {
-  if (g_no_overlay || width <= 0 || height <= 0 || width > kOvMaxWidth || height > kOvMaxHeight) return;
+  if (g_no_overlay || !g_menu_copy || width <= 0 || height <= 0 || width > kOvMaxWidth || height > kOvMaxHeight) return;
   if (g_ov.game_width && ((uint32_t)width != g_ov.game_width || (uint32_t)height != g_ov.game_height)) return;
   BOOL opaque = opaque_samples >= 135;  // of 144: a loading screen or menu, not a HUD
   FrameLock();
@@ -289,7 +294,7 @@ static BOOL OverlayLoadFunctions(HMODULE module) {
                          "vkAllocateMemory", "vkBindBufferMemory", "vkMapMemory",
                          "vkGetPhysicalDeviceMemoryProperties", "vkGetSwapchainImagesKHR", "vkCreateImage",
                          "vkGetImageMemoryRequirements", "vkBindImageMemory", "vkCmdCopyImage", "vkCmdBlitImage",
-                         "vkCmdClearColorImage"};
+                         "vkCmdClearColorImage", "vkDestroyImage", "vkFreeMemory"};
   _Static_assert(sizeof(names) == sizeof(g_vkf), "a name for each entry point");
   void** slots = (void**)&g_vkf;
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -333,7 +338,7 @@ static BOOL OverlayCanScale(uint32_t width, uint32_t height, uint32_t format) {
 
 static void OverlayNoteSwapchain(vk_dispatch_t device, vk_handle_t swapchain, uint32_t width, uint32_t height,
                                  uint32_t game_width, uint32_t game_height, uint32_t format) {
-  if (g_ov.swapchain == swapchain) return;
+  // A new swapchain, even with the handle of one destroyed just before: its own images and size.
   g_ov.device = device;
   g_ov.swapchain = swapchain;
   g_ov.width = width;

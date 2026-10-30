@@ -14,7 +14,10 @@ By default it also caps Chromium's shared memory (`--enable-low-end-device-mode
 in shared memory, which on the PS5 comes out of the title's ~440 MiB of flexible memory, while
 Chromium's desktop budgets allow 512 MiB of each. When flexible memory runs out the system closes
 the title: BeamNG went back to the home screen from a menu, the runtime's last `PW_WINE64 memory`
-lines showing 10 to 21 MiB of it free.
+lines showing 10 to 21 MiB of it free. The UI's share grows with BeamNG's size: in Window 1280x720
+about 215 MiB stayed free while driving, while in Fullscreen 1920x1080 the main menu left 35 to
+90 MiB and opening Options used the rest (Chromium's out-of-memory exception `0xe0000008`, which
+the shim logs with the other crashes).
 
 Chromium makes most of its threads without a stack size, so they take the program's default, which
 chrome.exe sets to 8 MiB. In BeamNG they took BeamNG's, and the renderer's thread, which runs inside
@@ -55,10 +58,12 @@ this unnecessary.
 
 ## Menu overlay and full-size swapchain
 
-On the console CEF draws BeamNG's menus correctly, yet the screen stayed black. While CEF's
-latest frame is opaque (loading screens, menus), the shim copies it into each swapchain image just
-before BeamNG presents it (`overlay.c`); see-through frames (the in-game HUD) leave BeamNG's frame
-alone. `shim:no-overlay` turns it off.
+On the console CEF draws BeamNG's menus correctly, yet the screen stayed black. With
+`shim:menu-copy`, while CEF's latest frame is opaque (loading screens, menus), the shim copies it
+into each swapchain image just before BeamNG presents it (`overlay.c`); see-through frames (the
+in-game HUD) leave BeamNG's frame alone. Since build 27 that copy is off by default: the black
+screen came from the size (below), and BeamNG draws its menus itself into the full-size swapchain
+(build 25 showed them with no copy). `shim:no-overlay` turns the overlay off altogether.
 
 With that the screen was still black: BeamNG's window is 1280x720, a size the PS5's VideoOut does
 not scan out, so Mesa gave its swapchain images of its own and blitted each into a 1920x1080
@@ -71,8 +76,26 @@ made, the shim makes BeamNG's size as before. `shim:no-vk-fullsize` keeps BeamNG
 `shim:vk-size=3840x2160` picks another full size. With this, BeamNG's menus and its 3D world show on
 the console.
 
-`test/run.sh` checks the overlay and the scaling on real Vulkan (Mesa's lavapipe under Wine, with
-the Khronos validation layer and its synchronization checks).
+When BeamNG changes its size (it applies its display settings at start-up, and again from
+Options), it destroys its swapchain and makes another, and the driver can hand the new one the
+destroyed one's handle. Up to build 25 the overlay then kept the old size and images: after
+BeamNG went from 1280x720 to Fullscreen 1920x1080 it scaled frames that needed none, into images
+that were not the ones being shown, and the picture shook between two sizes until a restart. The
+overlay now forgets every swapchain the shim destroys and reads each new one's size and images.
+
+A window of BeamNG's own beside its main one (some debug pop-ups, such as the Performance Graph's
+Export) gets no swapchain on the PS5: every window shows on the one display, and Wine answers
+`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`. BeamNG asked ten times and then crashed. Such a window now
+gets a stand-in (`standin.c`): images of the shim's own that BeamNG draws into and presents, and
+that nothing shows. An acquire hands out the next image at once; the semaphore and fence it should
+signal are signalled by an empty submit just before BeamNG's next submit, on that queue. A present
+passes the main window's swapchain on and drops the stand-in, and when only stand-ins are left an
+empty submit waits on its semaphores instead. Debug names and HDR metadata for a stand-in stay in
+the shim. The pop-up itself is not shown.
+
+`test/run.sh` checks the overlay and the scaling, and a stand-in used beside a real swapchain, on
+real Vulkan (Mesa's lavapipe under Wine, with the Khronos validation layer and its synchronization
+checks).
 
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). Every
@@ -84,7 +107,10 @@ the other Vulkan calls (recording, mostly), and what is left, the game's own wor
 the Vulkan calls of other threads. The calls are timed with rdtsc when it is cheap; a `clocks:` line
 at start says what it and `QueryPerformanceCounter` cost. A third `pace:` line lists the frames over
 100 ms, each with when it began in seconds since the shim loaded (BeamNG's own log counts from about
-then) and how long it took.
+then) and how long it took, and a fourth the frames of 34 to 100 ms (two refreshes or more) the
+same way. Every 10 seconds a `cef_do_message_loop_work` line gives how long BeamNG's calls into
+CEF took on its main thread, and a `pace:` line lists the calls over 8 ms, to set beside the slow
+frames.
 
 On the console BeamNG stops for about 250 ms every 1.7 seconds, in menus and while driving, and runs
 at 60 frames a second in between (build 22). To see who holds it up, a watchdog (`hitch.c`) notices

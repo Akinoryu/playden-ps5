@@ -136,6 +136,17 @@ static void OverlayForgetSwapchain(uint64_t swapchain);
 static BOOL OverlayCanScale(uint32_t width, uint32_t height, uint32_t format);
 static uint32_t g_full_width, g_full_height;
 static unsigned g_code_get_queue = ~0u, g_code_get_queue2 = ~0u, g_code_surface_caps = ~0u;
+// standin.c: the swapchains of the game's second windows, which Wine refuses on the PS5.
+static unsigned g_code_get_images = ~0u, g_code_submit = ~0u, g_code_submit2 = ~0u;
+static BOOL StandInCall(uint64_t handle, unsigned code, void* args);
+static BOOL IsStandIn(uint64_t handle);
+static uint64_t StandInCreate(void* device, const unsigned char* info);
+static BOOL StandInDestroy(uint64_t handle);
+static BOOL StandInAcquire(uint64_t swapchain, uint64_t semaphore, uint64_t fence, uint32_t* index, int32_t* result);
+static int StandInFilter(const present_info_t* asked, present_info_t* without, uint64_t* chains, uint32_t* indices,
+                         int32_t* results);
+static void StandInResults(const present_info_t* asked, const present_info_t* without);
+static void StandInConsume(void* queue, const present_info_t* asked);
 // Calls whose first parameter is the physical device the overlay needs (memory properties and the
 // like, which BeamNG asks for when it starts).
 static unsigned g_code_physical[3] = {~0u, ~0u, ~0u};
@@ -298,6 +309,8 @@ static struct {
   int64_t longest, acquire, present, paint;
   int hitches;  // frames over 100 ms this window: when they began, since the shim loaded, and how long
   int64_t hitch_at[8], hitch_length[8];
+  int slows;  // and frames of 34 to 100 ms (two refreshes or more), the same way
+  int64_t slow_at[16], slow_length[16];
 } g_pace;
 
 static int64_t PaceNow(void) {
@@ -444,21 +457,29 @@ static void PaceSeconds(char* line, size_t* n, int64_t ticks) {
 // A third pace line when frames took over 100 ms: when each began, in seconds since the shim
 // loaded (BeamNG's own log counts from about then), and how long it took, to see whether they
 // come at a steady rhythm and what else happened then.
-static void PaceHitches(void) {
-  if (!g_pace.hitches) return;
+// "libcef-shim: pace: <what>, at seconds (ms): 12.3 (40), ..." for the frames listed.
+static void PaceList(const char* what, int count, const int64_t* at, const int64_t* length) {
+  if (!count) return;
   char line[400];
   size_t n = 0;
-  PaceText(line, &n, "libcef-shim: pace: frames over 100 ms, at seconds (ms):");
-  for (int i = 0; i < g_pace.hitches; ++i) {
+  PaceText(line, &n, "libcef-shim: pace: ");
+  PaceText(line, &n, what);
+  PaceText(line, &n, ", at seconds (ms):");
+  for (int i = 0; i < count; ++i) {
     PaceText(line, &n, i ? ", " : " ");
-    PaceSeconds(line, &n, g_pace.hitch_at[i]);
+    PaceSeconds(line, &n, at[i]);
     PaceText(line, &n, " (");
-    PaceCount(line, &n, (uint64_t)(g_pace.hitch_length[i] * 1000 / g_pace.frequency));
+    PaceCount(line, &n, (uint64_t)(length[i] * 1000 / g_pace.frequency));
     PaceText(line, &n, ")");
   }
   PaceText(line, &n, "\n");
   line[n] = 0;
   Log(line);
+}
+
+static void PaceHitches(void) {
+  PaceList("frames over 100 ms", g_pace.hitches, g_pace.hitch_at, g_pace.hitch_length);
+  PaceList("frames of 34 to 100 ms", g_pace.slows, g_pace.slow_at, g_pace.slow_length);
 }
 
 static void PaceFrame(int64_t now) {
@@ -480,6 +501,9 @@ static void PaceFrame(int64_t now) {
   if (interval > 100 * ms && g_pace.hitches < 8) {
     g_pace.hitch_at[g_pace.hitches] = now - interval - g_start_qpc;
     g_pace.hitch_length[g_pace.hitches++] = interval;
+  } else if (interval > 34 * ms && interval <= 100 * ms && g_pace.slows < 16) {
+    g_pace.slow_at[g_pace.slows] = now - interval - g_start_qpc;
+    g_pace.slow_length[g_pace.slows++] = interval;
   }
   if (now - g_pace.window < 10 * g_pace.frequency || !g_pace.frames) return;
   char line[400];
@@ -511,7 +535,7 @@ static void PaceFrame(int64_t now) {
   PaceCalls(now, frames);
   PaceHitches();
   g_pace.window = now;
-  g_pace.hitches = 0;
+  g_pace.hitches = g_pace.slows = 0;
   g_pace.frames = g_pace.over17 = g_pace.over34 = g_pace.over100 = g_pace.paints = 0;
   g_pace.longest = g_pace.acquire = g_pace.present = g_pace.paint = 0;
 }
@@ -539,12 +563,14 @@ static void HideSuboptimal(uint64_t swapchain, int32_t* result) {
 }
 
 static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
+  if (StandInCall(handle, code, args)) return 0;
   if (code == g_code_acquire) {
     struct {
       uint64_t device, swapchain, timeout, semaphore, fence;
       uint32_t* index;
       int32_t result;
     }* p = args;
+    if (StandInAcquire(p->swapchain, p->semaphore, p->fence, p->index, &p->result)) return 0;
     int64_t start = PaceNow();
     long status = Acquire(handle, code, args, p->swapchain, &p->timeout, &p->result);
     g_pace.acquire += PaceNow() - start;
@@ -564,6 +590,7 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
       uint32_t* index;
       int32_t result;
     }* p = args;
+    if (StandInAcquire(p->info->swapchain, p->info->semaphore, p->info->fence, p->index, &p->result)) return 0;
     int64_t start = PaceNow();
     long status = Acquire(handle, code, args, p->info->swapchain, &p->info->timeout, &p->result);
     g_pace.acquire += PaceNow() - start;
@@ -577,6 +604,19 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
       const present_info_t* info;
       int32_t result;
     }* p = args;
+    // Stand-ins are dropped: their semaphores are waited on here when nothing else is presented.
+    const present_info_t* asked = p->info;
+    present_info_t without;
+    uint64_t kept_chains[16];
+    uint32_t kept_indices[16];
+    int32_t kept_results[16];
+    int kept = StandInFilter(asked, &without, kept_chains, kept_indices, kept_results);
+    if (kept == 0) {
+      StandInConsume((void*)(uintptr_t)p->queue, asked);
+      p->result = 0;
+      return 0;
+    }
+    if (kept > 0) p->info = &without;
     const present_info_t* game_info = p->info;
     g_vkt.presenter = GetCurrentThreadId();
     g_vkt.nested = 1;
@@ -597,6 +637,10 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
     NotePresent(p->queue, p->info, status ? -1 : p->result);
     for (uint32_t i = 0; !status && p->info && i < p->info->swapchain_count; ++i)
       PresentOrphans(p->info->swapchains[i]);
+    if (kept > 0) {
+      if (!status) StandInResults(asked, &without);
+      p->info = asked;
+    }
     return status;
   }
   if (code == g_code_create) {
@@ -612,6 +656,12 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
     uint64_t surface = *(const uint64_t*)(p->info + 24);
     uint32_t format = *(const uint32_t*)(p->info + 36), color_space = *(const uint32_t*)(p->info + 40);
     uint32_t usage = *(const uint32_t*)(p->info + 56), present_mode = *(const uint32_t*)(p->info + 88);
+    // A second window while the main one has its swapchain: not made at the full size, not the
+    // overlay's, and a stand-in (standin.c) if Wine refuses it, as it does on the PS5.
+    VkLock();
+    chain_t* current = FindChain(g_current_chain);
+    BOOL second = current && !current->parked && current->surface != surface;
+    VkUnlock();
     // An identical swapchain to one the game just destroyed: hand back the one the shim kept.
     // On the PS5 each destroy and create of a same-size swapchain reuses its display buffers,
     // and BeamNG's third one never got an image.
@@ -648,6 +698,9 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
         const void* allocator;
       } destroy = {kept_devices[i], kept_handles[i], NULL};
       VkLog("destroying the kept swapchain first", kept_handles[i], 0, 0);
+      // The next swapchain can get the same handle: the overlay must not keep this one's size and
+      // images (build 25 scaled the wrong image after a size change, and the picture shook).
+      OverlayForgetSwapchain(kept_handles[i]);
       RealFor(handle)(handle, g_code_destroy, &destroy);
     }
     // The overlay copies into the images: they need TRANSFER_DST usage. On the PS5 a swapchain
@@ -660,7 +713,8 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
     const unsigned char* game_info = p->info;
     for (int i = 0; i < 104; ++i) info_copy[i] = game_info[i];
     *(uint32_t*)(info_copy + 56) |= 0x2 /* VK_IMAGE_USAGE_TRANSFER_DST_BIT */;
-    BOOL enlarged = OverlayCanScale(width, height, format);
+    if (IsStandIn(old)) *(uint64_t*)(info_copy + 96) = 0;
+    BOOL enlarged = !second && OverlayCanScale(width, height, format);
     if (enlarged) {
       *(uint32_t*)(info_copy + 44) = g_full_width;
       *(uint32_t*)(info_copy + 48) = g_full_height;
@@ -678,15 +732,26 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
       status = RealFor(handle)(handle, code, args);
     }
     p->info = game_info;
+    if (second && !status && p->result && p->swapchain) {
+      int32_t refused = p->result;
+      uint64_t standin = StandInCreate((void*)(uintptr_t)p->device, game_info);
+      VkLog("create swapchain for a second window: refused, size, stand-in", (uint32_t)refused,
+            ((uint64_t)width << 32) | height, standin);
+      if (standin) {
+        *p->swapchain = standin;
+        p->result = 0;
+      }
+      return status;
+    }
     uint32_t made_width = enlarged ? g_full_width : width, made_height = enlarged ? g_full_height : height;
-    if (!status && p->result == 0 && p->swapchain)
+    if (!second && !status && p->result == 0 && p->swapchain)
       OverlayNoteSwapchain((void*)(uintptr_t)p->device, *p->swapchain, made_width, made_height, width, height,
                            format);
     VkLock();
     VkLog("create swapchain: old, size, result", old, ((uint64_t)width << 32) | height, (uint32_t)p->result);
     VkLog("  usage asked, format, size made", usage, format, ((uint64_t)made_width << 32) | made_height);
     if (!status && p->result == 0 && p->swapchain) {
-      chain_t* previous = FindChain(g_current_chain);
+      chain_t* previous = second ? NULL : FindChain(g_current_chain);
       if (previous) previous->retired = 1;
       chain_t* old_chain = FindChain(old);
       if (old_chain) old_chain->retired = 1;
@@ -696,8 +761,8 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
                                   0, 0, surface, format, color_space, usage, present_mode, p->device, enlarged};
           break;
         }
-      g_current_chain = *p->swapchain;
-      VkLog("  new swapchain", *p->swapchain, 0, 0);
+      if (!second) g_current_chain = *p->swapchain;
+      VkLog(second ? "  new swapchain, for a second window" : "  new swapchain", *p->swapchain, 0, 0);
       LogChains("swapchains, current");
     }
     VkUnlock();
@@ -707,6 +772,7 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
     struct {
       uint64_t device, swapchain;
     }* p = args;
+    if (StandInDestroy(p->swapchain)) return 0;
     VkLock();
     VkLog("destroy swapchain", p->swapchain, 0, 0);
     chain_t* chain = FindChain(p->swapchain);
@@ -837,6 +903,21 @@ static void HookModule(HMODULE module) {
   }
   g_code_acquire = codes[0], g_code_acquire2 = codes[1], g_code_create = codes[2], g_code_destroy = codes[3];
   g_code_present = codes[4];
+  // For the stand-ins of second windows (standin.c): their images and the submits that pay what
+  // their acquires owe.
+  const char* standin_names[] = {"vkGetSwapchainImagesKHR", "vkQueueSubmit", "vkQueueSubmit2"};
+  static const unsigned standin_expected[] = {0x291, 0x2ae, 0x2af};
+  unsigned* standin_codes[] = {&g_code_get_images, &g_code_submit, &g_code_submit2};
+  for (int i = 0; i < 3; ++i) {
+    const unsigned char* thunk = GetProcAddress(module, standin_names[i]);
+    unsigned standin_code = ~0u;
+    unix_call_fn* standin_slot = slot;
+    if (thunk && DecodeThunk(thunk, 0, &standin_code, &standin_slot) && standin_slot == slot &&
+        standin_code == standin_expected[i])
+      *standin_codes[i] = standin_code;
+    else
+      VkLog("stand-in swapchain: call not as expected, left alone", (uint64_t)i, standin_code, 0);
+  }
   // For the overlay: the calls that name a queue's family and the physical device.
   const char* extra_names[] = {"vkGetDeviceQueue",
                                "vkGetDeviceQueue2",

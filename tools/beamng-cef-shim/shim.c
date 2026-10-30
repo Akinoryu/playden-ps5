@@ -144,6 +144,7 @@ static BOOL g_no_hitch;  // shim:no-hitch: no listing of the threads when a fram
 static DWORD g_main_thread;  // the thread that called cef_initialize: CEF's UI thread, the game's main loop
 static BOOL g_yield_sleep;  // shim:yield-sleep: the main thread's short sleeps yield instead (time_hook.c)
 static BOOL g_watch_subtrees;  // shim:watch-subtrees: watches of whole trees stay as asked (watch_hook.c)
+static BOOL g_menu_copy;  // shim:menu-copy: CEF's opaque frames are copied over the game's (overlay.c)
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -244,7 +245,8 @@ static long g_reported;
 
 static BOOL Interesting(DWORD code) {
   return code == 0xc0000409 || code == 0xc0000005 || code == 0xc000001d || code == 0x80000003 ||
-         code == 0xc0000374 || code == 0xc0000096 || code == 0xc00000fd || code == 0xe06d7363;
+         code == 0xc0000374 || code == 0xc0000096 || code == 0xc00000fd || code == 0xe06d7363 ||
+         code == 0xe0000008;  // Chromium out of memory
 }
 
 // Logs crashes and C++ exceptions with a call stack, then lets them continue as before.
@@ -529,6 +531,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (watch_subtrees[i] && p[i] == watch_subtrees[i]) ++i;
       if (!watch_subtrees[i]) g_watch_subtrees = 1;
+      static const char menu_copy[] = "shim:menu-copy";
+      i = 0;
+      while (menu_copy[i] && p[i] == menu_copy[i]) ++i;
+      if (!menu_copy[i]) g_menu_copy = 1;
       static const char no_hitch[] = "shim:no-hitch";
       i = 0;
       while (no_hitch[i] && p[i] == no_hitch[i]) ++i;
@@ -941,6 +947,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 
 #include "vk_hook.c"
 #include "overlay.c"
+#include "standin.c"
 #include "paint_hook.c"
 #include "sampler.c"
 #include "hitch.c"
@@ -959,7 +966,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 26)\n");
+    Log("libcef-shim: loaded (build 27)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     HookGameTime();

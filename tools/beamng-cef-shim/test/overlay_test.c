@@ -40,6 +40,7 @@ static void VkLog(const char* what, uint64_t a, uint64_t b, uint64_t c) {
 typedef struct { uint32_t s_type; const void* next; uint32_t wait_count; const void* waits; uint32_t swapchain_count;
                  const uint64_t* swapchains; const uint32_t* indices; int32_t* results; } present_info_t;
 static struct { HMODULE module; } g_vk_modules[1];
+static BOOL g_menu_copy = 1;  /* shim:menu-copy: this test checks the menu copy too */
 #include "../overlay.c"
 
 /* user32 for the window */

@@ -72,9 +72,10 @@ In `/data/playden-games/284160/Bin64/`:
 
 These are the settings it was tested with:
 
-- **Display mode:** Window, 1280x720. The shim scales the picture to fill the TV, so Fullscreen at the same size
-  would look and run the same. A lower 16:9 size (for example 960x540) should run faster and look softer; that was
-  not tested.
+- **Display mode:** Window, 1280x720. The shim scales the picture to fill the TV. **Do not use 1920x1080:** at
+  that size BeamNG's interface takes much more of the PS5's memory, and opening Options ran out of it and closed
+  the game. It also costs more CPU time per frame (about 49 fps instead of 60). A lower 16:9 size (for example
+  960x540) should run faster and look softer; that was not tested.
 - **Graphics:** the lowest preset.
 - **FPS limit:** off. A 30 fps limit made the frame pacing worse.
 
@@ -147,20 +148,19 @@ drew the loading screens and the main menu correctly. Copies of its frames were 
 
 ### 5. Still a black screen, with correct menus and a running game
 
-BeamNG's own drawing of the menu never reached the screen. Then, even with the menu copied in, the picture stayed
-black. BeamNG's 1280x720 window is a size the PS5's video output does not show directly, and the resize step on the
-way to the 1920x1080 screen lost the picture.
+BeamNG's own drawing of the menu seemed not to reach the screen, so the shim copied CEF's menu frames into the
+picture itself. The picture still stayed black. BeamNG's 1280x720 window is a size the PS5's video output does not
+show directly, and the resize step on the way to the 1920x1080 screen lost the picture.
 
 **Fix:**
 
-- **Menus:** while CEF's latest frame is opaque (loading screens and menus), the shim copies it into each swapchain
-  image just before BeamNG presents it. See-through frames, such as the in-game HUD, leave the game's own picture
-  alone.
 - **Screen size:** the shim gives BeamNG a full 1920x1080 swapchain. BeamNG keeps drawing 1280x720 in its top-left
   corner, and before each present the shim scales that part (or the menu) to fill the screen, keeping the aspect
   ratio.
 - **Swapchain warnings:** Wine calls such a swapchain "suboptimal" because it is not the window's size. The shim
   reports success instead, or BeamNG would rebuild its swapchain on every frame.
+- **Menus:** with the size fixed, BeamNG's own menus show. The shim's copy of CEF's frames turned out not to be needed
+  and is off since build 27 (`shim:menu-copy` brings it back).
 
 This is checked on a PC with real Vulkan (Mesa's lavapipe) and the Khronos validation layer by
 [test/run.sh](test/run.sh).
@@ -212,10 +212,27 @@ The real cause is in the PS5 Wine runtime ([prospero-win](https://github.com/mpe
 `0884-server-ps5-poll-for-directory-changes`). It affects any game that watches a large folder tree, not only
 BeamNG. A fix there would make this part of the shim unnecessary.
 
+### 9. The picture shook after a display change, until a restart
+
+After BeamNG switched from Window 1280x720 to Fullscreen 1920x1080, the whole picture jumped between two sizes,
+frame after frame. When BeamNG changes its size it destroys its swapchain and makes a new one, and the driver can
+give the new one the old one's handle. The shim's scaler then kept the old size and the old images: it scaled frames
+that needed no scaling, into images that were not the ones being shown.
+
+**Fix:** the scaler forgets every swapchain the shim destroys and reads each new one's size and images.
+
+### 10. Pop-up windows crashed the game
+
+Some debug pop-ups, such as the Performance Graph's Export, open a second window. The PS5 shows only one window,
+so Wine refuses a swapchain for it. BeamNG asked ten times, then used the swapchain it did not get and crashed.
+
+**Fix:** a second window now gets a stand-in swapchain: images of the shim's own that BeamNG draws into and presents.
+BeamNG keeps running, but the pop-up itself is not shown.
+
 ### Along the way
 
 - The shim got lighter. Saving CEF frames and listing every thread's stack are now off unless asked for (each held
-  up the game). The menu copy runs only for frames it will draw.
+  up the game). Copying CEF's menu frames over the game's picture is off too: BeamNG draws its menus itself.
 - BeamNG's own log lives inside the game's private Windows folder (the "bottle"), which FTP cannot read. The shim
   copies it every 30 seconds to `libcef_shim_beamng.log` beside the DLL.
 
@@ -250,7 +267,8 @@ a file with any such line replaces all of the default switches. None of these op
 | Option | What it does |
 | --- | --- |
 | `shim:watch-subtrees` | Keep whole-tree folder watches as asked (brings the stutter back). |
-| `shim:no-overlay` | Do not copy CEF's menu frames into the game's picture. |
+| `shim:no-overlay` | Turn off the scaler and the menu copy (the screen goes black at 1280x720). |
+| `shim:menu-copy` | Copy CEF's opaque frames (loading screens, menus) over the game's picture, as builds 15 to 26 did. |
 | `shim:no-vk-fullsize` | Keep BeamNG's own swapchain size instead of 1920x1080. |
 | `shim:vk-size=WxH` | Use another full size, for example `3840x2160` (not tested). |
 | `shim:no-vk-fix` | Do not free display buffers held by replaced swapchains. |
@@ -274,7 +292,11 @@ a file with any such line replaces all of the default switches. None of these op
   - Delete `libcef_shim.txt` if you have one.
   - Check that the shim was built for your BeamNG version.
 - **The game freezes for a moment every 1.7 seconds.** You are on a shim older than build 25. Use the latest.
-- **Opening Options crashes the game.** You are on a shim older than build 22. Use the latest.
+- **Opening Options crashes the game.**
+  - On a shim older than build 22, use the latest.
+  - In Fullscreen 1920x1080, switch BeamNG to Window 1280x720: Options ran out of memory at 1920x1080.
+- **The picture shakes, or jumps between two sizes.** You are on a shim older than build 27. Use the latest.
+- **A pop-up window crashes the game.** You are on a shim older than build 27. Use the latest.
 - **A black screen with sound.** Check that `-gfx vk` is in Extra arguments, and look for `vk` and `overlay` lines in
   `libcef_shim.log`.
 - **The picture fills only the top-left of the screen.** Look for `overlay` lines in the log, and use the latest
@@ -286,11 +308,12 @@ a file with any such line replaces all of the default switches. None of these op
 
 ## Known limits
 
-- **Small hitches remain:** about 6 frames in every 10 s take 35-50 ms instead of 17 ms. They were not investigated.
+- **Small hitches remain:** about 6 frames in every 10 s take 35-50 ms instead of 17 ms. Build 27 logs when each one
+  happens, to find the cause.
 - **Heavier scenes may be slower.** In one run, the frame rate dropped to about 16 fps for about a minute after a
   level loaded. It was not investigated.
-- **Debug windows that open a second window can crash the game,** such as the Performance Graph's Export. The PS5
-  can show only the game's own window.
+- **Pop-up windows are not shown.** Debug pop-ups that open a second window, such as the Performance Graph's Export,
+  no longer crash the game, but the PS5 can show only the game's own window.
 - **While the game runs, it does not notice files that change** in subfolders of the folders it watches. Restart it
   after copying mods in.
 - **BeamNG's crash reporter is off** (`crashrpt=d`), so BeamNG cannot report its own crashes.
@@ -325,6 +348,7 @@ The source files:
 | `overlay.c` | The menu copy and the scaling. |
 | `paint_hook.c` | CEF's paint callbacks and frame checks. |
 | `watch_hook.c` | The folder-watch fix. |
+| `standin.c` | The stand-in swapchains of pop-up windows. |
 | `time_hook.c` | The sleep and clock measurements. |
 | `hitch.c` | The stall watchdog. |
 | `sampler.c` | The optional sampler. |

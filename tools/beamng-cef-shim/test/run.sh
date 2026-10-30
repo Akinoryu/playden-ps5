@@ -3,7 +3,8 @@
 #
 # Runs overlay_test.c under Wine on Mesa's lavapipe with the Khronos validation layer, on an Xvfb
 # display, once per mode (small, full, bars; see overlay_test.c), and checks screenshots of the
-# display after the game's own frames and after the menu. Needs wine, Xvfb, ImageMagick,
+# display after the game's own frames and after the menu; then standin_test.c (the stand-in
+# swapchain of a second window) the same way, without screenshots. Needs wine, Xvfb, ImageMagick,
 # mesa-vulkan-drivers, vulkan-validationlayers, clang/lld-link/llvm-dlltool, and Vulkan-Headers'
 # include folder:
 #
@@ -21,6 +22,9 @@ llvm-dlltool -m i386:x86-64 -d u32.def -l u32.lib
 clang --target=x86_64-pc-windows-msvc -O1 -ffreestanding -fno-builtin -Wno-incompatible-pointer-types -I"$headers" \
   -c "$here/overlay_test.c" -o overlay_test.obj
 lld-link /nodefaultlib /entry:mainCRTStartup /subsystem:console /out:overlay_test.exe overlay_test.obj k32.lib u32.lib
+clang --target=x86_64-pc-windows-msvc -O1 -ffreestanding -fno-builtin -Wno-incompatible-pointer-types -I"$headers" \
+  -c "$here/standin_test.c" -o standin_test.obj
+lld-link /nodefaultlib /entry:mainCRTStartup /subsystem:console /out:standin_test.exe standin_test.obj k32.lib u32.lib
 
 Xvfb :97 -screen 0 1920x1080x24 >/dev/null 2>&1 &
 xvfb=$!
@@ -82,6 +86,14 @@ for mode in small full bars; do
       check bars menu.png 1800 540 black ;;
   esac
 done
+rm -f run.log
+wine standin_test.exe >run.log 2>&1 || true
+cat run.log
+errors=$(grep -ciE 'Validation Error|SYNC-HAZARD' run.log || true)
+echo "standin: validation errors: $errors"
+[ "$errors" = 0 ] || failed=1
+grep -q 'test: done' run.log && ! grep -q FAILED run.log || failed=1
+
 [ "$failed" = 0 ] && echo PASS && exit 0
 echo FAIL
 exit 1

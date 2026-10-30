@@ -39,6 +39,10 @@ static volatile int64_t g_cef_work_since;    // when the current cef_do_message_
 static volatile int64_t g_cef_work_longest;  // this 10 s
 static volatile long g_cef_work_calls;
 static volatile int64_t g_cef_work_total;
+// Calls over 8 ms this 10 s: when they began, since the shim loaded, and how long; to set beside the
+// pace line's slow frames.
+static int64_t g_cef_slow_at[12], g_cef_slow_length[12];
+static volatile long g_cef_slows;
 
 typedef void (*cef_do_message_loop_work_fn)(void);
 
@@ -54,6 +58,11 @@ __declspec(dllexport) void cef_do_message_loop_work(void) {
   ++g_cef_work_calls;
   g_cef_work_total += spent;
   if (spent > g_cef_work_longest) g_cef_work_longest = spent;
+  if (g_pace.frequency && spent * 125 > g_pace.frequency && g_cef_slows < 12) {
+    g_cef_slow_at[g_cef_slows] = start - g_start_qpc;
+    g_cef_slow_length[g_cef_slows] = spent;
+    ++g_cef_slows;
+  }
 }
 
 static size_t HitchHex(char* line, size_t n, size_t capacity, uint64_t value) {
@@ -260,6 +269,9 @@ static DWORD WINAPI HitchWatch(void* unused) {
         SampleAppend(line, n, sizeof(line), " ms\n");
         Log(line);
       }
+      long slows = g_cef_slows;
+      PaceList("cef_do_message_loop_work over 8 ms", slows > 12 ? 12 : (int)slows, g_cef_slow_at, g_cef_slow_length);
+      g_cef_slows = 0;
     }
     if (!g_pace.frequency || lists >= kHitchLists) continue;
     if (now - second >= frequency) {
