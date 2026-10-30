@@ -53,6 +53,7 @@ __declspec(dllimport) HANDLE WINAPI OpenThread(DWORD, BOOL, DWORD);
 __declspec(dllimport) DWORD WINAPI SuspendThread(HANDLE);
 __declspec(dllimport) DWORD WINAPI ResumeThread(HANDLE);
 __declspec(dllimport) BOOL WINAPI GetThreadContext(HANDLE, void*);
+__declspec(dllimport) HMODULE WINAPI GetModuleHandleW(const WCHAR*);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -107,6 +108,7 @@ static HMODULE g_real;
 static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line_t*);
 static BOOL g_no_hook;
 static BOOL g_keep_settings;
+static BOOL g_vk_fix;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -362,6 +364,10 @@ static void LoadConfig(void) {
         for (const char* d = p + i; *d >= '0' && *d <= '9'; ++d) seconds = seconds * 10 + (DWORD)(*d - '0');
         g_dump_seconds = seconds;
       }
+      static const char no_fix[] = "shim:no-vk-fix";
+      i = 0;
+      while (no_fix[i] && p[i] == no_fix[i]) ++i;
+      if (!no_fix[i]) g_vk_fix = 0;
       static const char keep[] = "shim:keep-settings";
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
@@ -591,12 +597,15 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
   return result;
 }
 
+#include "vk_hook.c"
+
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
-    Log("libcef-shim: loaded (build 5)\n");
+    Log("libcef-shim: loaded (build 6)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
+    CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }
   return 1;
 }

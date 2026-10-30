@@ -27,5 +27,13 @@ In `/data/playden-games/284160/Bin64/`:
 3. Optional: upload `libcef_shim.txt` with one switch per line (`name` or `name=value`, `#` comments)
    to replace the default switches.
 
+With Playden's kit 0.15 the shim also watches the game's Vulkan swapchains through winevulkan's
+Unix call dispatcher. On the PS5, swapchains of one size share their display buffers, and BeamNG
+replaces its swapchain twice at startup while the old ones still hold an acquired image, so its
+third swapchain waits forever for a free buffer (black screen, sound playing). The shim presents
+those leftover images on the replaced swapchains, which frees their buffers. `shim:no-vk-fix`
+keeps the log and turns that off. A Mesa fix in PS5_Mesa's `wsi_common_videoout.c` would make
+this unnecessary.
+
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log. To undo, delete the
 shim and rename `libcef_real.dll` back. A Steam update or file check puts the original back.
