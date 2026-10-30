@@ -6,6 +6,13 @@ stops a second or so after CEF starts. This shim is a `libcef.dll` stand-in that
 to the real library, renamed `libcef_real.dll`, and appends switches that ask Chromium to do that work
 inside the game's process (`--single-process --in-process-gpu --no-sandbox` by default).
 
+By default it also caps Chromium's shared memory (`--enable-low-end-device-mode
+--force-gpu-mem-available-mb=64`). With GPU rendering off, the UI's tiles and decoded images live
+in shared memory, which on the PS5 comes out of the title's ~440 MiB of flexible memory, while
+Chromium's desktop budgets allow 512 MiB of each. When flexible memory runs out the system closes
+the title: BeamNG went back to the home screen from a menu, the runtime's last `PW_WINE64 memory`
+lines showing 10 to 21 MiB of it free.
+
 It needs no runtime or Playden change. Chromium does not support single-process mode officially, so
 this may only move the failure.
 

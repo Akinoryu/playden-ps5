@@ -109,8 +109,19 @@ typedef struct cef_app_t {
 typedef int (*cef_initialize_fn)(const void* args, const void* settings, cef_app_t* app, void* sandbox_info);
 typedef void (*cef_string_userfree_free_fn)(cef_string_t*);
 
-static const char* const kDefaultSwitches[] = {"single-process", "in-process-gpu", "no-sandbox",
-                                               "disable-stack-profiler", NULL};
+// The switches appended without a libcef_shim.txt, "name" or "name=value". The last two cap
+// Chromium's shared memory: with GPU rendering off, the UI's tiles and its decoded images live in
+// shared memory, which on the PS5 comes out of the title's ~440 MiB of flexible memory, while
+// Chromium's desktop budgets are 512 MiB of tiles and 512 MiB of images (64 MiB on a low-end
+// device). A title that runs out of flexible memory is closed by the system: BeamNG went back to
+// the home screen from a menu with 10 MiB of it left.
+static const char* const kDefaultSwitches[] = {"single-process",
+                                               "in-process-gpu",
+                                               "no-sandbox",
+                                               "disable-stack-profiler",
+                                               "enable-low-end-device-mode",
+                                               "force-gpu-mem-available-mb=64",
+                                               NULL};
 
 static HMODULE g_real;
 static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line_t*);
@@ -612,8 +623,15 @@ static BOOL IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r'; }
 
 static void AppendConfigured(cef_command_line_t* command_line) {
   if (!g_have_config) {
-    for (int i = 0; kDefaultSwitches[i]; ++i)
-      Append(command_line, kDefaultSwitches[i], Length(kDefaultSwitches[i]), NULL, 0);
+    for (int i = 0; kDefaultSwitches[i]; ++i) {
+      const char* name = kDefaultSwitches[i];
+      size_t length = Length(name), equals = 0;
+      while (equals < length && name[equals] != '=') ++equals;
+      if (equals < length)
+        Append(command_line, name, equals, name + equals + 1, length - equals - 1);
+      else
+        Append(command_line, name, length, NULL, 0);
+    }
     return;
   }
   const char* p = g_config;
@@ -665,7 +683,8 @@ static void LogHex(const char* prefix, const cef_string_t* text) {
 
 // Logs whether each wanted switch is on command_line.
 static void CheckSwitches(const char* where, cef_command_line_t* command_line) {
-  static const char* const names[] = {"single-process", "in-process-gpu", "no-sandbox", NULL};
+  static const char* const names[] = {"single-process", "in-process-gpu", "no-sandbox",
+                                      "enable-low-end-device-mode", "force-gpu-mem-available-mb", NULL};
   for (int k = 0; names[k]; ++k) {
     WCHAR storage[32];
     cef_string_t name = MakeCefString(names[k], Length(names[k]), storage);
@@ -839,7 +858,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 17)\n");
+    Log("libcef-shim: loaded (build 18)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
