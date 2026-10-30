@@ -150,27 +150,56 @@ static void NoteAcquire(uint64_t swapchain, uint32_t index, int32_t result) {
   VkUnlock();
 }
 
-// An acquire with a long timeout, in one-second steps; while stuck it logs the
-// swapchains and, with the fix on, frees images held on replaced swapchains.
+// An acquire with a long timeout waits in one-second steps. An acquire that
+// times out, in steps or because the game asked for a short timeout and tries
+// again, counts as stuck once a swapchain has had no image for a second; then
+// the swapchains are logged and, with the fix on, images held on replaced
+// swapchains are presented to free their buffers.
+static uint64_t g_stuck_chain, g_stuck_since_ms, g_stuck_logged_ms;
+
+static void NoteTimeout(uint64_t swapchain) {
+  uint64_t now = GetTickCount64();
+  VkLock();
+  if (g_stuck_chain != swapchain) {
+    g_stuck_chain = swapchain;
+    g_stuck_since_ms = now;
+    g_stuck_logged_ms = 0;
+  }
+  uint64_t stuck_ms = now - g_stuck_since_ms;
+  BOOL log = stuck_ms >= 1000 && (!g_stuck_logged_ms || now - g_stuck_logged_ms >= 10000);
+  if (log) {
+    g_stuck_logged_ms = now;
+    VkLog("acquire stuck: chain, milliseconds", swapchain, stuck_ms, 0);
+    LogChains("swapchains, current");
+  }
+  VkUnlock();
+  if (stuck_ms >= 1000 && g_vk_fix) ReleaseRetiredImages();
+}
+
+static void NoteAcquired(void) {
+  VkLock();
+  if (g_stuck_chain && g_stuck_logged_ms) VkLog("acquire works again: chain", g_stuck_chain, 0, 0);
+  g_stuck_chain = 0;
+  VkUnlock();
+}
+
 static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapchain, uint64_t* timeout,
                     int32_t* result) {
   const uint64_t asked = *timeout;
   const uint64_t step = 1000000000ull;
-  if (asked <= step) return g_real_dispatcher(handle, code, args);
   uint64_t waited = 0;
-  for (int round = 0;; ++round) {
-    *timeout = step;
+  for (;;) {
+    *timeout = asked < step ? asked : step;
     long status = g_real_dispatcher(handle, code, args);
     *timeout = asked;
-    if (status || *result != 2 /* VK_TIMEOUT */) return status;
-    waited += step;
-    if (round < 3 || round % 10 == 0) {
-      VkLock();
-      VkLog("acquire still waiting: chain, seconds", swapchain, waited / step, 0);
-      LogChains("swapchains, current");
-      VkUnlock();
+    if (status) return status;
+    if (*result != 2 /* VK_TIMEOUT */) {
+      NoteAcquired();
+      return status;
     }
-    if (g_vk_fix && ReleaseRetiredImages()) continue;
+    NoteTimeout(swapchain);
+    if (asked <= step) return status;  // the game asked for a short wait; it will call again
+    waited += step;
     if (asked != ~0ull && waited >= asked) return status;
   }
 }

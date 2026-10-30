@@ -54,6 +54,7 @@ __declspec(dllimport) DWORD WINAPI SuspendThread(HANDLE);
 __declspec(dllimport) DWORD WINAPI ResumeThread(HANDLE);
 __declspec(dllimport) BOOL WINAPI GetThreadContext(HANDLE, void*);
 __declspec(dllimport) HMODULE WINAPI GetModuleHandleW(const WCHAR*);
+__declspec(dllimport) uint64_t WINAPI GetTickCount64(void);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -119,10 +120,15 @@ static size_t Length(const char* s) {
   return n;
 }
 
+// Also written to libcef_shim.log beside this DLL: Playden keeps only the start and end of a
+// long title log, and the shim's lines can fall in the part it leaves out.
+static HANDLE g_log_file = INVALID_HANDLE_VALUE;
+
 static void Log(const char* text) {
   DWORD written;
   HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
   if (err && err != INVALID_HANDLE_VALUE) WriteFile(err, text, (DWORD)Length(text), &written, NULL);
+  if (g_log_file != INVALID_HANDLE_VALUE) WriteFile(g_log_file, text, (DWORD)Length(text), &written, NULL);
 }
 
 static void LogWide(const char* prefix, const WCHAR* text, size_t length) {
@@ -603,7 +609,14 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
-    Log("libcef-shim: loaded (build 6)\n");
+    WCHAR path[1024];
+    static const char name[] = "libcef_shim.log";
+    DWORD n = ModuleDirectory(path, 1000);
+    for (size_t i = 0; name[i]; ++i) path[n++] = (WCHAR)name[i];
+    path[n] = 0;
+    g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
+                             0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
+    Log("libcef-shim: loaded (build 7)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

@@ -36,5 +36,6 @@ those leftover images on the replaced swapchains, which frees their buffers. `sh
 keeps the log and turns that off. A Mesa fix in PS5_Mesa's `wsi_common_videoout.c` would make
 this unnecessary.
 
-The shim logs each step to stderr as `libcef-shim: ...` lines in the title log. To undo, delete the
+The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
+`libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). To undo, delete the
 shim and rename `libcef_real.dll` back. A Steam update or file check puts the original back.
