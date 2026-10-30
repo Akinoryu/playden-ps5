@@ -700,6 +700,9 @@ struct RuntimeHost::GameFiles {
   std::filesystem::path root;  // the game folder, as this process sees it
   std::string prefix;          // the game's bottle, as this process sees it
   std::vector<std::string> programs;
+  // The INI values to apply: the recipe's, or for a game still on the recipe Playden generated, those of the recipe
+  // Playden now ships for it (they touch only the game's own files, which the generated recipe doesn't name).
+  const std::vector<rt::IniValue>* ini = nullptr;
 };
 
 namespace {
@@ -1079,8 +1082,8 @@ std::string RuntimeHost::RecipeRegistryStep(const GameFiles& files) {
 // Generic step: values the recipe puts in the game's own INI files (docs/community-recipes.md), only where the key
 // is missing or empty, for a setting the game's launcher would write before starting the game.
 std::string RuntimeHost::RecipeIniStep(const GameFiles& files) {
-  const auto& ini = files.recipe->ini;
-  if (ini.empty()) return {};
+  if (!files.ini || files.ini->empty()) return {};
+  const auto& ini = *files.ini;
   const auto applied = rt::ApplyRecipeIniValues(files.root.string(), ini);
   std::string changed, skipped;
   for (const auto& file : applied.changed) changed += (changed.empty() ? "" : ",") + file;
@@ -1113,6 +1116,12 @@ std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::Runtime
   for (const auto& candidate : c.recipes)
     if (RecipeFits(candidate, record) && candidate.id == record.recipe_id) files.recipe = &candidate;
   if (!files.recipe) return {};  // publication reports the missing recipe
+  files.ini = &files.recipe->ini;
+  if (rt::IsGeneratedRecipeId(files.recipe->id))
+    for (const auto& candidate : c.recipes)
+      if (rt::RecipeGame(candidate) == GameOf(record) && candidate.app_id == record.runtime_number &&
+          !rt::IsGeneratedRecipeId(candidate.id))
+        files.ini = &candidate.ini;
   files.saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
   const rt::SettingsPreset* preset = nullptr;
   if (files.saved)

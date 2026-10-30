@@ -64,6 +64,13 @@ int main() {
   CHECK(Set("[A]\r\nx=1\r\n", "Engine.Engine", "Language", "int") == "[A]\r\nx=1\r\n\r\n[Engine.Engine]\r\nLanguage=int\r\n");
   CHECK(Set("[A]\nx=1", "B", "k", "v") == "[A]\nx=1\n\n[B]\nk=v\n");
   CHECK(Set("", "B", "k", "v") == "[B]\nk=v\n");
+  // A UTF-8 byte-order mark stays in front and doesn't hide the first section.
+  const std::string bom = "\xEF\xBB\xBF";
+  CHECK(Set(bom + "[A]\r\nLanguage=fra\r\n", "A", "Language", "int", &changed) == bom + "[A]\r\nLanguage=fra\r\n" && !changed);
+  CHECK(Set(bom + "[A]\r\nx=1\r\n", "A", "Language", "int") == bom + "[A]\r\nx=1\r\nLanguage=int\r\n");
+  CHECK(Set(bom, "B", "k", "v") == bom + "[B]\nk=v\n");
+  // Headers match with spaces inside the brackets.
+  CHECK(Set("[ A ]\nLanguage=deu\n", "A", "Language", "int", &changed) == "[ A ]\nLanguage=deu\n" && !changed);
 
   const auto root = fs::temp_directory_path() / ("playden-recipe-ini-" + std::to_string(::getpid()));
   fs::remove_all(root);

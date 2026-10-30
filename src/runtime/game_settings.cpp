@@ -1369,8 +1369,9 @@ bool RecipeIniValueAllowed(const IniValue& value, std::string* why) {
     return false;
   }
   if (value.section.empty() || value.section.size() > 128 || !printable(value.section) ||
-      value.section.find_first_of("[]") != std::string::npos) {
-    *why = "section is not printable ASCII without brackets";
+      value.section.find_first_of("[]") != std::string::npos || value.section.front() == ' ' ||
+      value.section.back() == ' ') {
+    *why = "section is not printable ASCII without brackets or surrounding spaces";
     return false;
   }
   const auto& key = value.key;

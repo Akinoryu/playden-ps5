@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "runtime/recipe_ini.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
 #include <filesystem>
@@ -136,7 +137,11 @@ bool WriteAtomic(const fs::path& path, std::string_view bytes, mode_t mode) {
 
 bool SetIniValueIfEmpty(std::string* text, const std::string& section, const std::string& key, const std::string& value) {
   const std::string newline = text->find("\r\n") != std::string::npos ? "\r\n" : "\n";
-  const auto lines = Lines(*text);
+  // A UTF-8 byte-order mark stays where it is, outside the first line.
+  constexpr std::string_view kBom = "\xEF\xBB\xBF";
+  const bool bom = std::string_view(*text).substr(0, kBom.size()) == kBom;
+  auto lines = Lines(*text);
+  if (bom) lines.front().begin = std::min(kBom.size(), lines.front().end);
   bool inside = false;
   std::optional<std::size_t> last_line;    // the first matching section's last non-blank line
   std::optional<std::size_t> empty_value;  // where an empty value of the key starts
@@ -171,8 +176,9 @@ bool SetIniValueIfEmpty(std::string* text, const std::string& section, const std
     else text->insert(at, newline + key + "=" + value);
     return true;
   }
-  if (!text->empty() && text->back() != '\n') text->append(newline);
-  if (!text->empty()) text->append(newline);
+  const bool empty = text->size() == (bom ? kBom.size() : 0);
+  if (!empty && text->back() != '\n') text->append(newline);
+  if (!empty) text->append(newline);
   text->append("[" + section + "]" + newline + key + "=" + value + newline);
   return true;
 }

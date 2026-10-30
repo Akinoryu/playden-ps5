@@ -1319,6 +1319,7 @@ int main(int argc, char** argv) {
     CHECK(refuses(R"({"Config//a.ini":{"S":{"k":"v"}}})"));
     CHECK(refuses(R"({"Config/a.cfg":{"S":{"k":"v"}}})"));              // only .ini files
     CHECK(refuses(R"({"a.ini":{"S]":{"k":"v"}}})"));                    // would end the header early
+    CHECK(refuses(R"({"a.ini":{" S ":{"k":"v"}}})"));                  // the file's [S] would never match
     CHECK(refuses(R"({"a.ini":{"S":{"k=x":"v"}}})"));                   // would be another key
     CHECK(refuses(R"({"a.ini":{"S":{";k":"v"}}})"));                    // would be a comment
     CHECK(refuses(R"({"a.ini":{"S":{"k":"two\nlines"}}})"));

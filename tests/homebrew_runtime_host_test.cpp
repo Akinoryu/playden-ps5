@@ -3777,6 +3777,72 @@ void ShippedRecipeWritesGameIni(bool language_chosen) {
   host.Shutdown();
 }
 
+// A copy of Arkham Asylum prepared before Playden shipped its recipe keeps the recipe Playden generated, and still
+// gets the shipped recipe's INI values the next time it is played.
+void GeneratedRecipeGetsShippedIni() {
+  Fixture fixture;
+  auto config = fixture.Config();
+  const auto runtime = fixture.root / "runtime";
+  Write(runtime / "presets.json", Read(fs::path(g_runtime_dir) / "presets.json"), 0644);
+  Write(runtime / "recipes/steam-220-hl2-v1.json", Read(fs::path(g_runtime_dir) / "recipes/steam-220-hl2-v1.json"), 0644);
+  Write(runtime / "recipes/recipes.lst", "steam-220-hl2-v1.json\n", 0644);
+  config.runtime_dir = runtime.string();
+  config.steamworks_dir = (fs::path(g_runtime_dir) / "steamworks").string();
+  config.host_namespace_prefix = fixture.root;
+  config.package_paths.console_data_root = "/data";
+  config.package_paths.host_data_root = fixture.root / "data";
+  config.package_operations.hash_file = HashArtifactFile;
+  config.package_operations.hash_bytes = HashArtifactBytes;
+  config.package_operations.free_space_unverifiable = true;
+  config.package_operations.validate_bottle = [](const fs::path& bottle) {
+    return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
+  };
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
+  unsigned uuids = 0;
+  config.uuid = [&uuids]() -> std::optional<std::string> {
+    ++uuids; return std::string("00000000-0000-4000-8000-00000000000") + std::to_string(uuids);
+  };
+  config.unix_time = [] { return std::int64_t{1760000000}; };
+  const auto game = fixture.root / "data/homebrew/FAKE77031/games/35140";
+  // A 32-bit PE header is all the generator reads.
+  std::string pe(0x80 + 26, '\0');
+  pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+  pe[0x44] = 0x4c; pe[0x45] = 0x01; pe[0x40 + 24] = 0x0b; pe[0x40 + 25] = 0x01;
+  Write(game / "Binaries/ShippingPC-BmGame.exe", pe, 0644);
+  const std::string shipped = "[Engine.Engine]\r\nbSubtitlesEnabled=FALSE\r\n";
+  Write(game / "BmGame/Config/UserEngine.ini", shipped, 0644);
+  RuntimePrepareRequest request{35140, "/data/homebrew/FAKE77031/games/35140", "internal", "Batman: Arkham Asylum GOTY Edition"};
+  request.launches = {{"", "", "Binaries\\ShippingPC-BmGame.exe", "", ""}};
+  const auto prepared = [](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(35140) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  };
+  {
+    RuntimeHost host(config);
+    CHECK(host.Start());
+    CHECK(WaitFor(host, Started).kit_available);
+    host.Prepare(request);
+    const auto done = WaitFor(host, prepared, 60);
+    if (done.refusals.count(35140)) std::fprintf(stderr, "Prepare refused: %s\n", done.refusals.at(35140).c_str());
+    CHECK(!done.refusals.count(35140) && done.installs.size() == 1);
+    CHECK(Read(config.state_root / "installs.json").find("\"recipe_id\":\"steam-35140-auto\"") != std::string::npos);
+    CHECK(Read(game / "BmGame/Config/UserEngine.ini") == shipped);
+    host.Shutdown();
+  }
+  // Playden now ships the recipe: the game keeps its own, and its files get the value.
+  Write(runtime / "recipes/steam-35140-arkhamasylum-v1.json",
+        Read(fs::path(g_runtime_dir) / "recipes/steam-35140-arkhamasylum-v1.json"), 0644);
+  Write(runtime / "recipes/recipes.lst", "steam-220-hl2-v1.json\nsteam-35140-arkhamasylum-v1.json\n", 0644);
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  host.Play(35140);
+  WaitFor(host, [](const RuntimeSnapshot& s) { return s.plays_handled > 0; }, 30);
+  CHECK(Read(config.state_root / "installs.json").find("\"recipe_id\":\"steam-35140-auto\"") != std::string::npos);
+  CHECK(Read(game / "BmGame/Config/UserEngine.ini") == shipped + "Language=int\r\n");
+  host.Shutdown();
+}
+
 // A shipped recipe's requirements are checked against the kit's template, as the kit's packager
 // checks the kit's own recipe: without PS5 audio in the template, a recipe that needs it is refused.
 void ShippedRecipeRequirementsFollowTheKit(bool template_audio_ps5) {
@@ -5846,6 +5912,7 @@ int main(int argc, char** argv) {
   ShippedRecipePreparesWithAnotherKitsRecipe();
   ShippedRecipeWritesGameIni(false);
   ShippedRecipeWritesGameIni(true);
+  GeneratedRecipeGetsShippedIni();
   ShippedRecipeRequirementsFollowTheKit(false);
   ShippedRecipeRequirementsFollowTheKit(true);
   MigrationRewritesInstallPathsAndRepublishes();

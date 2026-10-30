@@ -152,6 +152,8 @@ applies its settings:
 - A missing file is not made: the game makes its own file from its defaults.
   Playden also leaves a link or a UTF-16 file alone.
 - File, section and key names ignore letter case, as on Windows.
+- A game that Playden prepared with the recipe it made itself also gets the
+  INI values of a recipe that Playden ships for the game later.
 
 Rules: the file is a `.ini` path in the game folder, with `/` between folders
 and no `.` or `..` part. At most 16 values. Printable ASCII only. No `[` or `]`
