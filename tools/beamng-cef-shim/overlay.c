@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Menu overlay, included by shim.c after vk_hook.c and paint_hook.c.
+// Menu overlay and scaling, included by shim.c after vk_hook.c and paint_hook.c.
 //
 // On the console CEF draws BeamNG's menus correctly (frames saved by
 // paint_hook.c), BeamNG gets every frame through OnPaint and presents at 60 fps,
-// yet the screen stays black: BeamNG's own drawing of its UI texture does not
-// reach the swapchain. So while CEF's latest frame is opaque (loading screens and
-// menus cover the whole screen), the shim copies it into each swapchain image
-// just before the game presents it: one buffer-to-image copy on the presenting
-// queue, after the game's rendering (its present semaphores) and before the
-// present (a semaphore of the shim's). While the UI is see-through (a HUD over
-// the game) the game's own frame is shown. shim:no-overlay turns it off.
+// yet the screen stays black. So while CEF's latest frame is opaque (loading
+// screens and menus cover the whole screen), the shim copies it into each
+// swapchain image just before the game presents it: one buffer-to-image copy on
+// the presenting queue, after the game's rendering (its present semaphores) and
+// before the present (a semaphore of the shim's). While the UI is see-through (a
+// HUD over the game) the game's own frame is shown. shim:no-overlay turns it off.
+//
+// That alone still showed black (build 15): the 1280x720 swapchain went through
+// Mesa's scaled path, its own images blitted into 1920x1080 framebuffers. So
+// vk_hook.c makes the swapchain at the full size (1920x1080, or shim:vk-size=),
+// whose images are VideoOut's framebuffers, and here each present scales the
+// game's frame, the part of the image it drew at the size it asked for, or the
+// menu, up to the whole image: copied into an image of the shim's first, then
+// blitted back over the whole swapchain image. shim:no-vk-fullsize keeps the
+// game's size.
 //
 // The Vulkan calls go through winevulkan.dll's exports, with the game's device
 // and queue. The structures below are the few this needs, with the layout of
@@ -89,6 +97,40 @@ typedef struct {
 } vk_buffer_create_info_t;
 
 typedef struct {
+  uint32_t s_type;
+  const void* next;
+  uint32_t flags, image_type, format;
+  uint32_t width, height, depth;
+  uint32_t mip_levels, array_layers, samples, tiling, usage, sharing_mode;
+  uint32_t queue_family_index_count;
+  const uint32_t* queue_family_indices;
+  uint32_t initial_layout;
+} vk_image_create_info_t;
+
+typedef struct {
+  uint32_t aspect_mask, mip_level, base_array_layer, layer_count;
+} vk_subresource_layers_t;
+
+typedef struct {
+  vk_subresource_layers_t src;
+  int32_t src_x, src_y, src_z;
+  vk_subresource_layers_t dst;
+  int32_t dst_x, dst_y, dst_z;
+  uint32_t width, height, depth;
+} vk_image_copy_t;
+
+typedef struct {
+  vk_subresource_layers_t src;
+  int32_t src_offsets[2][3];
+  vk_subresource_layers_t dst;
+  int32_t dst_offsets[2][3];
+} vk_image_blit_t;
+
+typedef struct {
+  uint32_t aspect_mask, base_mip_level, level_count, base_array_layer, layer_count;
+} vk_subresource_range_t;
+
+typedef struct {
   uint64_t size, alignment;
   uint32_t memory_type_bits;
 } vk_memory_requirements_t;
@@ -115,16 +157,23 @@ typedef struct {
 enum {
   kOvMaxImages = 8,
   kOvLayoutUndefined = 0,
+  kOvLayoutTransferSrc = 6,
   kOvLayoutTransferDst = 7,
   kOvLayoutPresent = 1000001002,
   kOvStageTransfer = 0x1000,
   kOvStageBottom = 0x2000,
+  kOvAccessTransferRead = 0x800,
   kOvAccessTransferWrite = 0x1000,
   kOvFormatB8G8R8A8Unorm = 44,
   kOvFormatB8G8R8A8Srgb = 50,
-  kOvMaxWidth = 1920,  // the largest UI frame the overlay takes
+  kOvFilterLinear = 1,
+  kOvMaxWidth = 1920,  // the largest UI frame the overlay takes, and the largest game frame it scales
   kOvMaxHeight = 1080,
 };
+
+// The size swapchains are made at (shim:vk-size=), and whether they are (shim:no-vk-fullsize).
+static BOOL g_vk_fullsize = 1;
+static uint32_t g_full_width = 1920, g_full_height = 1080;
 
 // winevulkan.dll's entry points.
 static struct {
@@ -148,6 +197,13 @@ static struct {
   int32_t (*map_memory)(vk_dispatch_t, vk_handle_t, uint64_t, uint64_t, uint32_t, void**);
   void (*get_physical_device_memory_properties)(vk_dispatch_t, void*);
   int32_t (*get_swapchain_images)(vk_dispatch_t, vk_handle_t, uint32_t*, vk_handle_t*);
+  int32_t (*create_image)(vk_dispatch_t, const void*, const void*, vk_handle_t*);
+  void (*get_image_memory_requirements)(vk_dispatch_t, vk_handle_t, void*);
+  int32_t (*bind_image_memory)(vk_dispatch_t, vk_handle_t, vk_handle_t, uint64_t);
+  void (*cmd_copy_image)(vk_dispatch_t, vk_handle_t, uint32_t, vk_handle_t, uint32_t, uint32_t, const void*);
+  void (*cmd_blit_image)(vk_dispatch_t, vk_handle_t, uint32_t, vk_handle_t, uint32_t, uint32_t, const void*,
+                         uint32_t);
+  void (*cmd_clear_color_image)(vk_dispatch_t, vk_handle_t, uint32_t, const void*, uint32_t, const void*);
 } g_vkf;
 
 static struct {
@@ -158,9 +214,10 @@ static struct {
     vk_dispatch_t queue;
     uint32_t family;
   } queues[16];
-  // The swapchain the images belong to.
+  // The swapchain the images belong to, its size, and the size the game asked for and draws at.
   vk_handle_t swapchain;
   uint32_t width, height, format, image_count;
+  uint32_t game_width, game_height;
   vk_handle_t images[kOvMaxImages];
   // Per image: its command buffer, the fence of its last copy, the semaphore the present waits on.
   vk_dispatch_t command_buffers[kOvMaxImages];
@@ -171,7 +228,9 @@ static struct {
   vk_handle_t staging, staging_memory;
   void* staging_map;
   uint32_t staging_width, staging_height;
-  long overlaid;
+  // What a scaled frame is copied into before it is blitted over the whole swapchain image.
+  vk_handle_t scaler, scaler_memory;
+  long overlaid, scaled;
 } g_ov;
 
 static BOOL g_no_overlay;
@@ -219,7 +278,10 @@ static BOOL OverlayLoadFunctions(HMODULE module) {
                          "vkCmdCopyBufferToImage", "vkQueueSubmit", "vkCreateFence", "vkWaitForFences",
                          "vkResetFences", "vkCreateSemaphore", "vkCreateBuffer", "vkGetBufferMemoryRequirements",
                          "vkAllocateMemory", "vkBindBufferMemory", "vkMapMemory",
-                         "vkGetPhysicalDeviceMemoryProperties", "vkGetSwapchainImagesKHR"};
+                         "vkGetPhysicalDeviceMemoryProperties", "vkGetSwapchainImagesKHR", "vkCreateImage",
+                         "vkGetImageMemoryRequirements", "vkBindImageMemory", "vkCmdCopyImage", "vkCmdBlitImage",
+                         "vkCmdClearColorImage"};
+  _Static_assert(sizeof(names) == sizeof(g_vkf), "a name for each entry point");
   void** slots = (void**)&g_vkf;
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
     slots[i] = GetProcAddress(module, names[i]);
@@ -252,13 +314,23 @@ static void OverlayNoteQueue(vk_dispatch_t queue, uint32_t family) {
     }
 }
 
+// Whether a swapchain the game asks for at this size and format is made at the full size instead:
+// the scaler image holds at most kOvMaxWidth x kOvMaxHeight of the game's frame, in its format.
+static BOOL OverlayCanScale(uint32_t width, uint32_t height, uint32_t format) {
+  return g_vk_fullsize && !g_no_overlay && !g_ov.failed && format == kOvFormatB8G8R8A8Unorm && width && height &&
+         width <= kOvMaxWidth && height <= kOvMaxHeight && width <= g_full_width && height <= g_full_height &&
+         (width != g_full_width || height != g_full_height);
+}
+
 static void OverlayNoteSwapchain(vk_dispatch_t device, vk_handle_t swapchain, uint32_t width, uint32_t height,
-                                 uint32_t format) {
+                                 uint32_t game_width, uint32_t game_height, uint32_t format) {
   if (g_ov.swapchain == swapchain) return;
   g_ov.device = device;
   g_ov.swapchain = swapchain;
   g_ov.width = width;
   g_ov.height = height;
+  g_ov.game_width = game_width;
+  g_ov.game_height = game_height;
   g_ov.format = format;
   g_ov.image_count = 0;  // fetched again at the next present
 }
@@ -268,6 +340,15 @@ static void OverlayForgetSwapchain(vk_handle_t swapchain) {
     g_ov.swapchain = 0;
     g_ov.image_count = 0;
   }
+}
+
+// A memory type of bits with all of wanted's property flags, or ~0u.
+static uint32_t OverlayMemoryType(uint32_t bits, uint32_t wanted) {
+  static vk_physical_device_memory_properties_t properties;
+  if (!properties.memory_type_count) g_vkf.get_physical_device_memory_properties(g_ov.physical, &properties);
+  for (uint32_t i = 0; i < properties.memory_type_count && i < 32; ++i)
+    if ((bits & (1u << i)) && (properties.memory_types[i].property_flags & wanted) == wanted) return i;
+  return ~0u;
 }
 
 // Everything the copies need, made once on the presenting queue's family.
@@ -308,14 +389,7 @@ static BOOL OverlayCreate(vk_dispatch_t queue) {
   }
   vk_memory_requirements_t requirements;
   g_vkf.get_buffer_memory_requirements(device, g_ov.staging, &requirements);
-  static vk_physical_device_memory_properties_t properties;
-  g_vkf.get_physical_device_memory_properties(g_ov.physical, &properties);
-  uint32_t type = ~0u;
-  for (uint32_t i = 0; i < properties.memory_type_count && i < 32; ++i)
-    if ((requirements.memory_type_bits & (1u << i)) && (properties.memory_types[i].property_flags & 0x6) == 0x6) {
-      type = i;
-      break;
-    }
+  uint32_t type = OverlayMemoryType(requirements.memory_type_bits, 0x6 /* HOST_VISIBLE | HOST_COHERENT */);
   if (type == ~0u) {
     OverlayFail("no host-visible coherent memory type", 0);
     return 0;
@@ -333,6 +407,35 @@ static BOOL OverlayCreate(vk_dispatch_t queue) {
   return 1;
 }
 
+// The scaler image, made at the first scaled present: B8G8R8A8, as the swapchains it serves.
+static BOOL OverlayCreateScaler(void) {
+  if (g_ov.scaler) return 1;
+  vk_dispatch_t device = g_ov.device;
+  vk_image_create_info_t info = {14,     NULL, 0, 1 /* 2D */, kOvFormatB8G8R8A8Unorm, kOvMaxWidth, kOvMaxHeight, 1,
+                                 1,      1,    1, 0 /* OPTIMAL */, 0x3 /* TRANSFER_SRC | TRANSFER_DST */,
+                                 0,      0,    NULL, kOvLayoutUndefined};
+  vk_handle_t image = 0, memory = 0;
+  int32_t result = g_vkf.create_image(device, &info, NULL, &image);
+  if (result) {
+    OverlayFail("vkCreateImage", result);
+    return 0;
+  }
+  vk_memory_requirements_t requirements;
+  g_vkf.get_image_memory_requirements(device, image, &requirements);
+  uint32_t type = OverlayMemoryType(requirements.memory_type_bits, 0x1 /* DEVICE_LOCAL */);
+  if (type == ~0u) type = OverlayMemoryType(requirements.memory_type_bits, 0);
+  vk_memory_allocate_info_t memory_info = {5, NULL, requirements.size, type};
+  if (type == ~0u || (result = g_vkf.allocate_memory(device, &memory_info, NULL, &memory)) ||
+      (result = g_vkf.bind_image_memory(device, image, memory, 0))) {
+    OverlayFail("scaler memory", result);
+    return 0;
+  }
+  g_ov.scaler = image;
+  g_ov.scaler_memory = memory;
+  VkLog("overlay: scaler image, memory type, bytes", image, type, requirements.size);
+  return 1;
+}
+
 static BOOL OverlayFetchImages(void) {
   if (g_ov.image_count) return 1;
   uint32_t count = kOvMaxImages;
@@ -343,6 +446,9 @@ static BOOL OverlayFetchImages(void) {
   }
   g_ov.image_count = count;
   VkLog("overlay: swapchain images, size", count, ((uint64_t)g_ov.width << 32) | g_ov.height, g_ov.format);
+  if (g_ov.width != g_ov.game_width || g_ov.height != g_ov.game_height)
+    VkLog("overlay: the game draws at, scaled up to", ((uint64_t)g_ov.game_width << 32) | g_ov.game_height,
+          ((uint64_t)g_ov.width << 32) | g_ov.height, 0);
   return 1;
 }
 
@@ -353,24 +459,79 @@ static BOOL OverlayIdle(void) {
   return 1;
 }
 
-// Before the game's present: copies CEF's frame into the image, and returns the present info to
-// use instead of the game's (waiting on the copy), or NULL to present the game's frame as it is.
+static vk_image_memory_barrier_t Barrier(vk_handle_t image, uint32_t src_access, uint32_t dst_access,
+                                         uint32_t old_layout, uint32_t new_layout) {
+  return (vk_image_memory_barrier_t){45, NULL, src_access, dst_access, old_layout, new_layout, ~0u, ~0u, image,
+                                     0x1 /* COLOR */, 0, 1, 0, 1};
+}
+
+// The menu (ui) or the game's frame, width x height at the top left, into the scaler, then blitted
+// over the whole of image, its aspect ratio kept, the bars black.
+static void RecordScale(vk_dispatch_t command_buffer, vk_handle_t image, BOOL ui, uint32_t width, uint32_t height) {
+  vk_image_memory_barrier_t first[2] = {
+      Barrier(g_ov.scaler, 0, kOvAccessTransferWrite, kOvLayoutUndefined, kOvLayoutTransferDst),
+      ui ? Barrier(image, 0, kOvAccessTransferWrite, kOvLayoutUndefined, kOvLayoutTransferDst)
+         : Barrier(image, 0, kOvAccessTransferRead, kOvLayoutPresent, kOvLayoutTransferSrc)};
+  g_vkf.cmd_pipeline_barrier(command_buffer, kOvStageTransfer, kOvStageTransfer, 0, 0, NULL, 0, NULL, 2, first);
+  if (ui) {
+    vk_buffer_image_copy_t region = {0, width, height, 0x1, 0, 0, 1, 0, 0, 0, width, height, 1};
+    g_vkf.cmd_copy_buffer_to_image(command_buffer, g_ov.staging, g_ov.scaler, kOvLayoutTransferDst, 1, &region);
+  } else {
+    vk_image_copy_t region = {{0x1, 0, 0, 1}, 0, 0, 0, {0x1, 0, 0, 1}, 0, 0, 0, width, height, 1};
+    g_vkf.cmd_copy_image(command_buffer, image, kOvLayoutTransferSrc, g_ov.scaler, kOvLayoutTransferDst, 1, &region);
+  }
+  vk_image_memory_barrier_t second[2] = {
+      Barrier(g_ov.scaler, kOvAccessTransferWrite, kOvAccessTransferRead, kOvLayoutTransferDst, kOvLayoutTransferSrc),
+      Barrier(image, 0, kOvAccessTransferWrite, kOvLayoutTransferSrc, kOvLayoutTransferDst)};
+  g_vkf.cmd_pipeline_barrier(command_buffer, kOvStageTransfer, kOvStageTransfer, 0, 0, NULL, 0, NULL, ui ? 1 : 2,
+                             second);
+
+  // Fit width x height in the image, centred.
+  uint32_t to_width = g_ov.width, to_height = g_ov.height;
+  if ((uint64_t)width * g_ov.height > (uint64_t)height * g_ov.width)
+    to_height = (uint32_t)((uint64_t)height * g_ov.width / width);
+  else
+    to_width = (uint32_t)((uint64_t)width * g_ov.height / height);
+  int32_t x = (int32_t)(g_ov.width - to_width) / 2, y = (int32_t)(g_ov.height - to_height) / 2;
+  if (to_width != g_ov.width || to_height != g_ov.height) {
+    static const uint32_t black[4] = {0, 0, 0, 0x3f800000 /* 1.0f */};
+    vk_subresource_range_t range = {0x1, 0, 1, 0, 1};
+    g_vkf.cmd_clear_color_image(command_buffer, image, kOvLayoutTransferDst, black, 1, &range);
+    vk_image_memory_barrier_t cleared =
+        Barrier(image, kOvAccessTransferWrite, kOvAccessTransferWrite, kOvLayoutTransferDst, kOvLayoutTransferDst);
+    g_vkf.cmd_pipeline_barrier(command_buffer, kOvStageTransfer, kOvStageTransfer, 0, 0, NULL, 0, NULL, 1, &cleared);
+  }
+  vk_image_blit_t blit = {{0x1, 0, 0, 1},
+                          {{0, 0, 0}, {(int32_t)width, (int32_t)height, 1}},
+                          {0x1, 0, 0, 1},
+                          {{x, y, 0}, {x + (int32_t)to_width, y + (int32_t)to_height, 1}}};
+  g_vkf.cmd_blit_image(command_buffer, g_ov.scaler, kOvLayoutTransferSrc, image, kOvLayoutTransferDst, 1, &blit,
+                       kOvFilterLinear);
+}
+
+// Before the game's present: copies CEF's frame into the image, or scales the game's frame up to
+// fill it, and returns the present info to use instead of the game's (waiting on that work), or
+// NULL to present the game's frame as it is.
 static const present_info_t* OverlayPresent(void* queue, const present_info_t* info) {
   static present_info_t replacement;
   static vk_handle_t wait_semaphore;
-  if (g_no_overlay || g_ov.failed || !info || info->swapchain_count != 1 || !g_ov.swapchain ||
-      info->swapchains[0] != g_ov.swapchain || !g_frame)
+  if (g_ov.failed || !info || info->swapchain_count != 1 || !g_ov.swapchain || info->swapchains[0] != g_ov.swapchain)
     return NULL;
-  if (g_ov.format != kOvFormatB8G8R8A8Unorm && g_ov.format != kOvFormatB8G8R8A8Srgb) return NULL;
-  FrameLock();
-  BOOL opaque = g_frame_opaque, dirty = g_frame_dirty;
-  FrameUnlock();
-  if (!opaque) return NULL;
-  if (!OverlayCreate(queue) || !OverlayFetchImages()) return NULL;
+  BOOL scale = g_ov.width != g_ov.game_width || g_ov.height != g_ov.game_height;
+  BOOL ui = 0, dirty = 0;
+  if (!g_no_overlay && g_frame &&
+      (g_ov.format == kOvFormatB8G8R8A8Unorm || g_ov.format == kOvFormatB8G8R8A8Srgb)) {
+    FrameLock();
+    ui = g_frame_opaque;
+    dirty = g_frame_dirty;
+    FrameUnlock();
+  }
+  if (!ui && !scale) return NULL;
+  if (!OverlayCreate(queue) || !OverlayFetchImages() || (scale && !OverlayCreateScaler())) return NULL;
   uint32_t index = info->indices[0];
   if (index >= g_ov.image_count) return NULL;
 
-  if (dirty && OverlayIdle()) {
+  if (ui && dirty && OverlayIdle()) {
     FrameLock();
     uint32_t width = g_frame_width < g_ov.width ? g_frame_width : g_ov.width;
     uint32_t height = g_frame_height < g_ov.height ? g_frame_height : g_ov.height;
@@ -384,7 +545,8 @@ static const present_info_t* OverlayPresent(void* queue, const present_info_t* i
     g_frame_dirty = 0;
     FrameUnlock();
   }
-  if (!g_ov.staging_width) return NULL;
+  if (!g_ov.staging_width) ui = 0;
+  if (!ui && !scale) return NULL;
 
   vk_dispatch_t command_buffer = g_ov.command_buffers[index];
   if (g_vkf.wait_for_fences(g_ov.device, 1, &g_ov.fences[index], 1, 200000000ull) != 0) return NULL;
@@ -396,15 +558,21 @@ static const present_info_t* OverlayPresent(void* queue, const present_info_t* i
     OverlayFail("vkBeginCommandBuffer", result);
     return NULL;
   }
-  vk_image_memory_barrier_t to_transfer = {45, NULL, 0, kOvAccessTransferWrite, kOvLayoutUndefined,
-                                           kOvLayoutTransferDst, ~0u, ~0u, g_ov.images[index], 0x1, 0, 1, 0, 1};
-  g_vkf.cmd_pipeline_barrier(command_buffer, kOvStageTransfer, kOvStageTransfer, 0, 0, NULL, 0, NULL, 1,
-                             &to_transfer);
-  vk_buffer_image_copy_t region = {0, g_ov.staging_width, g_ov.staging_height, 0x1, 0, 0, 1, 0, 0, 0,
-                                   g_ov.staging_width, g_ov.staging_height, 1};
-  g_vkf.cmd_copy_buffer_to_image(command_buffer, g_ov.staging, g_ov.images[index], kOvLayoutTransferDst, 1, &region);
-  vk_image_memory_barrier_t to_present = {45, NULL, kOvAccessTransferWrite, 0, kOvLayoutTransferDst,
-                                          kOvLayoutPresent, ~0u, ~0u, g_ov.images[index], 0x1, 0, 1, 0, 1};
+  vk_handle_t image = g_ov.images[index];
+  if (scale) {
+    RecordScale(command_buffer, image, ui, ui ? g_ov.staging_width : g_ov.game_width,
+                ui ? g_ov.staging_height : g_ov.game_height);
+  } else {
+    vk_image_memory_barrier_t to_transfer =
+        Barrier(image, 0, kOvAccessTransferWrite, kOvLayoutUndefined, kOvLayoutTransferDst);
+    g_vkf.cmd_pipeline_barrier(command_buffer, kOvStageTransfer, kOvStageTransfer, 0, 0, NULL, 0, NULL, 1,
+                               &to_transfer);
+    vk_buffer_image_copy_t region = {0, g_ov.staging_width, g_ov.staging_height, 0x1, 0, 0, 1, 0, 0, 0,
+                                     g_ov.staging_width, g_ov.staging_height, 1};
+    g_vkf.cmd_copy_buffer_to_image(command_buffer, g_ov.staging, image, kOvLayoutTransferDst, 1, &region);
+  }
+  vk_image_memory_barrier_t to_present =
+      Barrier(image, kOvAccessTransferWrite, 0, kOvLayoutTransferDst, kOvLayoutPresent);
   g_vkf.cmd_pipeline_barrier(command_buffer, kOvStageTransfer, kOvStageBottom, 0, 0, NULL, 0, NULL, 1, &to_present);
   if ((result = g_vkf.end_command_buffer(command_buffer))) {
     OverlayFail("vkEndCommandBuffer", result);
@@ -424,7 +592,9 @@ static const present_info_t* OverlayPresent(void* queue, const present_info_t* i
   wait_semaphore = g_ov.semaphores[index];
   replacement.wait_count = 1;
   replacement.waits = &wait_semaphore;
-  if (++g_ov.overlaid == 1 || g_ov.overlaid % 600 == 0)
+  if (ui && (++g_ov.overlaid == 1 || g_ov.overlaid % 600 == 0))
     VkLog("overlay: menu frames drawn over the game's", g_ov.overlaid, index, 0);
+  if (scale && (++g_ov.scaled == 1 || g_ov.scaled % 600 == 0))
+    VkLog("overlay: frames scaled up, of them menus", g_ov.scaled, g_ov.overlaid, 0);
   return &replacement;
 }

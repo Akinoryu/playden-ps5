@@ -4,8 +4,12 @@
 //
 // Every winevulkan call goes through one pointer, the Unix call dispatcher.
 // The shim puts its own function there, logs swapchain calls (create, destroy,
-// acquire, present) and passes every call on unchanged, with one exception:
-// on the PS5, swapchains of one size share their display buffers, and a
+// acquire, present) and passes the rest on unchanged. Swapchains are made at
+// the full size with the usage the overlay needs (see the create below), a
+// destroyed one is kept for the identical create that follows, and presents
+// go through the overlay (overlay.c).
+//
+// On the PS5, swapchains of one size share their display buffers, and a
 // replaced swapchain that still holds an image the game acquired keeps that
 // buffer busy until it is destroyed or presented. Two of them and the buffer
 // on screen leave nothing to acquire, and an acquire without a timeout waits
@@ -29,6 +33,7 @@ typedef struct {
   uint64_t surface;
   uint32_t format, color_space, usage, present_mode;
   uint64_t device;
+  BOOL enlarged;  // made at the full size; the overlay scales the game's frames up to it
 } chain_t;
 
 static unix_call_fn g_real_dispatcher;
@@ -125,8 +130,11 @@ typedef struct {
 static const present_info_t* OverlayPresent(void* queue, const present_info_t* info);
 static void OverlayNoteQueue(void* queue, uint32_t family);
 static void OverlayNotePhysical(void* physical);
-static void OverlayNoteSwapchain(void* device, uint64_t swapchain, uint32_t width, uint32_t height, uint32_t format);
+static void OverlayNoteSwapchain(void* device, uint64_t swapchain, uint32_t width, uint32_t height,
+                                 uint32_t game_width, uint32_t game_height, uint32_t format);
 static void OverlayForgetSwapchain(uint64_t swapchain);
+static BOOL OverlayCanScale(uint32_t width, uint32_t height, uint32_t format);
+static uint32_t g_full_width, g_full_height;
 static unsigned g_code_get_queue = ~0u, g_code_get_queue2 = ~0u, g_code_surface_caps = ~0u;
 
 // Presents every image still acquired on a replaced swapchain, which frees its
@@ -277,6 +285,25 @@ static long Acquire(uint64_t handle, unsigned code, void* args, uint64_t swapcha
 static volatile long g_vk_calls;
 static volatile long g_paints, g_accelerated_paints, g_blank_paints;  // paint_hook.c
 
+// Wine answers VK_SUBOPTIMAL_KHR for a swapchain whose size is not its window's, and an enlarged
+// one never is: the game would make its swapchain again at every frame. Its acquires and
+// presents report success instead.
+enum { kSuboptimal = 1000001003 };
+
+static BOOL ChainEnlarged(uint64_t handle) {
+  VkLock();
+  chain_t* chain = FindChain(handle);
+  BOOL enlarged = chain && chain->enlarged;
+  VkUnlock();
+  return enlarged;
+}
+
+static void HideSuboptimal(uint64_t swapchain, int32_t* result) {
+  static long hidden;
+  if (*result != kSuboptimal || !ChainEnlarged(swapchain)) return;
+  *result = 0;
+  if (++hidden == 1) VkLog("Wine's suboptimal answers for the enlarged swapchain hidden from the game", swapchain, 0, 0);
+}
 
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
   long calls = __sync_add_and_fetch(&g_vk_calls, 1);
@@ -288,6 +315,7 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       int32_t result;
     }* p = args;
     long status = Acquire(handle, code, args, p->swapchain, &p->timeout, &p->result);
+    if (!status) HideSuboptimal(p->swapchain, &p->result);
     if (!status) NoteAcquire(p->swapchain, p->index ? *p->index : 0, p->result);
     return status;
   }
@@ -304,6 +332,7 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       int32_t result;
     }* p = args;
     long status = Acquire(handle, code, args, p->info->swapchain, &p->info->timeout, &p->result);
+    if (!status) HideSuboptimal(p->info->swapchain, &p->result);
     if (!status) NoteAcquire(p->info->swapchain, p->index ? *p->index : 0, p->result);
     return status;
   }
@@ -319,6 +348,10 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
     long status = RealFor(handle)(handle, code, args);
     p->info = game_info;
     g_present_handle = handle;
+    if (!status && p->info && p->info->swapchain_count == 1) {
+      if (p->info->results) HideSuboptimal(p->info->swapchains[0], &p->info->results[0]);
+      HideSuboptimal(p->info->swapchains[0], &p->result);
+    }
     NotePresent(p->queue, p->info, status ? -1 : p->result);
     for (uint32_t i = 0; !status && p->info && i < p->info->swapchain_count; ++i)
       PresentOrphans(p->info->swapchains[i]);
@@ -375,19 +408,41 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       VkLog("destroying the kept swapchain first", kept_handles[i], 0, 0);
       RealFor(handle)(handle, g_code_destroy, &destroy);
     }
-    // The overlay copies into the images: they need TRANSFER_DST usage.
+    // The overlay copies into the images: they need TRANSFER_DST usage. On the PS5 a swapchain
+    // of a size VideoOut does not scan out (1280x720) is images of Mesa's own, each present
+    // blitted into a 1920x1080 framebuffer, and BeamNG's screen stayed black that way though
+    // every frame held its menu (build 15). So the swapchain is made at the full size, the
+    // framebuffers themselves, and the overlay scales the game's frame up before each present.
+    // If the full size fails, the game's size is made as before.
     unsigned char info_copy[104];
     const unsigned char* game_info = p->info;
     for (int i = 0; i < 104; ++i) info_copy[i] = game_info[i];
     *(uint32_t*)(info_copy + 56) |= 0x2 /* VK_IMAGE_USAGE_TRANSFER_DST_BIT */;
+    BOOL enlarged = OverlayCanScale(width, height, format);
+    if (enlarged) {
+      *(uint32_t*)(info_copy + 44) = g_full_width;
+      *(uint32_t*)(info_copy + 48) = g_full_height;
+      *(uint32_t*)(info_copy + 56) |= 0x1 /* VK_IMAGE_USAGE_TRANSFER_SRC_BIT */;
+    }
     p->info = info_copy;
     long status = RealFor(handle)(handle, code, args);
+    if (enlarged && (status || p->result)) {
+      VkLog("create swapchain: the full size failed, status, result", (uint32_t)status, (uint32_t)p->result, 0);
+      enlarged = 0;
+      *(uint32_t*)(info_copy + 44) = width;
+      *(uint32_t*)(info_copy + 48) = height;
+      *(uint32_t*)(info_copy + 56) = usage | 0x2;
+      p->result = 0;
+      status = RealFor(handle)(handle, code, args);
+    }
     p->info = game_info;
+    uint32_t made_width = enlarged ? g_full_width : width, made_height = enlarged ? g_full_height : height;
     if (!status && p->result == 0 && p->swapchain)
-      OverlayNoteSwapchain((void*)(uintptr_t)p->device, *p->swapchain, width, height, format);
+      OverlayNoteSwapchain((void*)(uintptr_t)p->device, *p->swapchain, made_width, made_height, width, height,
+                           format);
     VkLock();
     VkLog("create swapchain: old, size, result", old, ((uint64_t)width << 32) | height, (uint32_t)p->result);
-    VkLog("  usage asked, format", usage, format, 0);
+    VkLog("  usage asked, format, size made", usage, format, ((uint64_t)made_width << 32) | made_height);
     if (!status && p->result == 0 && p->swapchain) {
       chain_t* previous = FindChain(g_current_chain);
       if (previous) previous->retired = 1;
@@ -396,7 +451,7 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       for (int i = 0; i < kMaxChains; ++i)
         if (!g_chains[i].handle) {
           g_chains[i] = (chain_t){*p->swapchain, width, height, *(const uint32_t*)(p->info + 32), 0, 0,
-                                  0, 0, surface, format, color_space, usage, present_mode, p->device};
+                                  0, 0, surface, format, color_space, usage, present_mode, p->device, enlarged};
           break;
         }
       g_current_chain = *p->swapchain;

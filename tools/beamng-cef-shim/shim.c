@@ -122,6 +122,8 @@ static BOOL g_vk_reuse;
 static BOOL g_no_shared_texture;
 static BOOL g_keep_begin_frame;
 static BOOL g_no_overlay;
+static BOOL g_vk_fullsize;
+static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -409,7 +411,9 @@ static DWORD ModuleDirectory(WCHAR* dir, DWORD capacity) {
   return n;
 }
 
-static void LoadConfig(void) {
+// Called when the DLL loads: BeamNG makes its swapchain before it starts CEF. Not inlined, so
+// DllMain's frame stays under a page (there is no __chkstk).
+__attribute__((noinline)) static void LoadConfig(void) {
   WCHAR path[1024];
   static const char name[] = "libcef_shim.txt";
   DWORD n = ModuleDirectory(path, 1000);
@@ -461,6 +465,24 @@ static void LoadConfig(void) {
       i = 0;
       while (no_reuse[i] && p[i] == no_reuse[i]) ++i;
       if (!no_reuse[i]) g_vk_reuse = 0;
+      static const char no_fullsize[] = "shim:no-vk-fullsize";
+      i = 0;
+      while (no_fullsize[i] && p[i] == no_fullsize[i]) ++i;
+      if (!no_fullsize[i]) g_vk_fullsize = 0;
+      static const char size[] = "shim:vk-size=";  // WIDTHxHEIGHT, e.g. 3840x2160
+      i = 0;
+      while (size[i] && p[i] == size[i]) ++i;
+      if (!size[i]) {
+        uint32_t width = 0, height = 0;
+        const char* d = p + i;
+        for (; *d >= '0' && *d <= '9' && width < 100000; ++d) width = width * 10 + (uint32_t)(*d - '0');
+        if (*d == 'x') ++d;
+        for (; *d >= '0' && *d <= '9' && height < 100000; ++d) height = height * 10 + (uint32_t)(*d - '0');
+        if (width >= 640 && height >= 360 && width <= 3840 && height <= 2160) {
+          g_full_width = width;
+          g_full_height = height;
+        }
+      }
       static const char no_commit[] = "shim:no-commit";
       i = 0;
       while (no_commit[i] && p[i] == no_commit[i]) ++i;
@@ -687,7 +709,6 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
     Log("libcef-shim: libcef_real.dll or its cef_initialize is missing\n");
     return 0;
   }
-  LoadConfig();
   if (!app) {
     // The game gave no CefApp: give CEF one whose only job is the command line.
     g_fallback_app.base.size = sizeof(g_fallback_app);
@@ -773,7 +794,8 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 15)\n");
+    Log("libcef-shim: loaded (build 16)\n");
+    LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

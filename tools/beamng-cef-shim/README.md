@@ -36,13 +36,25 @@ those leftover images on the replaced swapchains, which frees their buffers. `sh
 keeps the log and turns that off. A Mesa fix in PS5_Mesa's `wsi_common_videoout.c` would make
 this unnecessary.
 
-## Menu overlay
+## Menu overlay and full-size swapchain
 
-On the console CEF draws BeamNG's menus correctly but BeamNG's own frames stay black. While CEF's
+On the console CEF draws BeamNG's menus correctly, yet the screen stayed black. While CEF's
 latest frame is opaque (loading screens, menus), the shim copies it into each swapchain image just
 before BeamNG presents it (`overlay.c`); see-through frames (the in-game HUD) leave BeamNG's frame
-alone. `shim:no-overlay` turns it off. `test/run.sh` checks the overlay on real Vulkan (Mesa's
-lavapipe under Wine, with the Khronos validation layer).
+alone. `shim:no-overlay` turns it off.
+
+With that the screen was still black: BeamNG's window is 1280x720, a size the PS5's VideoOut does
+not scan out, so Mesa gave its swapchain images of its own and blitted each into a 1920x1080
+framebuffer at present. The shim therefore makes BeamNG's swapchain 1920x1080, VideoOut's own
+framebuffers, while BeamNG keeps drawing 1280x720 at the top left of each image, and before each
+present it scales that part (or the menu) up over the whole image, aspect ratio kept. Wine reports
+such a swapchain as suboptimal, since it is not the window's size; the shim reports success to
+BeamNG instead, or it would make its swapchain again at every frame. If the full size cannot be
+made, the shim makes BeamNG's size as before. `shim:no-vk-fullsize` keeps BeamNG's size, and
+`shim:vk-size=3840x2160` picks another full size.
+
+`test/run.sh` checks the overlay and the scaling on real Vulkan (Mesa's lavapipe under Wine, with
+the Khronos validation layer and its synchronization checks).
 
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). To undo, delete the
