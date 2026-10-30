@@ -68,6 +68,7 @@ Recipe fields:
 | `locked` | Setting ids the player must choose "Change anyway" to change. |
 | `requirements` | What the runtime kit's template bottle must provide: `{"audio": "ps5"}` (Wine's PS5 audio driver) is the only one so far. On a kit without it, Playden refuses to prepare or start the game and names what is missing. |
 | `registry` | Values the bottle gets under `HKEY_CURRENT_USER` when the game's files are prepared, as a Steam install script's would be: `{"Software\\Wine\\AppDefaults\\game.exe\\Direct3D": {"VideoMemorySize": "4096"}}`. Only some keys are allowed; see [Registry values](#registry-values). |
+| `ini` | Values the game's own INI files get when the game's files are prepared, written only when the key is missing or empty: `{"BmGame/Config/UserEngine.ini": {"Engine.Engine": {"Language": "int"}}}`. See [INI values](#ini-values). |
 
 Community fields:
 
@@ -132,6 +133,31 @@ needs go instead:
 Other rules: string values only, at most 16 values, printable ASCII, no `"` in
 names or values, no `\` in values, no `[` or `]` in keys, and each value once
 (letter case does not make two values different).
+
+## INI values
+
+Use `ini` only for a value that the game's own launcher writes before it starts
+the game. The console cannot start a second program, so the launcher cannot
+start the game. Batman: Arkham Asylum starts its launcher, and stops, while
+`BmGame/Config/UserEngine.ini` has no `Language` under `[Engine.Engine]`.
+
+Playden writes the values into the game folder whenever it prepares the game or
+applies its settings:
+
+- A value is written only when its key is missing or empty in the section. A
+  value that the player or the game wrote stays.
+- A missing key goes after the last line of its section. A missing section goes
+  at the end of the file. All other lines stay as they are, with the file's own
+  line endings.
+- A missing file is not made: the game makes its own file from its defaults.
+  Playden also leaves a link or a UTF-16 file alone.
+- File, section and key names ignore letter case, as on Windows.
+
+Rules: the file is a `.ini` path in the game folder, with `/` between folders
+and no `.` or `..` part. At most 16 values. Printable ASCII only. No `[` or `]`
+in a section, no `=`, `[` or `]` in a key, and a key does not start with `;` or
+`#`. A value is not empty. Each value once (letter case does not make two
+values different).
 
 ## Shipped recipes
 

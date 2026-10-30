@@ -1343,6 +1343,76 @@ bool RecipeRegistryValueAllowed(const std::string& key, const std::string& name,
   return false;
 }
 
+constexpr std::size_t kMaxRecipeIniValues = 16;
+
+// An INI value a recipe may carry (docs/community-recipes.md): a .ini file inside the game folder,
+// named with '/' and no "." or ".." part, and printable ASCII that keeps each value on its own line
+// under its own [section]: no brackets in the section, no '=' in the key, and no leading ';' or '#',
+// which would make the line a comment.
+bool RecipeIniValueAllowed(const IniValue& value, std::string* why) {
+  const auto printable = [](const std::string& text) {
+    for (const unsigned char c : text)
+      if (c < 0x20 || c > 0x7e) return false;
+    return true;
+  };
+  const auto& file = value.file;
+  bool parts_ok = !file.empty() && file.size() <= 200 && printable(file) &&
+                  file.find_first_of("\\:*?\"<>|") == std::string::npos && file.front() != '/' && file.back() != '/';
+  for (std::size_t start = 0; parts_ok && start <= file.size();) {
+    const auto end = std::min(file.find('/', start), file.size());
+    const auto part = file.substr(start, end - start);
+    parts_ok = !part.empty() && part != "." && part != "..";
+    start = end + 1;
+  }
+  if (!parts_ok || file.size() < 5 || LowerAscii(file.substr(file.size() - 4)) != ".ini") {
+    *why = "file is not a .ini path inside the game folder";
+    return false;
+  }
+  if (value.section.empty() || value.section.size() > 128 || !printable(value.section) ||
+      value.section.find_first_of("[]") != std::string::npos) {
+    *why = "section is not printable ASCII without brackets";
+    return false;
+  }
+  const auto& key = value.key;
+  if (key.empty() || key.size() > 64 || !printable(key) || key.find_first_of("=[]") != std::string::npos ||
+      key.front() == ';' || key.front() == '#' || key.front() == ' ' || key.back() == ' ') {
+    *why = "key is not printable ASCII without '=' or brackets";
+    return false;
+  }
+  if (value.value.empty() || value.value.size() > 256 || !printable(value.value) || value.value.front() == ' ' ||
+      value.value.back() == ' ') {
+    *why = "value is not printable ASCII";
+    return false;
+  }
+  return true;
+}
+
+// The ini field as ParseGameRecipe reads it, grouped by file and section; each file starts on
+// file_break (empty for the compact form) and the closing brace on end_break.
+std::string SerializeIniValues(const std::vector<IniValue>& values, const std::string& file_break,
+                               const std::string& end_break) {
+  const auto quoted = [](const std::string& text) { return "\"" + json::escape(text) + "\""; };
+  const std::string space = file_break.empty() ? "" : " ";
+  std::map<std::string, std::map<std::string, std::vector<const IniValue*>>> files;
+  for (const auto& value : values) files[value.file][value.section].push_back(&value);
+  std::string text = "{";
+  bool first_file = true;
+  for (const auto& [file, sections] : files) {
+    text += std::string(first_file ? "" : ",") + file_break + quoted(file) + ":" + space + "{";
+    first_file = false;
+    bool first_section = true;
+    for (const auto& [section, keys] : sections) {
+      text += std::string(first_section ? "" : "," + space) + quoted(section) + ":" + space + "{";
+      first_section = false;
+      for (std::size_t index = 0; index < keys.size(); ++index)
+        text += std::string(index ? "," + space : "") + quoted(keys[index]->key) + ":" + space + quoted(keys[index]->value);
+      text += "}";
+    }
+    text += "}";
+  }
+  return text + end_break + "}";
+}
+
 }  // namespace
 
 bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* reason) {
@@ -1425,6 +1495,28 @@ bool ParseGameRecipe(std::string_view text, GameRecipe* recipe, std::string* rea
         if (out.registry.size() >= kMaxRecipeRegistryValues) return fail("registry has too many values");
         if (!identities.insert(LowerAscii(key + "\n" + name)).second) return fail("registry " + key + " " + name + " appears twice");
         out.registry.push_back({key, name, "\"" + *string + "\""});
+      }
+    }
+  }
+  if (const auto* ini = root->get("ini")) {
+    const auto* files = ini->object();
+    if (!files) return fail("ini must map files to their sections");
+    // Windows reads the files, sections and keys ignoring case, so each value is named once.
+    std::set<std::string> identities;
+    for (const auto& [file, sections] : *files) {
+      if (!sections.object()) return fail("ini file " + file + " must map sections to their values");
+      for (const auto& [section, keys] : *sections.object()) {
+        if (!keys.object()) return fail("ini section " + section + " must map keys to strings");
+        for (const auto& [key, value] : *keys.object()) {
+          if (!value.string()) return fail("ini value " + key + " must be a string");
+          IniValue entry{file, section, key, *value.string()};
+          std::string why;
+          if (!RecipeIniValueAllowed(entry, &why)) return fail("ini " + file + " [" + section + "] " + key + ": " + why);
+          if (out.ini.size() >= kMaxRecipeIniValues) return fail("ini has too many values");
+          if (!identities.insert(LowerAscii(file + "\n" + section + "\n" + key)).second)
+            return fail("ini " + file + " [" + section + "] " + key + " appears twice");
+          out.ini.push_back(std::move(entry));
+        }
       }
     }
   }
@@ -1607,6 +1699,7 @@ std::string SerializeGameRecipe(const GameRecipe& recipe) {
     }
     text += "}";
   }
+  if (!recipe.ini.empty()) text += ",\"ini\":" + SerializeIniValues(recipe.ini, "", "");
   return text + "}\n";
 }
 
@@ -3141,6 +3234,7 @@ CommunityRecipe BuildCommunityRecipe(const GameRecipe& recipe, const EffectiveSe
     if (!settings.values.at(id).unlocked) shared.locked.insert(id);
   // What the bottle gets and what the kit must provide stay with the game.
   shared.registry = recipe.registry;
+  shared.ini = recipe.ini;
   shared.requirements = recipe.requirements;
   out.status = "untested";
   return out;
@@ -3203,6 +3297,7 @@ std::string SerializeCommunityRecipe(const CommunityRecipe& community) {
     }
     text += "\n  }";
   }
+  if (!recipe.ini.empty()) text += ",\n  \"ini\": " + SerializeIniValues(recipe.ini, "\n    ", "\n  ");
   text += ",\n  \"steam_appid\": " + std::to_string(recipe.app_id) + ",\n  \"executable\": " +
           quoted(community.executable) + ",\n  \"community\": {\n    \"format_version\": 1,\n    \"min_kit\": " +
           quoted(community.min_kit) + ",\n    \"tested_firmware\": " + quoted(community.tested_firmware) +

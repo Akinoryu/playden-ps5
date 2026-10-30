@@ -135,6 +135,19 @@ struct RegistryValue {
   bool default_value = false;  // Wine uses @= for a key's unnamed value
 };
 
+// One value a recipe puts in an INI file of the game's own folder (runtime/recipe_ini.h): written
+// only while the key is missing or empty, so the player's own choice is never replaced.
+struct IniValue {
+  std::string file;     // relative to the game folder, '/' separators, e.g. BmGame/Config/UserEngine.ini
+  std::string section;  // without brackets, e.g. Engine.Engine
+  std::string key;
+  std::string value;
+};
+
+inline bool operator==(const IniValue& left, const IniValue& right) {
+  return left.file == right.file && left.section == right.section && left.key == right.key && left.value == right.value;
+}
+
 struct GameRecipe {
   std::string id;
   int version = 0;
@@ -160,6 +173,9 @@ struct GameRecipe {
   // Values the bottle's user.reg gets when the game's files are prepared, as a Steam install
   // script's would be (docs/community-recipes.md): strings under HKEY_CURRENT_USER.
   std::vector<RegistryValue> registry;
+  // Values the game's own INI files get when its files are prepared, for a setting the game's
+  // launcher would write before starting the game, which the console can't do (Batman: Arkham Asylum).
+  std::vector<IniValue> ini;
   // What the kit's template bottle must provide ("audio": "ps5"); see UnmetRecipeRequirements.
   std::map<std::string, std::string> requirements;
 };

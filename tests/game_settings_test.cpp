@@ -1292,6 +1292,43 @@ int main(int argc, char** argv) {
     CHECK(ReadText(registry_root / "user.reg").find("\n[Software\\\\Wine\\\\AppDefaults\\\\a.exe\\\\Direct3D] 1791500000\n\"VideoMemorySize\"=\"4096\"\n") != std::string::npos);
     std::filesystem::remove_all(registry_root);
   }
+  // A recipe can carry values for the game's own INI files, written at preparation while the key is missing or
+  // empty (runtime/recipe_ini.h): a .ini inside the game folder, one value per line under its own section.
+  {
+    const std::string head = R"({"recipe_id":"x","recipe_version":1,"app_id":1,"launch_entries":[{"id":"a","label":"A","executable":"a.exe"}],"ini":)";
+    GameRecipe with_ini;
+    CHECK(ParseGameRecipe(head + R"({"BmGame/Config/UserEngine.ini":{"Engine.Engine":{"Language":"int","Other":"1"}},"b.ini":{"S":{"k":"v"}}}})",
+                          &with_ini, &reason));
+    CHECK(with_ini.ini.size() == 3);
+    CHECK(std::count(with_ini.ini.begin(), with_ini.ini.end(),
+                     IniValue{"BmGame/Config/UserEngine.ini", "Engine.Engine", "Language", "int"}) == 1);
+    GameRecipe reread;
+    CHECK(ParseGameRecipe(SerializeGameRecipe(with_ini), &reread, &reason));
+    CHECK(std::is_permutation(reread.ini.begin(), reread.ini.end(), with_ini.ini.begin(), with_ini.ini.end()));
+    CHECK(SerializeGameRecipe(hl2).find("\"ini\"") == std::string::npos);  // absent when empty
+    GameRecipe refused;
+    const auto refuses = [&](const std::string& ini) {
+      return !ParseGameRecipe(head + ini + "}", &refused, &reason);
+    };
+    CHECK(refuses(R"([])"));                                            // not an object
+    CHECK(refuses(R"({"a.ini":{"S":{"k":1}}})"));                       // not a string
+    CHECK(refuses(R"({"a.ini":{"S":"k=v"}})"));                         // a section maps keys
+    CHECK(refuses(R"({"/etc/a.ini":{"S":{"k":"v"}}})"));                // outside the game folder
+    CHECK(refuses(R"({"Config/../../a.ini":{"S":{"k":"v"}}})"));
+    CHECK(refuses(R"({"Config\\a.ini":{"S":{"k":"v"}}})"));             // '/' separators only
+    CHECK(refuses(R"({"Config//a.ini":{"S":{"k":"v"}}})"));
+    CHECK(refuses(R"({"Config/a.cfg":{"S":{"k":"v"}}})"));              // only .ini files
+    CHECK(refuses(R"({"a.ini":{"S]":{"k":"v"}}})"));                    // would end the header early
+    CHECK(refuses(R"({"a.ini":{"S":{"k=x":"v"}}})"));                   // would be another key
+    CHECK(refuses(R"({"a.ini":{"S":{";k":"v"}}})"));                    // would be a comment
+    CHECK(refuses(R"({"a.ini":{"S":{"k":"two\nlines"}}})"));
+    CHECK(refuses(R"({"a.ini":{"S":{"k":""}}})"));                      // nothing to write
+    CHECK(refuses(R"({"a.ini":{"S":{"k":"v"}},"A.INI":{"s":{"K":"w"}}})"));  // the same value twice, ignoring case
+    CHECK(reason.find("appears twice") != std::string::npos);
+    std::string many = "{\"a.ini\":{\"S\":{";
+    for (int index = 0; index < 17; ++index) many += std::string(index ? "," : "") + "\"k" + std::to_string(index) + "\":\"v\"";
+    CHECK(refuses(many + "}}}") && reason.find("too many") != std::string::npos);
+  }
   // Final Fantasy XIII asks DxDiag for its video memory, which Wine answers from wined3d, so the shipped
   // recipe sets wined3d's VideoMemorySize for its program. Its Direct3D 9 goes to DXVK (a shipped recipe
   // names its own overrides), and it wants the Steam emulator, not the game's own files.
@@ -2094,8 +2131,10 @@ int main(int argc, char** argv) {
     with_extras.registry = {{"Software\\Wine\\AppDefaults\\a.exe\\Direct3D", "VideoMemorySize", "\"4096\""},
                             {"Software\\Studio\\Game", "Language", "\"en\""}};
     with_extras.requirements = {{"audio", "ps5"}};
+    with_extras.ini = {{"BmGame/Config/UserEngine.ini", "Engine.Engine", "Language", "int"}};
     CHECK(ParseGameRecipe(SerializeCommunityRecipe(BuildCommunityRecipe(with_extras, settings)), &exported, &reason));
     CHECK(exported.requirements == with_extras.requirements && exported.registry.size() == 2);
+    CHECK(exported.ini == with_extras.ini);
     for (const auto& value : with_extras.registry)
       CHECK(std::any_of(exported.registry.begin(), exported.registry.end(), [&](const RegistryValue& read) {
         return read.key == value.key && read.name == value.name && read.data == value.data;

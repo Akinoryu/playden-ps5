@@ -10,6 +10,7 @@
 #include "runtime/prospero_profile.h"
 #include "runtime/settings_publication_journal.h"
 #include "runtime/dotnet_heap.h"
+#include "runtime/recipe_ini.h"
 #include "runtime/game_probe.h"
 #include "runtime/install_script.h"
 #include "runtime/layout_migration.h"
@@ -1075,6 +1076,21 @@ std::string RuntimeHost::RecipeRegistryStep(const GameFiles& files) {
   return {};
 }
 
+// Generic step: values the recipe puts in the game's own INI files (docs/community-recipes.md), only where the key
+// is missing or empty, for a setting the game's launcher would write before starting the game.
+std::string RuntimeHost::RecipeIniStep(const GameFiles& files) {
+  const auto& ini = files.recipe->ini;
+  if (ini.empty()) return {};
+  const auto applied = rt::ApplyRecipeIniValues(files.root.string(), ini);
+  std::string changed, skipped;
+  for (const auto& file : applied.changed) changed += (changed.empty() ? "" : ",") + file;
+  for (const auto& file : applied.skipped) skipped += (skipped.empty() ? "" : ",") + file;
+  Log("recipe ini app=" + std::to_string(files.record.runtime_number) + " values=" + std::to_string(ini.size()) +
+      " changed=" + (changed.empty() ? "-" : changed) + (skipped.empty() ? std::string() : " skipped=" + skipped) +
+      (applied.ok ? std::string() : " failed=" + applied.message));
+  return applied.ok ? std::string() : applied.message;
+}
+
 // Generic step: self-contained .NET games reserve more address space than the console grants unless their
 // garbage collector is given a heap limit (runtime/dotnet_heap.h).
 std::string RuntimeHost::DotnetHeapStep(const GameFiles& files) {
@@ -1089,8 +1105,8 @@ std::string RuntimeHost::DotnetHeapStep(const GameFiles& files) {
 }
 
 // The steps run in this order for every game, whatever its store: generic ones (media, EULA, Direct3D 12,
-// the bottle's Environment, MFC, the recipe's registry values, the .NET heap) and Steam-file ones, which act only
-// on the Steam files a game has (SteamStub, Steamworks and steam.dll, install scripts and redistributables).
+// the bottle's Environment, MFC, the recipe's registry and INI values, the .NET heap) and Steam-file ones, which act
+// only on the Steam files a game has (SteamStub, Steamworks and steam.dll, install scripts and redistributables).
 std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::RuntimeInstall& record, bool steam_account_known) {
   MediaStep(c, record);
   GameFiles files{record};
@@ -1132,6 +1148,7 @@ std::string RuntimeHost::ApplyPreparationSteps(Composition& c, const rt::Runtime
   if (auto refused = InstallScriptsStep(files); !refused.empty()) return refused;
   MfcStep(files);
   if (auto refused = RecipeRegistryStep(files); !refused.empty()) return refused;
+  if (auto refused = RecipeIniStep(files); !refused.empty()) return refused;
   return DotnetHeapStep(files);
 }
 

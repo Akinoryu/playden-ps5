@@ -607,6 +607,7 @@ class RuntimeHost {
   void KitMonoStep(Composition& composition, const runtime::RuntimeInstall& record, const char* when);  // never stops the start
   std::string BottleEnvironmentStep(const GameFiles& files);
   std::string RecipeRegistryStep(const GameFiles& files);
+  std::string RecipeIniStep(const GameFiles& files);
   std::string DotnetHeapStep(const GameFiles& files);
   void MfcStep(const GameFiles& files);  // an upgrade: never stops the start
   // Steam-file steps.
