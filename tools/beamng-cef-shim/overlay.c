@@ -363,8 +363,10 @@ static uint32_t OverlayMemoryType(uint32_t bits, uint32_t wanted) {
 // Everything the copies need, made once on the presenting queue's family.
 static BOOL OverlayCreate(vk_dispatch_t queue) {
   if (g_ov.ready) return g_ov.ready_queue == queue;
-  if (!g_ov.physical) {
-    OverlayFail("no physical device seen yet", 0);
+  if (!g_ov.physical) {  // tried again at the next present
+    static BOOL logged;
+    if (!logged) Log("libcef-shim: overlay waits for the game's physical device\n");
+    logged = 1;
     return 0;
   }
   if (!OverlayLoadFunctions(g_vk_modules[0].module)) return 0;

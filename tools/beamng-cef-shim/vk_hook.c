@@ -136,6 +136,9 @@ static void OverlayForgetSwapchain(uint64_t swapchain);
 static BOOL OverlayCanScale(uint32_t width, uint32_t height, uint32_t format);
 static uint32_t g_full_width, g_full_height;
 static unsigned g_code_get_queue = ~0u, g_code_get_queue2 = ~0u, g_code_surface_caps = ~0u;
+// Calls whose first parameter is the physical device the overlay needs (memory properties and the
+// like, which BeamNG asks for when it starts).
+static unsigned g_code_physical[3] = {~0u, ~0u, ~0u};
 
 // Presents every image still acquired on a replaced swapchain, which frees its
 // display buffer. Called with the lock not held. Goes through winevulkan's own
@@ -508,8 +511,9 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
     if (!status && p->queue && *p->queue && p->info) OverlayNoteQueue(*p->queue, *(const uint32_t*)(p->info + 20));
     return status;
   }
-  if (code == g_code_surface_caps) {
-    OverlayNotePhysical(*(void**)args);  // its first parameter is the physical device
+  if (code == g_code_surface_caps || code == g_code_physical[0] || code == g_code_physical[1] ||
+      code == g_code_physical[2]) {
+    OverlayNotePhysical(*(void**)args);  // their first parameter is the physical device
     return RealFor(handle)(handle, code, args);
   }
   return RealFor(handle)(handle, code, args);
@@ -536,6 +540,24 @@ static BOOL DecodeThunk(const unsigned char* code, BOOL queue_call, unsigned* ca
 
 // Points one winevulkan.dll's swapchain calls at VkDispatcher. Every copy of the DLL a game
 // loads has its own code and its own dispatcher pointer.
+// Whether address is in module's image. Until a module first calls into its Unix side, its slot
+// holds winecrt0's fallback, code of the module itself: that looks up ntdll's
+// __wine_unix_call_dispatcher, writes it into the slot and jumps through it. So a call passed on to
+// the fallback unhooks the module (build 17 hooked winevulkan.dll that early, and most calls went
+// past the shim); ntdll's dispatcher, what the fallback would write, is called instead.
+static BOOL InImage(HMODULE module, const void* address) {
+  const unsigned char* base = (const unsigned char*)module;
+  DWORD size = *(const DWORD*)(base + *(const int32_t*)(base + 0x3c) + 0x50);  // SizeOfImage
+  return (const unsigned char*)address >= base && (const unsigned char*)address < base + size;
+}
+
+static unix_call_fn NtdllDispatcher(void) {
+  static const WCHAR name[] = {'n', 't', 'd', 'l', 'l', '.', 'd', 'l', 'l', 0};
+  HMODULE ntdll = GetModuleHandleW(name);
+  unix_call_fn* variable = ntdll ? (unix_call_fn*)GetProcAddress(ntdll, "__wine_unix_call_dispatcher") : NULL;
+  return variable ? *variable : NULL;
+}
+
 static void HookModule(HMODULE module) {
   const char* names[] = {"vkAcquireNextImageKHR", "vkAcquireNextImage2KHR", "vkCreateSwapchainKHR",
                          "vkDestroySwapchainKHR", "vkQueuePresentKHR"};
@@ -556,10 +578,16 @@ static void HookModule(HMODULE module) {
   g_code_acquire = codes[0], g_code_acquire2 = codes[1], g_code_create = codes[2], g_code_destroy = codes[3];
   g_code_present = codes[4];
   // For the overlay: the calls that name a queue's family and the physical device.
-  const char* extra_names[] = {"vkGetDeviceQueue", "vkGetDeviceQueue2", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"};
-  static const unsigned extra_expected[] = {0x211, 0x212, 0x267};
-  unsigned* extra_codes[] = {&g_code_get_queue, &g_code_get_queue2, &g_code_surface_caps};
-  for (int i = 0; i < 3; ++i) {
+  const char* extra_names[] = {"vkGetDeviceQueue",
+                               "vkGetDeviceQueue2",
+                               "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+                               "vkGetPhysicalDeviceMemoryProperties",
+                               "vkGetPhysicalDeviceMemoryProperties2",
+                               "vkGetPhysicalDeviceProperties"};
+  static const unsigned extra_expected[] = {0x211, 0x212, 0x267, 0x251, 0x252, 0x257};
+  unsigned* extra_codes[] = {&g_code_get_queue,  &g_code_get_queue2, &g_code_surface_caps,
+                             &g_code_physical[0], &g_code_physical[1], &g_code_physical[2]};
+  for (int i = 0; i < 6; ++i) {
     const unsigned char* thunk = GetProcAddress(module, extra_names[i]);
     unsigned extra_code = ~0u;
     unix_call_fn* extra_slot = slot;
@@ -578,6 +606,13 @@ static void HookModule(HMODULE module) {
       break;
     }
   unix_call_fn real = *slot;
+  if (InImage(module, (const void*)real)) {
+    // winecrt0's fallback: see InImage.
+    unix_call_fn resolved = NtdllDispatcher();
+    VkLog("the slot holds winecrt0's fallback; calls go to ntdll's dispatcher", (uint64_t)(uintptr_t)real,
+          (uint64_t)(uintptr_t)resolved, 0);
+    if (resolved) real = resolved;
+  }
   if (g_real_dispatcher && real != g_real_dispatcher && real != VkDispatcher)
     VkLog("this copy's dispatcher differs", (uint64_t)(uintptr_t)module, (uint64_t)(uintptr_t)real, 0);
   if (!g_real_dispatcher && real != VkDispatcher) g_real_dispatcher = real;
@@ -661,9 +696,21 @@ static BOOL SameNameNoCase(const WCHAR* a, const char* b) {
 static void VerifyPatches(void) {
   for (int m = 0; m < g_vk_module_count; ++m) {
     vk_module_t* record = &g_vk_modules[m];
-    if (*(void* volatile*)record->slot != (void*)VkDispatcher) {
-      VkLog("dispatcher slot was restored, setting it again", (uint64_t)(uintptr_t)record->slot,
-            (uint64_t)(uintptr_t)*(void* volatile*)record->slot, 0);
+    unix_call_fn current = (unix_call_fn)*(void* volatile*)record->slot;
+    if (current != VkDispatcher) {
+      // What the module put there is the dispatcher to call from now on (see InImage): passed on to
+      // winecrt0's fallback, every call would put ntdll's dispatcher back in the slot.
+      static long restores;
+      if (!InImage(record->module, (const void*)current) && current != record->real) {
+        VkLog("the module set its dispatcher; calls go to it now", (uint64_t)(uintptr_t)record->real,
+              (uint64_t)(uintptr_t)current, 0);
+        if (g_real_dispatcher == record->real) g_real_dispatcher = current;
+        record->real = current;
+        __sync_synchronize();
+      } else if (++restores <= 20 || restores % 100 == 0) {
+        VkLog("dispatcher slot was restored, setting it again: slot, value, times", (uint64_t)(uintptr_t)record->slot,
+              (uint64_t)(uintptr_t)current, (uint64_t)restores);
+      }
       DWORD old_protect;
       if (VirtualProtect(record->slot, 8, PAGE_READWRITE, &old_protect)) {
         *record->slot = VkDispatcher;
