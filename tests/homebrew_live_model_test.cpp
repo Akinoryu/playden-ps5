@@ -662,6 +662,83 @@ void live_program_change_applies_like_other_settings(const std::filesystem::path
           "program: the reset applies the same way");
 }
 
+// Run a program once… (Game actions): a program from the game folder, its settings launcher, starts once through
+// Play's own request, which carries the program; Game settings and the next Play stay the game's.
+void live_runs_setup_program_once(const std::filesystem::path& base) {
+    using playden::homebrew::GameId;
+    using playden::homebrew::TitleActivity;
+    std::filesystem::create_directories(base);
+    auto model = make_live(base);
+    model.SetGameSettingsFile(base / "setup-program-settings.json");
+    model.SetSettingsData({{"playden-default", "Playden default", "Most games", "", {}}}, {});
+    model.UpdateAccount({AuthState::SignedIn, "account", "Owner", {}, {}, false});
+    playden::GameSummary game;
+    game.id = SteamId(35140);
+    game.title = "Batman: Arkham Asylum GOTY Edition";
+    check(model.UpdateLibrary({{game}, false, {}, false, true, 100}), "setup program: library delivered");
+    model.UpdateInstalls({}, {{SteamId(35140), 1024, "internal", true}});
+    playden::runtime::GameRecipe recipe;
+    recipe.id = playden::runtime::GeneratedRecipeId(35140);
+    recipe.version = 2;
+    recipe.app_id = 35140;
+    recipe.name = game.title;
+    recipe.launch_entries = {{"launch-1", "Play", "Binaries/ShippingPC-BmGame.exe", "", ""}};
+    model.SetGeneratedRecipes({recipe});
+    std::map<GameId, playden::homebrew::LiveGameSetup> setups;
+    setups[SteamId(35140)].scanned = true;
+    setups[SteamId(35140)].programs = {{"Binaries/BmLauncher.exe", "pe32", "", false, ""},
+                                       {"Binaries/ShippingPC-BmGame.exe", "pe32", "", false, ""},
+                                       {"Binaries/UE3ShaderCompileWorker.exe", "pe32", "Uses a missing DLL.", false, ""}};
+    model.SetGameSetups(setups);
+    playden::homebrew::LiveRuntimeGame runtime;
+    runtime.game_id = SteamId(35140);
+    runtime.status = "Ready";
+    runtime.ready = runtime.prepared = runtime.has_title = runtime.can_play = true;
+    runtime.launch_entry_id = "launch-1";
+    runtime.activity = TitleActivity::Running;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
+    check(model.action("details:35140"), "setup program: open details");
+
+    // Not while the game runs.
+    activate(model, "details-more");
+    check(find_row(model, "run-once") && !find_row(model, "run-once")->enabled, "setup program: waits while the game runs");
+    model.action("circle");
+    runtime.activity = TitleActivity::Stopped;
+    model.UpdateRuntime(playden::homebrew::RuntimeState::Ready, {runtime});
+
+    // The folder's programs: the game's own is named, one the console can't start is not offered.
+    activate(model, "details-more");
+    check(find_row(model, "run-once")->enabled && find_row(model, "run-once")->title == "Run a program once…",
+          "setup program: Game actions offers it");
+    activate(model, "run-once");
+    check(model.state().navigation.modals.back().id == "setup-programs", "setup program: the picker opens");
+    check(find_row(model, "setup-program-0")->enabled && find_row(model, "setup-program-1")->value == "The game's program" &&
+              !find_row(model, "setup-program-2")->enabled,
+          "setup program: the picker names the game's program and refuses what can't start");
+    (void)model.TakeProgramScanRequests();
+    activate(model, "setup-program-0");
+    check(model.state().navigation.modals.back().title == "Run BmLauncher.exe once?" &&
+              model.state().navigation.modals.back().body.find("Mouse preset") != std::string::npos,
+          "setup program: the confirmation names the program and the Mouse preset");
+    check(model.TakeRuntimePlayRequests().empty(), "setup program: nothing starts before the confirmation");
+    activate(model, "run-once-start");
+    check(model.state().navigation.modals.empty() &&
+              model.TakeRuntimePlayRequests() == std::vector<playden::GameId>{SteamId(35140)},
+          "setup program: Run once asks for Play");
+    check(model.TakeRuntimeSetupPrograms() == std::map<GameId, std::string>{{SteamId(35140), "Binaries/BmLauncher.exe"}},
+          "setup program: the Play request carries the program");
+    check(!model.state().game_settings.count(SteamId(35140)), "setup program: Game settings stay as they were");
+
+    // A plain Play after a run that never reached the runtime starts the game.
+    activate(model, "details-more");
+    activate(model, "run-once");
+    activate(model, "setup-program-0");
+    activate(model, "run-once-start");
+    activate(model, "details-play");
+    check(model.TakeRuntimePlayRequests().size() == 2 && model.TakeRuntimeSetupPrograms().empty(),
+          "setup program: Play replaces the program's run");
+}
+
 void live_download_telemetry() {
     using namespace playden::homebrew;
     Simulation model({}, {}, ModelMode::Live);
@@ -2022,6 +2099,7 @@ int main() {
     live_refresh_rate_keeps_off_over_a_preset_cap(base / "capped");
     live_update_runtime_from_maintenance(base / "update-runtime");
     live_program_change_applies_like_other_settings(base);
+    live_runs_setup_program_once(base);
     live_imported_game_steam_app_id(base);
     live_imported_program_seeds_once(base);
     live_setup_asks_for_a_steam_program(base);

@@ -947,6 +947,13 @@ void Controller::TickRuntime() {
     }
   }
   auto plays = model_.TakeRuntimePlayRequests();
+  {
+    auto programs = model_.TakeRuntimeSetupPrograms();
+    for (const auto id : plays) {
+      if (const auto found = programs.find(id); found != programs.end()) setup_programs_[id] = found->second;
+      else setup_programs_.erase(id);
+    }
+  }
   // A game whose update is putting its files in place doesn't start (the details page says so).
   if (installs_) std::erase_if(plays, [this](GameId id) { return installs_->Locked(id); });
   std::erase_if(plays, [this](GameId id) { return HoldForDropFolder(id, DropFolderNext::kPlay); });
@@ -1219,11 +1226,14 @@ void Controller::TickRuntime() {
       });
       model_.NotifyPlayStopped(id, moving ? "The game is moving to another drive. Play once the move finishes."
                                           : "The game's update is putting its files in place. Play once it finishes.");
+      setup_programs_.erase(id);
       continue;
     }
     play_queued_.insert(id);
     ++plays_requested_;
-    runtime_->Play(*app);
+    const auto program = setup_programs_.find(id);
+    runtime_->Play(*app, program == setup_programs_.end() ? std::string() : program->second);
+    if (program != setup_programs_.end()) setup_programs_.erase(program);
   }
   plays_ready_ = std::move(later);
   {

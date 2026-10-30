@@ -464,8 +464,10 @@ class RuntimeHost {
   // The names each game's PS5 title should carry. A Ready title whose installed
   // name differs reports an update, and Prepare applies the new name.
   void SetTitleNames(std::map<std::uint32_t, std::string> names);
-  // Queues Play of a Ready game.
-  void Play(std::uint32_t runtime_number);
+  // Queues Play of a Ready game. With setup_program (a program in the game folder, relative to it), the title starts
+  // that program once instead, with the Mouse controller preset, and the game's saved settings come back with the
+  // next publication: the next Play, or the next start of Playden (RuntimeInstall::setup_program).
+  void Play(std::uint32_t runtime_number, std::string setup_program = {});
   // A game's files changed outside the runtime (an update finished): the installs are checked again, so
   // RuntimeInstallView::files_changed follows.
   void RecheckInstalls();
@@ -548,16 +550,22 @@ class RuntimeHost {
   // With force, the settings are published again even when the title already has their revision:
   // after Update moved the title to another runtime, which may take different profile keys (120 Hz
   // output). Nothing is published when they write the same profile and dxvk.conf as before.
+  // With setup_program, the saved settings are published with that program and the Mouse controller preset in
+  // their place, for one run (Play). A title that publishes such a run gets its saved settings back from the next
+  // call without it, whatever their revision.
   std::string RepublishSettings(Composition& composition, const runtime::RuntimeInstall& record,
                                 bool* published = nullptr, bool steam_account_known = true,
                                 bool* prepare_again = nullptr, std::string* upgrade_deferred = nullptr,
-                                std::string* code = nullptr, bool force = false);
+                                std::string* code = nullptr, bool force = false, const std::string& setup_program = {});
   // RepublishSettings without the upgrade's fallback.
   // `defaults_published`: with force, a game with no saved settings whose title has revision 0 was
   // published from Playden's defaults, so they are published again.
   std::string PublishSavedSettings(Composition& composition, const runtime::RuntimeInstall& record,
                                    bool* published, bool steam_account_known, bool* prepare_again,
-                                   std::string* code = nullptr, bool force = false, bool defaults_published = false);
+                                   std::string* code = nullptr, bool force = false, bool defaults_published = false,
+                                   const std::string& setup_program = {});
+  // Records the program the title's profile starts once (RuntimeInstall::setup_program); empty: none.
+  std::string MarkSetupProgram(Composition& composition, const std::string& install_id, const std::string& program);
   // Whether an update left its marker in the Ready game's folder (installs::kFilesChangedName).
   bool FilesChanged(const runtime::RuntimeInstall& record) const;
   // The Ready-path part of Prepare for a game whose files changed: its generated recipe is made again
@@ -647,7 +655,7 @@ class RuntimeHost {
   void HealBottle(Composition& composition, const std::string& data_root, const std::string& title_id);
   runtime::LaunchEvidence Evidence(Composition& composition, const runtime::RuntimeInstall& record,
                                    const std::string& session_id);
-  void RunPlay(Composition& composition, std::uint32_t runtime_number);
+  void RunPlay(Composition& composition, std::uint32_t runtime_number, const std::string& setup_program = {});
   // Removes a game's PS5 title; empty when it has none left, otherwise why not.
   // moving: the title goes because its game was installed again elsewhere (journal "remove-move"),
   // so Prepare, not Uninstall, finishes a removal that stopped part way.
@@ -736,7 +744,11 @@ class RuntimeHost {
   mutable std::shared_ptr<const RuntimeSnapshot> shared_;  // Shared()'s copy of snapshot_ at shared_revision_
   mutable std::uint64_t shared_revision_ = 0;
   std::vector<RuntimePrepareRequest> prepare_requests_;
-  std::vector<std::uint32_t> play_requests_;
+  struct PlayRequest {
+    std::uint32_t app = 0;
+    std::string setup_program;  // Play(…, setup_program)
+  };
+  std::vector<PlayRequest> play_requests_;
   struct RemovalRequest {
     std::uint32_t app = 0;
     bool delete_saves = false;

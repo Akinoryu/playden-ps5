@@ -932,6 +932,9 @@ public:
     // Queues Prepare without a button press: after a download, or before Play.
     void RequestRuntimePrepare(GameId id);
     [[nodiscard]] std::vector<GameId> TakeRuntimePlayRequests();
+    // The Play requests above that run a program from the game folder once instead of the game (Run a program
+    // once…): the program, relative to the game folder. A plain Play request of the same game replaces its entry.
+    [[nodiscard]] std::map<GameId, std::string> TakeRuntimeSetupPrograms();
     [[nodiscard]] bool TakeRuntimeCleanupRequest();
     // Live mode: kept game data, deletions the player confirmed, and why an uninstall stopped.
     void UpdateKeptBottles(std::vector<LiveKeptBottle> kept);
@@ -1181,6 +1184,8 @@ private:
     std::vector<LiveCompletedPreparation> prepared_dismissed_;
     std::optional<GameId> prepare_next_asked_;
     std::vector<GameId> pending_runtime_play_requests_;
+    std::map<GameId, std::string> pending_runtime_setup_programs_;
+    std::string setup_program_choice_;  // Run a program once: the program the confirmation names
     bool pending_runtime_cleanup_ = false;
     bool library_catalog_received_ = false;
     std::set<Store> catalog_sources_;  // stores whose library arrived at least once
@@ -1405,6 +1410,8 @@ private:
     // A game whose setup waits for its program (LiveGameSetup::steam_choices): the sheet that asks,
     // installers and tools last, and the choice, which sets the game up again.
     void open_steam_programs(GameId id);
+    // Run a program once…: the game folder's programs, then a confirmation.
+    void open_setup_programs();
     void choose_steam_launch(GameId id, const std::string& program);
     std::vector<LaunchProgram> steam_programs_shown_;
     std::set<GameId> steam_programs_asked_;  // games whose waiting setup asked once already

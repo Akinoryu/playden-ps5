@@ -521,7 +521,7 @@ std::string action_label(const std::string& key) {
         {"install-confirm", "Install"}, {"install-version", "Version"}, {"install-language", "Language"}, {"install-dlc", "Includes"}, {"update-confirm", "Download and install"}, {"storage-picker", "Change storage"},
         {"value-edit", "Edit…"}, {"value-reset", "Reset to recipe"}, {"override-add", "Add an override…"},
         {"unlock-setting", "Change anyway"}, {"export-recipe", "Export as recipe"}, {"program-scan", "Looking for programs…"},
-        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"clear-shader-cache", "Clear shader cache"},
+        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"run-once", "Run a program once…"}, {"run-once-start", "Run once"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"clear-shader-cache", "Clear shader cache"},
         {"section-compatibility", "Compatibility"}, {"section-advanced", "Advanced"}, {"heading-game", "Game"},
         {"heading-display", "Display"}, {"heading-controls", "Controls"}, {"heading-sound", "Sound"},
         {"heading-graphics", "Graphics"}, {"heading-windows", "Windows"},
@@ -2308,6 +2308,12 @@ std::vector<GameId> Simulation::TakeRuntimePlayRequests() {
     auto requests = std::move(pending_runtime_play_requests_);
     pending_runtime_play_requests_.clear();
     return requests;
+}
+
+std::map<GameId, std::string> Simulation::TakeRuntimeSetupPrograms() {
+    auto programs = std::move(pending_runtime_setup_programs_);
+    pending_runtime_setup_programs_.clear();
+    return programs;
 }
 
 bool Simulation::TakeRuntimeCleanupRequest() {
@@ -5338,6 +5344,9 @@ void Simulation::rebuild_view() {
                                            &base, &ignored))
                 inherited = base.values.at(modal.setting_id);
         }
+        if (modal.id == "setup-programs")
+            view_.subtitle = "Pick a program from the game folder, such as its settings launcher. It runs one time with the "
+                             "Mouse preset; Play and Game settings stay as they are.";
         if (modal.id == "game-settings" || modal.id == "game-maintenance") {
             if (const auto* game = find_game(state_, settings_game)) view_.subtitle = game->title;
         } else if (!modal.setting_id.empty()) {
@@ -6091,6 +6100,30 @@ void Simulation::rebuild_view() {
                     if (record != state_.game_settings.end() && runtime_game != state_.runtime_games.end() &&
                         record->second.revision > runtime_game->second.settings_revision)
                         item.subtitle = "Changes apply on next launch";
+                }
+            } else if (action_key == "run-once") {
+                item.subtitle = "Starts a program from the game folder, such as its settings launcher, one time. Play doesn't change.";
+                std::string refusal;
+                if (live() && !game_closed(state_.navigation.selected_game_id, &refusal)) {
+                    item.enabled = false;
+                    item.subtitle = refusal;
+                }
+            } else if (modal.id == "setup-programs" && action_key.rfind("setup-program-", 0) == 0) {
+                item.kind = RowKind::Choice;
+                const auto setup = game_setups_.find(state_.navigation.selected_game_id);
+                const auto index = static_cast<std::size_t>(std::stoul(action_key.substr(14)));
+                if (setup != game_setups_.end() && index < setup->second.programs.size()) {
+                    const auto& program = setup->second.programs[index];
+                    item.title = program.path;
+                    const auto detected = rt::DetectedLabel(program.detected);
+                    item.subtitle = program.architecture.empty() ? "Not a Windows program the PS5 can start."
+                        : !program.refusal.empty() ? program.refusal
+                        : (program.architecture == "pe64" ? "64-bit" : "32-bit") + (detected.empty() ? std::string() : " · " + detected);
+                    item.enabled = !program.architecture.empty() && program.refusal.empty();
+                    rt::EffectiveSettings values;
+                    if (EffectiveSettingsFor(state_.navigation.selected_game_id, &values) && values.launch &&
+                        BottlePath(values.launch->executable) == BottlePath(program.path))
+                        item.value = "The game's program";
                 }
             } else if (action_key == "game-maintenance") {
                 if (live())
@@ -8788,6 +8821,7 @@ void Simulation::activate() {
             if (auto previous = state_.runtime_games.find(id); previous != state_.runtime_games.end())
                 previous->second.play_detail.clear();
             pending_runtime_play_requests_.push_back(id);
+            pending_runtime_setup_programs_.erase(id);
         }
     } else if (action_name == "details-update") {
         const auto id = state_.navigation.detail_id.value_or(state_.navigation.selected_game_id);
@@ -9360,6 +9394,38 @@ void Simulation::activate() {
         }
         // From Game actions it opens on top of that sheet, so Circle returns there.
         open_modal({"game-maintenance", "Maintenance", state_.navigation.focus_key, maintenance_actions(), 0, false});
+    } else if (action_name == "run-once") {
+        // Whether the game runs, for the rows; the confirmation checks it again.
+        pending_activity_requests_.push_back(state_.navigation.selected_game_id);
+        open_setup_programs();
+    } else if (action_name.rfind("setup-program-", 0) == 0) {
+        const auto setup = game_setups_.find(state_.navigation.selected_game_id);
+        const auto index = static_cast<std::size_t>(std::stoul(action_name.substr(14)));
+        if (setup == game_setups_.end() || index >= setup->second.programs.size()) return;
+        setup_program_choice_ = setup->second.programs[index].path;
+        const auto slash = setup_program_choice_.find_last_of('/');
+        const auto name = slash == std::string::npos ? setup_program_choice_ : setup_program_choice_.substr(slash + 1);
+        ModalEntry confirm{"confirmation", "Run " + name + " once?", state_.navigation.focus_key, {"cancel", "run-once-start"}, 1, false};
+        confirm.body = "Playden starts " + setup_program_choice_ + " instead of the game, one time. It runs until you close it.\n\n"
+                       "Controls use the Mouse preset for this run: the left stick moves the pointer, Cross clicks, Circle "
+                       "right-clicks and Options presses Enter.\n\n"
+                       "If the program has its own Play button, it may not start the game on the PS5. Change your settings in "
+                       "it, close it, then press Play in Playden. Play and Game settings stay as they are.";
+        open_modal(std::move(confirm));
+    } else if (live() && action_name == "run-once-start") {
+        const auto id = state_.navigation.selected_game_id;
+        std::string refusal;
+        if (setup_program_choice_.empty() || !game_closed(id, &refusal)) {
+            if (!refusal.empty()) push_notice({"run-once-" + ToKey(id), "The program can't run now", "", false, kLiveNoticeSeconds, false, refusal});
+            return;
+        }
+        // Back to the game's page, where Play shows the start as it does the game's.
+        while (!state_.navigation.modals.empty()) close_modal();
+        if (auto previous = state_.runtime_games.find(id); previous != state_.runtime_games.end())
+            previous->second.play_detail.clear();
+        pending_runtime_play_requests_.push_back(id);
+        pending_runtime_setup_programs_[id] = setup_program_choice_;
+        state_.navigation.focus_key = "details-play";
     } else if (action_name == "game-move") {
         const auto game = state_.navigation.selected_game_id;
         if (move_blocker(game, {}).empty() && move_volumes().size() >= 2) open_move_picker(game);
@@ -10492,6 +10558,10 @@ void Simulation::SetGameSetups(std::map<GameId, LiveGameSetup> setups) {
         close_modal();
         open_setting("launch_option");
     }
+    if (!state_.navigation.modals.empty() && state_.navigation.modals.back().id == "setup-programs") {
+        close_modal();
+        open_setup_programs();
+    }
     rebuild_view();
 }
 
@@ -10647,7 +10717,28 @@ std::vector<std::string> Simulation::details_context_actions() const {
         const auto maintenance = std::find(actions.begin(), actions.end(), "game-maintenance");
         actions.insert(maintenance == actions.end() ? actions.begin() : maintenance + 1, "manage-saves");
     }
+    // A program from the game folder (its settings launcher) for one run, after Maintenance.
+    if (live() && game_prepared(selected)) {
+        const auto maintenance = std::find(actions.begin(), actions.end(), "game-maintenance");
+        actions.insert(maintenance == actions.end() ? actions.begin() : maintenance + 1, "run-once");
+    }
     return actions;
+}
+
+void Simulation::open_setup_programs() {
+    const auto id = state_.navigation.selected_game_id;
+    const auto setup = game_setups_.find(id);
+    std::vector<std::string> actions;
+    if (setup != game_setups_.end())
+        for (std::size_t index = 0; index < setup->second.programs.size(); ++index)
+            actions.push_back("setup-program-" + std::to_string(index));
+    // Every opening scans again, as the Program picker does; the last list shows meanwhile.
+    if (live()) {
+        if (requested_program_scans_.insert(id).second) pending_program_scans_.push_back(id);
+        if (setup == game_setups_.end() || !setup->second.scanned) actions.push_back("program-scan");
+    }
+    actions.push_back("cancel");
+    open_modal({"setup-programs", "Run a program once", state_.navigation.focus_key, std::move(actions), 0, false});
 }
 
 std::vector<std::string> Simulation::maintenance_actions() const {

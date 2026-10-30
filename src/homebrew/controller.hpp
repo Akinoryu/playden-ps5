@@ -232,6 +232,9 @@ class Controller {
   // may start without syncing after a failed check, and what Play shows meanwhile.
   std::map<GameId, bool> sync_before_play_;
   std::vector<GameId> plays_ready_;
+  // Plays that run a program from the game folder once (Simulation::TakeRuntimeSetupPrograms), until handed to the
+  // runtime; a plain Play of the game drops its entry.
+  std::map<GameId, std::string> setup_programs_;
   std::set<GameId> play_without_sync_;
   // Games are prepared without a button press: once their download finishes (games
   // downloading now, then games waiting to be prepared), and when Play finds one not

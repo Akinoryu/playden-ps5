@@ -587,11 +587,11 @@ void RuntimeHost::HoldPreparations(bool hold) {
   wake_.notify_all();
 }
 
-void RuntimeHost::Play(std::uint32_t app_id) {
+void RuntimeHost::Play(std::uint32_t app_id, std::string setup_program) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) return;
-    play_requests_.push_back(app_id);
+    play_requests_.push_back({app_id, std::move(setup_program)});
   }
   wake_.notify_all();
 }
@@ -1755,7 +1755,8 @@ std::string RuntimeHost::UnlinkDxvkConfig(const rt::RuntimeInstall& record) {
 
 std::string RuntimeHost::RepublishSettings(Composition& c, const rt::RuntimeInstall& record, bool* published,
                                            bool steam_account_known, bool* prepare_again,
-                                           std::string* upgrade_deferred, std::string* code, bool force) {
+                                           std::string* upgrade_deferred, std::string* code, bool force,
+                                           const std::string& setup_program) {
   if (published) *published = false;
   if (code) code->clear();
   if (prepare_again) *prepare_again = false;
@@ -1770,8 +1771,8 @@ std::string RuntimeHost::RepublishSettings(Composition& c, const rt::RuntimeInst
   // (another runtime) reports its refusal instead.
   const auto saved_revision = config_.settings_record
       ? config_.settings_record(GameOf(record)).value_or(rt::GameSettingsRecord{}).revision : 0;
-  const bool upgrade_only = !force && record.moved_from.empty() && saved_revision <= record.settings_revision &&
-                            NeedsUnownedPublication(c, record);
+  const bool upgrade_only = !force && setup_program.empty() && record.setup_program.empty() && record.moved_from.empty() &&
+                            saved_revision <= record.settings_revision && NeedsUnownedPublication(c, record);
   // A game folder that isn't there (a stale record, an unplugged drive) can't be published, and
   // arming the request first would leave a journal on the record: nothing is armed for it.
   if (upgrade_only || !record.moved_from.empty()) {
@@ -1783,7 +1784,8 @@ std::string RuntimeHost::RepublishSettings(Composition& c, const rt::RuntimeInst
       return {};
     }
   }
-  auto refused = PublishSavedSettings(c, record, published, steam_account_known, prepare_again, code, force);
+  auto refused = PublishSavedSettings(c, record, published, steam_account_known, prepare_again, code, force, false,
+                                      setup_program);
   if (refused.empty() || !upgrade_only) return refused;
   Log("settings update app=" + std::to_string(record.runtime_number) + " unowned upgrade deferred, owned publication kept: " +
       refused);
@@ -1798,7 +1800,7 @@ std::string RuntimeHost::RepublishSettings(Composition& c, const rt::RuntimeInst
 
 std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeInstall& record, bool* published,
                                               bool steam_account_known, bool* prepare_again, std::string* code,
-                                              bool force, bool defaults_published) {
+                                              bool force, bool defaults_published, const std::string& setup_program) {
   if (code) code->clear();
   // Refusals only a new preparation gets past (the title's recipe or settings can't be published again).
   const auto again = [prepare_again](std::string message) {
@@ -1815,6 +1817,25 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
         " title=" + std::to_string(record.settings_revision));
     return {};
   }
+  // Run a program once: the saved settings with that program and the Mouse controller preset (its rows as the preset
+  // sets them, so a recipe's or the player's controller choices don't hide the pointer) in their place. The title
+  // keeps that profile until the next publication without one puts the saved settings back (RuntimeInstall::
+  // setup_program), whatever their revision.
+  const bool restoring = setup_program.empty() && !record.setup_program.empty();
+  if (!setup_program.empty()) {
+    auto& overrides = saved.overrides;
+    std::erase_if(overrides, [](const auto& entry) {
+      static const std::set<std::string> program = {"program", "architecture", "program_folder", "program_arguments",
+                                                    "start_check"};
+      return program.count(entry.first) || entry.first.rfind("button.", 0) == 0;
+    });
+    overrides["launch_option"] = rt::kProgramEntryId;
+    overrides["program"] = setup_program;
+    overrides["controller_preset"] = "mouse";
+    for (const auto& [id, value] : rt::ControllerPresetInputs().at("mouse")) overrides[id] = value;
+    for (const char* id : {"launch_option", "program", "controller_preset", "controller", "pointer_stick", "pointer_speed"})
+      overrides[std::string(rt::kUnlockPrefix) + id] = "on";
+  }
   // A game whose folder moved (RuntimeInstall::moved_from) is published again at its revision, so
   // its descriptor, profile and dxvk.conf name the new folder.
   const bool moved = !record.moved_from.empty();
@@ -1822,7 +1843,8 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   const bool unowned_upgrade = !moved && NeedsUnownedPublication(c, record);
   if (unowned_upgrade) Log("settings update app=" + std::to_string(record.runtime_number) + " publishes the game folder unowned");
   // "Steam features" only swaps the game's own files, so it follows the saved value at once.
-  if (!force && saved.revision <= record.settings_revision && !moved && !unowned_upgrade)
+  if (!force && setup_program.empty() && !restoring && saved.revision <= record.settings_revision && !moved &&
+      !unowned_upgrade)
     return ApplyPreparationSteps(c, record, steam_account_known);
   if (!c.kit) return "No verified runtime kit is installed.";
   if (saved.revision < record.settings_revision)
@@ -1928,7 +1950,8 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
     return again("The settings no longer match this game's PS5 title; prepare it again.");
   // A forced publication runs only when the new runtime changes what the settings write (120 Hz output), so a
   // respin that changes nothing there keeps its publication, registration and bottle as they are.
-  if (force) {
+  // So is a program's run, or the return from one, that publishes what the title already has.
+  if (force || !setup_program.empty() || restoring) {
     // POSIX reads, as elsewhere here: the PS5 libc++ has no locale support for file streams.
     const auto read = [](const std::filesystem::path& path) {
       std::string bytes;
@@ -1944,8 +1967,13 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
     const auto config = HostPath(record.install_path) / WorkingFolder(next.launch_working_directory, next.launch_path,
                                                                                  next.launch_in_install_root) /
                         "dxvk.conf";
-    if (read(profile) == plan.profile_bytes && read(config) == plan.dxvk_config) return {};
+    if (read(profile) == plan.profile_bytes && read(config) == plan.dxvk_config)
+      return restoring ? MarkSetupProgram(c, record.install_id, {}) : std::string{};
   }
+  // Recorded before the program's profile is published, so a publication cut off part way still gets the saved
+  // settings back.
+  if (!setup_program.empty())
+    if (const auto marked = MarkSetupProgram(c, record.install_id, setup_program); !marked.empty()) return marked;
   const auto transaction = config_.uuid();
   if (!transaction) return "No secure random source for the settings update.";
   rt::SettingsPublicationRequest request;
@@ -1985,7 +2013,20 @@ std::string RuntimeHost::PublishSavedSettings(Composition& c, const rt::RuntimeI
   if (published) *published = true;
   if (const auto current = c.records.Find(record.install_id)) OpenGameFolders(c, *current);
   if (moved) FinishGamesMove(c);
+  if (restoring) return MarkSetupProgram(c, record.install_id, {});
   return {};
+}
+
+std::string RuntimeHost::MarkSetupProgram(Composition& c, const std::string& install_id, const std::string& program) {
+  auto record = c.records.Find(install_id);
+  if (!record) return "The game's install record is missing.";
+  if (record->setup_program == program) return {};
+  Log("setup program app=" + std::to_string(record->runtime_number) + " " +
+      (program.empty() ? "done: " + record->setup_program : "runs once: " + program));
+  record->setup_program = program;
+  const auto written = c.repository.Update(*record);
+  PublishInstalls(c, install_id);
+  return written.ok() ? std::string{} : "The program's run could not be recorded: " + written.message();
 }
 
 bool RuntimeHost::MoveGames(Composition& c, std::string* error) {
@@ -2336,7 +2377,7 @@ void RuntimeHost::PublishLaunch(Composition& c, const rt::LaunchSnapshot& launch
   });
 }
 
-void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id) {
+void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id, const std::string& setup_program) {
   // The player waits on this Play: Microsoft's MFC may be downloaded for it, with a progress line.
   RedistWorkScope redist(redist_work_, true, app_id);
   std::optional<rt::RuntimeInstall> record;
@@ -2371,7 +2412,19 @@ void RuntimeHost::RunPlay(Composition& c, std::uint32_t app_id) {
                c.coordinator->Activity(record->title_id) == rt::NativeActivity::kStopped;
       }
       std::string settings;
-      if (!record->moved_from.empty()) {
+      if (!setup_program.empty()) {
+        // Another program for one run: its profile is published now, so nothing of the game may be running.
+        if (!idle) {
+          auto busy = MaintenanceRefusal(c, *record);
+          settings = busy.empty() ? std::string("Close the game first.") : std::move(busy);
+        } else if (!record->moved_from.empty()) {
+          settings = "This game needs an update for Playden 0.6 first: press Play once.";
+        } else {
+          settings = RepublishSettings(c, *record, nullptr, true, nullptr, nullptr, nullptr, false, setup_program);
+        }
+        Log("play setup program app=" + std::to_string(app_id) + " program=" + setup_program + " " +
+            (settings.empty() ? "published" : settings));
+      } else if (!record->moved_from.empty()) {
         // Its folder moved in 0.6: the title starts only once its publication names the new one.
         if (!idle) {
           auto busy = MaintenanceRefusal(c, *record);
@@ -4454,8 +4507,10 @@ bool RuntimeHost::RunServices() {
       if (c.kit)
         for (const auto& record : c.repository.Snapshot()) {
           // Only newer settings: the Steam account is not known yet, so Steam files wait for Play.
+          // So are they after a program's run (RuntimeInstall::setup_program), whatever their revision.
           const auto saved = config_.settings_record ? config_.settings_record(GameOf(record)) : std::nullopt;
-          if (!saved || saved->revision <= record.settings_revision || !record.moved_from.empty() ||
+          const bool newer = saved && saved->revision > record.settings_revision;
+          if ((!newer && record.setup_program.empty()) || !record.moved_from.empty() ||
               !MaintenanceRefusal(c, record).empty()) continue;
           bool published = false;
           const auto refused = RepublishSettings(c, record, &published, false);
@@ -4490,7 +4545,7 @@ bool RuntimeHost::RunServices() {
   startup_hold.reset();
   bool reload = false;
   for (;;) {
-    std::vector<std::uint32_t> plays;
+    std::vector<PlayRequest> plays;
     std::vector<RemovalRequest> removals;
     std::vector<std::uint32_t> kept_deletes;
     std::vector<std::pair<std::uint32_t, RuntimeMaintenance>> maintenance;
@@ -4601,9 +4656,10 @@ bool RuntimeHost::RunServices() {
       Log("leftover requests cleanup kept=" + std::to_string(kept) + " remaining=" + std::to_string(left));
       Publish([&](RuntimeSnapshot& s) { s.leftover_requests = left; });
     }
-    for (const auto app : plays) {
+    for (const auto& play : plays) {
+      const auto app = play.app;
       if (composition) {
-        RunPlay(*composition, app);
+        RunPlay(*composition, app, play.setup_program);
         poll = true;
       } else {
         Publish([&](RuntimeSnapshot& s) {

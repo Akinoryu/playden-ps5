@@ -528,6 +528,19 @@ void MovedRecordsRewriteTogetherAndKeepTheirMark() {
   CHECK(restarted.Update(cleared).ok());
   RuntimeInstallRepository again(storage, "installs.json", Free);
   CHECK(again.Load().ok() && again.Find("install-a")->moved_from.empty() && !again.Find("install-b")->moved_from.empty());
+
+  // A program's run (Run a program once) is kept the same way, only while set, and only as a path in the game folder.
+  auto setup = *again.Find("install-a"); setup.setup_program = "Binaries/BmLauncher.exe";
+  auto outside = setup; outside.setup_program = "../BmLauncher.exe";
+  CHECK(!again.Update(outside).ok());
+  CHECK(again.Update(setup).ok());
+  RuntimeInstallRepository reloaded(storage, "installs.json", Free);
+  CHECK(reloaded.Load().ok() && reloaded.Find("install-a")->setup_program == "Binaries/BmLauncher.exe" &&
+        reloaded.Find("install-b")->setup_program.empty());
+  setup.setup_program.clear();
+  CHECK(reloaded.Update(setup).ok());
+  const auto unset = storage.ReadDurable("installs.json", 1 << 20);
+  CHECK(unset.ok() && std::string(unset.value().begin(), unset.value().end()).find("setup_program") == std::string::npos);
 }
 
 std::string ReadText(const std::string& path) {

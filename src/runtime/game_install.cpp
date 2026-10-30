@@ -205,6 +205,7 @@ bool ValidRecord(const RuntimeInstall& record) {
        !IsSimpleId(record.journal->step))) return false;
   if (!record.moved_from.empty() &&
       (!IsAbsoluteNormalizedPath(record.moved_from) || record.moved_from == record.install_path)) return false;
+  if (!record.setup_program.empty() && !IsRelativeLaunchPath(record.setup_program)) return false;
   return true;
 }
 
@@ -295,6 +296,10 @@ std::optional<RuntimeInstall> ParseRecord(const JsonValue& value, RepositoryErro
     if (!moved->is_string() || moved->text().empty()) return std::nullopt;
     record.moved_from = moved->text();
   }
+  if (const auto* setup = value.Find("setup_program")) {
+    if (!setup->is_string() || setup->text().empty()) return std::nullopt;
+    record.setup_program = setup->text();
+  }
   if (!ValidRecord(record)) return std::nullopt;
   return record;
 }
@@ -335,6 +340,7 @@ void WriteRecord(TextOutput& output, const RuntimeInstall& record) {
     StringField(output, "step", record.journal->step, false); output << '}'; }
   else output << "null";
   if (!record.moved_from.empty()) { output << ','; StringField(output, "moved_from", record.moved_from, false); }
+  if (!record.setup_program.empty()) { output << ','; StringField(output, "setup_program", record.setup_program, false); }
   output << '}';
 }
 

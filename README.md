@@ -351,6 +351,9 @@ build/homebrew-host/playden-homebrew --simulation --scenario signed-out
   happening, use Settings › Account › **Sign in again**: it keeps your library, favorites and settings.
 - Godot games (Slay the Spire 2) need `--rendering-driver opengl3` in Game settings › Extra arguments. Playden picks
   Godot's Vulkan renderer, which did not work on this kit.
+- Some games start only after their own settings program has run once. On the game's page, use Options ›
+  **Run a program once…**, pick that program, change the settings, close it, then press Play. Its own Play button
+  can't start the game on the PS5. Until Playden opens again, the game's Home tile starts that program too.
 - The 120 Hz choice of the "Refresh rate" game setting needs a newer runtime kit; it is not available with this kit.
 - When you close a game from the PS5 menu, it can stay suspended. Pressing Play again resumes it instead of starting
   it again.
