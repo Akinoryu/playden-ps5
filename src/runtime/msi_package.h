@@ -57,7 +57,11 @@ bool ReadMsiPackage(std::string_view package, MsiInstallPlan* plan, std::string*
 // One stream of the package by its decoded name ("media1.cab"); nullopt when missing.
 std::optional<std::string> ReadMsiStream(std::string_view package, const std::string& name);
 
-// Extracts every file of a cabinet (MSZIP or stored folders; LZX and Quantum are refused),
+// The same stream in place, without a copy, when its sectors follow one another in the package (a
+// large cabinet's usually do); nullopt otherwise, and the caller reads it with ReadMsiStream.
+std::optional<std::string_view> ViewMsiStream(std::string_view package, const std::string& name);
+
+// Extracts every file of a cabinet (MSZIP, LZX or stored folders; Quantum is refused),
 // calling sink with each member's name and contents in cabinet order. Stops at the first sink
 // that returns false. Cabinets that continue into another one are refused.
 bool ExtractCabinet(std::string_view cabinet, const std::function<bool(const std::string&, std::string_view)>& sink,

@@ -150,13 +150,64 @@ void TestCabinet() {
   CHECK(members["second"] == "0123456789");  // copied from the previous block's history
   CHECK(members.count("empty") && members["empty"].empty());
   CHECK((order == std::vector<std::string>{"first", "second", "empty"}));
-  // LZX is refused by name; a sink that stops ends extraction.
+  // LZX needs a window of 2^15 to 2^21 bytes, Quantum is refused by name; a sink that stops ends extraction.
   auto lzx = TwoBlockCabinet();
   lzx[36 + 6] = 3;
   CHECK(!ExtractCabinet(lzx, [](const std::string&, std::string_view) { return true; }, &reason));
-  CHECK(reason == "LZX cabinets are not supported");
+  CHECK(reason == "unsupported LZX window size");
+  auto quantum = TwoBlockCabinet();
+  quantum[36 + 6] = 2;
+  CHECK(!ExtractCabinet(quantum, [](const std::string&, std::string_view) { return true; }, &reason));
+  CHECK(reason == "Quantum cabinets are not supported");
   CHECK(!ExtractCabinet(TwoBlockCabinet(), [](const std::string&, std::string_view) { return false; }, &reason));
   CHECK(!ExtractCabinet("MSCF", [](const std::string&, std::string_view) { return true; }, &reason));
+  // LZX: an uncompressed block over two frames, an odd length, and the x86 call translation undone.
+  std::string big(40001, '\0');
+  for (std::size_t index = 0; index < big.size(); ++index) big[index] = static_cast<char>('a' + index % 23);
+  members.clear();
+  CHECK(ExtractCabinet(LzxCabinet({{"big", big}, {"small", "hello"}}), [&](const std::string& name, std::string_view data) {
+    members[name] = std::string(data);
+    return true;
+  }, &reason));
+  CHECK(members["big"] == big && members["small"] == "hello");
+  // At output position 2 an encoder turned the call's relative target 98 into the absolute 100.
+  std::string call = "ab\xe8";
+  Put32(&call, 100);
+  call += std::string(20, 'z');
+  std::string expected = "ab\xe8";
+  Put32(&expected, 98);
+  expected += std::string(20, 'z');
+  members.clear();
+  CHECK(ExtractCabinet(LzxCabinet({{"call", call}}, 1000), [&](const std::string& name, std::string_view data) {
+    members[name] = std::string(data);
+    return true;
+  }, &reason));
+  CHECK(members["call"] == expected);
+  // A stream cut short is damaged, not padded out.
+  auto cut = LzxCabinet({{"big", big}});
+  cut.resize(cut.size() - 2000);
+  CHECK(!ExtractCabinet(cut, [](const std::string&, std::string_view) { return true; }, &reason));
+  // Literals of a verbatim block decode. Ones that need bits past the stream's end don't, even when the data block
+  // says the stream is that short, and nor does a main tree that leaves a code unused.
+  const std::string text = "verbatim literals, eight bits each";
+  members.clear();
+  CHECK(ExtractCabinet(LzxVerbatimCabinet("text", text), [&](const std::string& name, std::string_view data) {
+    members[name] = std::string(data);
+    return true;
+  }, &reason));
+  CHECK(members["text"] == text);
+  CHECK(!ExtractCabinet(LzxVerbatimCabinet("text", text, 2), [](const std::string&, std::string_view) { return true; }, &reason));
+  CHECK(reason == "damaged LZX data (input ends early)");
+  CHECK(!ExtractCabinet(LzxVerbatimCabinet("text", text, 0, 255), [](const std::string&, std::string_view) { return true; },
+                        &reason));
+  CHECK(reason == "damaged LZX data (main tree)");
+  // Only the last frame may be short: after a short one, a full frame would run past the window's end.
+  const std::string frames(32769, 'q');
+  CHECK(ExtractCabinet(LzxCabinet({{"frames", frames}}, 0, {32768, 1}), [](const std::string&, std::string_view) { return true; },
+                       &reason));
+  CHECK(!ExtractCabinet(LzxCabinet({{"frames", frames}}, 0, {1, 32768}), [](const std::string&, std::string_view) { return true; },
+                        &reason));
+  CHECK(reason == "damaged cabinet (LZX frame size)");
   // Members that overlap are refused: "second" moved to offset 5.
   auto overlapping = TwoBlockCabinet();
   const auto second = overlapping.find("second") - 16 + 4;

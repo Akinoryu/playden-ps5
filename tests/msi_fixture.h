@@ -322,6 +322,140 @@ inline std::string StoredCabinet(const std::vector<std::pair<std::string, std::s
   return cabinet + files + data;
 }
 
+// The members' CFFILE rows, all in folder 0, and their bytes in order.
+inline void LzxMembers(const std::vector<std::pair<std::string, std::string>>& members, std::string* files,
+                       std::string* content) {
+  for (const auto& [name, data] : members) {
+    Put32(files, static_cast<std::uint32_t>(data.size()));
+    Put32(files, static_cast<std::uint32_t>(content->size()));
+    Put16(files, 0);  // folder
+    Put16(files, 0);
+    Put16(files, 0);
+    Put16(files, 0x20);
+    *files += name;
+    files->push_back('\0');
+    *content += data;
+  }
+}
+
+// LZX bits, most significant first, packed into 16-bit little-endian words.
+struct LzxBits {
+  std::vector<bool> bits;
+  void Put(std::uint32_t value, unsigned count) {
+    for (unsigned bit = count; bit-- > 0;) bits.push_back((value >> bit) & 1);
+  }
+  void Align() { Put(0, bits.size() % 16 ? 16 - bits.size() % 16 : 0); }
+  std::string Words() const {
+    std::string stream;
+    for (std::size_t at = 0; at < bits.size(); at += 16) {
+      unsigned word = 0;
+      for (unsigned bit = 0; bit < 16; ++bit) word = word << 1 | (at + bit < bits.size() && bits[at + bit] ? 1 : 0);
+      Put16(&stream, word);
+    }
+    return stream;
+  }
+};
+
+// A cabinet with one LZX folder (64 KiB window) holding stream, its data blocks given as (packed, unpacked) sizes.
+inline std::string LzxFolderCabinet(const std::string& files, std::size_t members, const std::string& stream,
+                                    const std::vector<std::pair<std::size_t, std::size_t>>& blocks) {
+  std::string data;
+  std::size_t taken = 0;
+  for (const auto& [packed, frame] : blocks) {
+    Put32(&data, 0);
+    Put16(&data, static_cast<unsigned>(packed));
+    Put16(&data, static_cast<unsigned>(frame));
+    data += stream.substr(taken, packed);
+    taken += packed;
+  }
+  const std::uint32_t files_at = 36 + 8;
+  const std::uint32_t data_at = files_at + static_cast<std::uint32_t>(files.size());
+  std::string cabinet = "MSCF";
+  Put32(&cabinet, 0);
+  Put32(&cabinet, data_at + static_cast<std::uint32_t>(data.size()));
+  Put32(&cabinet, 0);
+  Put32(&cabinet, files_at);
+  Put32(&cabinet, 0);
+  cabinet.push_back(3);
+  cabinet.push_back(1);
+  Put16(&cabinet, 1);  // folders
+  Put16(&cabinet, static_cast<unsigned>(members));
+  Put16(&cabinet, 0);  // flags
+  Put16(&cabinet, 0);
+  Put16(&cabinet, 0);
+  Put32(&cabinet, data_at);
+  Put16(&cabinet, static_cast<unsigned>(blocks.size()));
+  Put16(&cabinet, 3 | 16 << 8);  // LZX, 2^16 window
+  return cabinet + files + data;
+}
+
+// A cabinet with one LZX folder (64 KiB window) whose stream is a single uncompressed LZX block:
+// the members' bytes follow the stream header, the block header, its padding and the repeated
+// offsets, split into 32 KiB frames across data blocks. translation: the stream's x86 call
+// translation size (0 for none); the bytes are stored as an encoder writes them. frames: other frame
+// sizes, with the whole stream in the first data block.
+inline std::string LzxCabinet(const std::vector<std::pair<std::string, std::string>>& members, std::uint32_t translation = 0,
+                              const std::vector<std::size_t>& frames = {}) {
+  std::string files, content;
+  LzxMembers(members, &files, &content);
+  LzxBits bits;
+  bits.Put(translation ? 1 : 0, 1);
+  if (translation) {
+    bits.Put(translation >> 16, 16);
+    bits.Put(translation & 0xffff, 16);
+  }
+  bits.Put(3, 3);  // uncompressed block
+  bits.Put(static_cast<std::uint32_t>(content.size()) >> 8, 16);
+  bits.Put(static_cast<std::uint32_t>(content.size()) & 0xff, 8);
+  bits.Put(0, bits.bits.size() % 16 ? 16 - bits.bits.size() % 16 : 16);  // 1 to 16 bits up to the next word
+  std::string stream = bits.Words();
+  for (int repeated = 0; repeated < 3; ++repeated) Put32(&stream, 1);
+  const auto header = stream.size();
+  stream += content;
+  if (content.size() & 1) stream.push_back('\0');
+  std::vector<std::pair<std::size_t, std::size_t>> blocks;
+  if (!frames.empty()) {
+    for (const auto frame : frames) blocks.emplace_back(blocks.empty() ? stream.size() : 0, frame);
+  } else {
+    for (std::size_t at = 0; at < content.size(); at += 32768) {
+      const auto frame = std::min<std::size_t>(32768, content.size() - at);
+      blocks.emplace_back((at == 0 ? header : 0) + frame + (at + frame == content.size() ? stream.size() - header - content.size() : 0),
+                          frame);
+    }
+  }
+  return LzxFolderCabinet(files, members.size(), stream, blocks);
+}
+
+// A cabinet with one LZX folder whose stream is a single verbatim block of literals, in one frame: every byte value
+// has an 8-bit code (the code is the byte), with no matches. cut: bytes taken off the stream's end (and its data
+// block's packed size). missing_literal: a byte value left out of the main tree, which is then incomplete.
+inline std::string LzxVerbatimCabinet(const std::string& name, const std::string& content, std::size_t cut = 0,
+                                      int missing_literal = -1) {
+  std::string files, all;
+  LzxMembers({{name, content}}, &files, &all);
+  LzxBits bits;
+  bits.Put(0, 1);  // no translation
+  bits.Put(1, 3);  // verbatim block
+  bits.Put(static_cast<std::uint32_t>(content.size()) >> 8, 16);
+  bits.Put(static_cast<std::uint32_t>(content.size()) & 0xff, 8);
+  // Each tree's lengths go through a pretree whose codes are 0 (length unchanged from 0) and 1 (pretree symbol 9:
+  // (0 - 8) mod 17, so length 8).
+  const auto pretree = [&] {
+    for (unsigned symbol = 0; symbol < 20; ++symbol) bits.Put(symbol == 0 || symbol == 9 ? 1 : 0, 4);
+  };
+  pretree();
+  for (int literal = 0; literal < 256; ++literal) bits.Put(literal == missing_literal ? 0 : 1, 1);
+  pretree();
+  for (unsigned symbol = 256; symbol < 256 + 32 * 8; ++symbol) bits.Put(0, 1);  // no matches
+  pretree();
+  for (unsigned symbol = 0; symbol < 249; ++symbol) bits.Put(0, 1);  // an empty length tree
+  for (const auto byte : content) bits.Put(static_cast<unsigned char>(byte), 8);
+  bits.Align();
+  auto stream = bits.Words();
+  stream.resize(stream.size() - cut);
+  return LzxFolderCabinet(files, 1, stream, {{stream.size(), content.size()}});
+}
+
 // A WiX Burn bundle: a small PE whose .wixburn section lists the UX container (file "0" is the manifest)
 // and one attached container. signed_form: the attached container follows an original signature, as in
 // Microsoft's bundles; otherwise it follows the UX container. with_section false: no .wixburn section.

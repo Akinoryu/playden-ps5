@@ -1,6 +1,7 @@
 #include "runtime/msi_package.h"
 
 #include "miniz.h"
+#include "runtime/lzx_decoder.h"
 
 #include <algorithm>
 #include <cctype>
@@ -56,6 +57,8 @@ class Compound {
     return nullptr;
   }
   bool Read(const CompoundEntry& entry, std::string* out) const;
+  // The stream in place when its sectors follow one another, as a large stream's usually do.
+  std::optional<std::string_view> View(const CompoundEntry& entry) const;
 
  private:
   bool Chain(const std::vector<std::uint32_t>& table, std::uint32_t start, std::uint64_t size, bool mini,
@@ -116,6 +119,19 @@ bool Compound::Chain(const std::vector<std::uint32_t>& table, std::uint32_t star
 
 bool Compound::Read(const CompoundEntry& entry, std::string* out) const {
   return Chain(entry.size < cutoff_ ? mini_fat_ : fat_, entry.start, entry.size, entry.size < cutoff_, out);
+}
+
+std::optional<std::string_view> Compound::View(const CompoundEntry& entry) const {
+  if (entry.size < cutoff_ || entry.size == 0 || entry.size > kMaxStreamBytes) return std::nullopt;
+  const std::uint64_t sectors = (entry.size + sector_size_ - 1) / sector_size_;
+  const std::uint64_t at = (static_cast<std::uint64_t>(entry.start) + 1) * sector_size_;
+  if (at + entry.size > data_.size()) return std::nullopt;
+  // Each sector is in the FAT, as Read requires, and each but the last links to the next.
+  for (std::uint64_t index = 0; index < sectors; ++index) {
+    const auto sector = entry.start + index;
+    if (sector >= fat_.size() || (index + 1 < sectors && fat_[sector] != sector + 1)) return std::nullopt;
+  }
+  return data_.substr(static_cast<std::size_t>(at), static_cast<std::size_t>(entry.size));
 }
 
 bool Compound::Open(std::string_view data, std::string* reason) {
@@ -960,6 +976,14 @@ bool ReadMsiPackage(std::string_view package, MsiInstallPlan* plan, std::string*
   return builder.Build(plan, reason);
 }
 
+std::optional<std::string_view> ViewMsiStream(std::string_view package, const std::string& name) {
+  Compound compound;
+  std::string reason;
+  if (!compound.Open(package, &reason)) return std::nullopt;
+  const auto* entry = compound.Find(name);
+  return entry ? compound.View(*entry) : std::nullopt;
+}
+
 std::optional<std::string> ReadMsiStream(std::string_view package, const std::string& name) {
   Compound compound;
   std::string reason, out;
@@ -1032,7 +1056,7 @@ bool ExtractCabinet(std::string_view cabinet, const std::function<bool(const std
   for (std::size_t folder_index = 0; folder_index < folders.size(); ++folder_index) {
     const auto& folder = folders[folder_index];
     const auto kind = folder.compression & 0x0f;
-    if (kind != 0 && kind != 1) return fail(kind == 3 ? "LZX cabinets are not supported" : "Quantum cabinets are not supported");
+    if (kind != 0 && kind != 1 && kind != 3) return fail("Quantum cabinets are not supported");
     std::vector<const Member*> wanted;
     for (const auto& member : members)
       if (member.folder == folder_index) wanted.push_back(&member);
@@ -1078,7 +1102,31 @@ bool ExtractCabinet(std::string_view cabinet, const std::function<bool(const std
       }
       return true;
     };
-    for (std::size_t block = 0; block < folder.blocks; ++block) {
+    if (kind == 3) {
+      // LZX: the folder's blocks are one stream, read in place, each block one frame of it.
+      std::vector<std::string_view> stream;
+      std::vector<std::uint16_t> frames;
+      for (std::size_t block = 0; block < folder.blocks; ++block) {
+        if (block_at + 8 + data_reserve > cabinet.size()) return fail("damaged cabinet");
+        const auto packed = U16(cabinet, block_at + 4);
+        const auto unpacked = U16(cabinet, block_at + 6);
+        const auto data_at = block_at + 8 + data_reserve;
+        if (data_at + packed > cabinet.size() || unpacked > kWindow) return fail("damaged cabinet");
+        stream.push_back(cabinet.substr(data_at, packed));
+        frames.push_back(unpacked);
+        block_at = data_at + packed;
+      }
+      LzxDecoder lzx((folder.compression >> 8) & 0x1f, std::move(stream));
+      for (const auto unpacked : frames) {
+        std::string why;
+        if (!lzx.DecodeFrame(unpacked, buffer.get(), &why)) {
+          if (reason) *reason = why;
+          return false;
+        }
+        if (!deliver(buffer.get(), unpacked)) return fail("extraction stopped");
+      }
+    }
+    for (std::size_t block = 0; kind != 3 && block < folder.blocks; ++block) {
       if (block_at + 8 + data_reserve > cabinet.size()) return fail("damaged cabinet");
       const auto packed = U16(cabinet, block_at + 4);
       const auto unpacked = U16(cabinet, block_at + 6);

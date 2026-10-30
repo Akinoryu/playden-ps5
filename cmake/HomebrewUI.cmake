@@ -70,6 +70,7 @@ add_library(playden_steam_cm_codec STATIC
     "${CMAKE_SOURCE_DIR}/src/runtime/game_settings.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/install_script.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/msi_package.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/lzx_decoder.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/burn_bundle.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/redist_install.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/game_probe.cpp")
