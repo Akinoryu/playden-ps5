@@ -297,19 +297,37 @@ static void AppendConfigured(cef_command_line_t* command_line) {
   }
 }
 
+static void AppendAndLog(cef_command_line_t* command_line);
+
 static void HookedOnBeforeCommandLineProcessing(cef_app_t* self, const cef_string_t* process_type,
                                                 cef_command_line_t* command_line) {
   Log("libcef-shim: CEF asked for the command line; calling BeamNG's handler first\n");
-  if (g_original_hook) g_original_hook(self, process_type, command_line);
+  // A struct argument carries one reference that the callee releases (BeamNG's handler does),
+  // so keep a reference of our own to use the command line after it returns.
+  typedef void (*add_ref_fn)(void*);
+  typedef int (*release_fn)(void*);
+  if (command_line) ((add_ref_fn)command_line->base.add_ref)(command_line);
+  if (g_original_hook) {
+    g_original_hook(self, process_type, command_line);
+  } else if (command_line) {
+    ((release_fn)command_line->base.release)(command_line);  // what a handler would have done
+  }
   Log("libcef-shim: BeamNG's handler returned\n");
+  if (!command_line) {
+    Log("libcef-shim: no command line, nothing appended\n");
+    return;
+  }
   if (process_type && process_type->length) {
     LogWide("libcef-shim: leaving a helper process alone: ", process_type->str, process_type->length);
-    return;
+  } else if (command_line->is_read_only(command_line)) {
+    Log("libcef-shim: command line is read-only, nothing appended\n");
+  } else {
+    AppendAndLog(command_line);
   }
-  if (!command_line || command_line->is_read_only(command_line)) {
-    Log("libcef-shim: command line missing or read-only, nothing appended\n");
-    return;
-  }
+  ((release_fn)command_line->base.release)(command_line);
+}
+
+static void AppendAndLog(cef_command_line_t* command_line) {
   AppendConfigured(command_line);
   cef_string_userfree_free_fn free_string =
       (cef_string_userfree_free_fn)GetProcAddress(g_real, "cef_string_userfree_utf16_free");
@@ -378,7 +396,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
-    Log("libcef-shim: loaded (diagnostics build 2)\n");
+    Log("libcef-shim: loaded (build 3)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
   }
   return 1;
