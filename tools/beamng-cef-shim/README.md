@@ -83,6 +83,16 @@ at start says what it and `QueryPerformanceCounter` cost. A third `pace:` line l
 100 ms, each with when it began in seconds since the shim loaded (BeamNG's own log counts from about
 then) and how long it took.
 
+On the console BeamNG stops for about 250 ms every 1.7 seconds, in menus and while driving, and runs
+at 60 frames a second in between (build 22). To see who holds it up, a watchdog (`hitch.c`) notices
+when a frame is 120 ms late in otherwise smooth play, from a minute after start, stops every thread
+of the game at once, notes where each is, lets them all go, and logs a `hitch` line and then a line
+per thread: its name, where it was (with the function for Windows' and Wine's modules) and the code
+addresses on its stack. It does this for six stalls, 5 seconds apart at least, and the line says
+how long the threads were held. It also times `cef_do_message_loop_work`, which the game's main
+thread calls each frame, says whether the main thread was inside it during the stall, and logs every
+10 seconds how long those calls took. `shim:no-hitch` turns it off.
+
 With `shim:sample`, for 30 seconds of every minute, ten times a second, the shim also stops the
 thread that submits for a moment and notes where it is (`sampler.c`): after each 30 seconds a
 `sample:` line lists the modules (and for Windows' and Wine's, the function) it was found in most,

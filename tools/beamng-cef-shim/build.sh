@@ -25,7 +25,7 @@ done
 llvm-dlltool -m i386:x86-64 -d "$out/kernel32.def" -l "$out/kernel32.lib"
 
 # The shim's own exports; everything else goes to libcef_real.dll.
-own="cef_initialize cef_browser_host_create_browser cef_browser_host_create_browser_sync"
+own="cef_initialize cef_browser_host_create_browser cef_browser_host_create_browser_sync cef_do_message_loop_work"
 {
   printf 'LIBRARY libcef.dll\nEXPORTS\n'
   for name in $own; do printf '  %s\n' "$name"; done

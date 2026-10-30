@@ -139,6 +139,8 @@ static BOOL g_no_overlay;
 static BOOL g_save_frames;
 static BOOL g_sample;  // shim:sample: sample where the thread that submits spends its time (sampler.c)
 static int64_t g_start_qpc;  // when the shim loaded
+static BOOL g_no_hitch;  // shim:no-hitch: no listing of the threads when a frame is late (hitch.c)
+static DWORD g_main_thread;  // the thread that called cef_initialize: CEF's UI thread, the game's main loop
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -516,6 +518,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
       if (!keep[i]) g_keep_settings = 1;
+      static const char no_hitch[] = "shim:no-hitch";
+      i = 0;
+      while (no_hitch[i] && p[i] == no_hitch[i]) ++i;
+      if (!no_hitch[i]) g_no_hitch = 1;
       static const char sample[] = "shim:sample";
       i = 0;
       while (sample[i] && p[i] == sample[i]) ++i;
@@ -840,6 +846,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
     Log("libcef-shim: libcef_real.dll or its cef_initialize is missing\n");
     return 0;
   }
+  g_main_thread = GetCurrentThreadId();
   if (!g_create_thread) {
     const unsigned char* program = (const unsigned char*)GetModuleHandleW(NULL);
     size_t reserve = *(const uint64_t*)(program + *(const int32_t*)(program + 0x3c) + 24 + 72);  // SizeOfStackReserve
@@ -925,6 +932,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 #include "overlay.c"
 #include "paint_hook.c"
 #include "sampler.c"
+#include "hitch.c"
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
@@ -938,11 +946,12 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 22)\n");
+    Log("libcef-shim: loaded (build 23)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
     if (g_sample) CreateThread(NULL, 0, (void*)SampleLater, NULL, 0, NULL);
+    if (!g_no_hitch) CreateThread(NULL, 0, (void*)HitchWatch, NULL, 0, NULL);
   }
   return 1;
 }
