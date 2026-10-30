@@ -22,6 +22,12 @@ enum class RedistAction { kMsi, kCovered, kNotRun };
 // folder ('/' separators), found from `msiexec /i <package>` or a process that is the package.
 RedistAction ClassifyRedist(const RedistEntry& entry, const std::string& install_dir, std::string* package);
 
+// A Windows Installer package a setup program carries as is, uncompressed (WISE and other
+// self-extracting installers, NVIDIA's PhysX System Software among them): the offset of the first
+// compound file in the program that reads as a package with files, or nullopt. Compressed payloads
+// are not looked into.
+std::optional<std::size_t> FindEmbeddedMsi(std::string_view program);
+
 struct RedistOutcome {
   std::string script;   // the install script, relative to the game folder
   std::string name;
@@ -36,9 +42,10 @@ struct RedistInstallResult {
 
 // Finds install scripts at the top of game_root and in its redistributable folders
 // (_CommonRedist, Redist, Support, __Installer…, up to four folders deep), and installs their
-// Windows Installer packages into the stopped bottle at prefix_dir. A package installed before
-// (the same SHA-256, listed in <prefix>/.playden-redist) is not installed again. A package that
-// fails is reported and left out; the others still install.
+// Windows Installer packages into the stopped bottle at prefix_dir, including a package a setup
+// program in the game folder carries (FindEmbeddedMsi). A package installed before (the same
+// SHA-256, listed in <prefix>/.playden-redist; a setup program's own) is not installed again. A
+// package that fails is reported and left out; the others still install.
 RedistInstallResult InstallRedistributables(const std::string& game_root, const std::string& install_dir,
                                             const std::string& prefix_dir, std::int64_t unix_time);
 

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
@@ -37,14 +38,32 @@ std::string Lower(std::string_view text) {
   return out;
 }
 
-bool ReadFile(const std::filesystem::path& path, std::size_t maximum, std::string* text) {
+bool ReadFile(const std::filesystem::path& path, std::size_t maximum, std::string* text, off_t offset = 0) {
   text->clear();
   const int file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0) return false;
+  if (offset && ::lseek(file, offset, SEEK_SET) != offset) {
+    ::close(file);
+    return false;
+  }
+  // The whole file at once: growing the string a piece at a time briefly holds two copies.
+  struct stat info {};
+  std::size_t expected = 0;
+  if (::fstat(file, &info) == 0 && info.st_size > offset) {
+    if (static_cast<std::uint64_t>(info.st_size - offset) > maximum) {  // too large: refused before any allocation
+      ::close(file);
+      return false;
+    }
+    expected = static_cast<std::size_t>(info.st_size - offset);
+    text->reserve(expected + 1);
+  }
   bool ok = true;
   // Large packages: read straight into the string, not through a stack buffer (small worker stacks).
-  for (std::size_t chunk = 1u << 20;;) {
+  for (;;) {
     const auto size = text->size();
+    // Within the reserved size (one byte more, to see the end), so the string never grows past it.
+    std::size_t chunk = 1u << 20;
+    if (expected && size <= expected) chunk = std::min(chunk, expected + 1 - size);
     text->resize(size + chunk);
     const auto count = ::read(file, &(*text)[size], chunk);
     if (count < 0 && errno == EINTR) {
@@ -290,20 +309,24 @@ bool InstallPlan(std::string_view package, const CabinetSource& beside, const st
     if (!used.count(index)) continue;
     const auto& cabinet = plan.cabinets[index];
     std::string bytes;
+    std::optional<std::string_view> view;  // an embedded cabinet in place, without a copy, when it can be
     if (cabinet.embedded) {
-      auto stream = ReadMsiStream(package, cabinet.name);
-      if (!stream) {
-        *reason = "the package's cabinet " + cabinet.name + " is missing";
-        return false;
+      view = ViewMsiStream(package, cabinet.name);
+      if (!view) {
+        auto stream = ReadMsiStream(package, cabinet.name);
+        if (!stream) {
+          *reason = "the package's cabinet " + cabinet.name + " is missing";
+          return false;
+        }
+        bytes = std::move(*stream);
       }
-      bytes = std::move(*stream);
     } else if (cabinet.name.find('/') != std::string::npos || cabinet.name.find('\\') != std::string::npos ||
                !beside(cabinet.name, &bytes)) {
       *reason = "the cabinet " + cabinet.name + " beside the package could not be read";
       return false;
     }
     std::string failure;
-    const bool ok = ExtractCabinet(bytes, [&](const std::string& member, std::string_view data) {
+    const bool ok = ExtractCabinet(view ? *view : std::string_view(bytes), [&](const std::string& member, std::string_view data) {
       const auto found = wanted.find(member);
       if (found == wanted.end()) return true;
       for (const auto* file : found->second) {
@@ -339,10 +362,16 @@ bool InstallPlan(std::string_view package, const CabinetSource& beside, const st
     const auto extended = ExtendPath(current, plan.path_prepend, plan.path_append);
     if (extended != current) machine.push_back({kEnvironmentKey, "PATH", "str(2):" + WineString(extended)});
   }
-  // Steam marks the entry as run under its HasRunKey (a DWORD named after the entry).
+  // Steam marks the entry as run under its HasRunKey (a DWORD named after the entry), unless the
+  // package writes that value itself (PhysX's "PhysX Version" under AGEIA Technologies).
   const auto run_key = Lower(entry.has_run_key);
-  if (run_key.rfind("hkey_local_machine\\software\\", 0) == 0 && run_key.rfind("hkey_local_machine\\software\\wow6432node\\", 0) != 0)
-    machine.push_back({"Software\\Wow6432Node\\" + entry.has_run_key.substr(28), entry.name, "dword:00000001"});
+  if (run_key.rfind("hkey_local_machine\\software\\", 0) == 0 && run_key.rfind("hkey_local_machine\\software\\wow6432node\\", 0) != 0) {
+    RegistryValue marker{"Software\\Wow6432Node\\" + entry.has_run_key.substr(28), entry.name, "dword:00000001"};
+    const bool written = std::any_of(machine.begin(), machine.end(), [&](const RegistryValue& value) {
+      return !value.default_value && Lower(value.key) == Lower(marker.key) && Lower(value.name) == Lower(marker.name);
+    });
+    if (!written) machine.push_back(std::move(marker));
+  }
   for (const auto& [hive, values] : {std::pair<const char*, const std::vector<RegistryValue>*>{"system.reg", &machine},
                                      std::pair<const char*, const std::vector<RegistryValue>*>{"user.reg", &plan.user}}) {
     if (!values->empty() && !ApplyBottleRegistryValues(*values, prefix.string(), unix_time, hive, reason)) return false;
@@ -350,7 +379,17 @@ bool InstallPlan(std::string_view package, const CabinetSource& beside, const st
   return true;
 }
 
-// Installs a package from the game folder, its external cabinets beside it.
+// Installs a package read from the game folder (on its own, or inside the setup program at
+// package_path), its external cabinets beside that file.
+bool InstallPackageBytes(std::string_view package, const std::filesystem::path& package_path,
+                         const std::filesystem::path& prefix, const RedistEntry& entry, std::int64_t unix_time,
+                         std::size_t* files, std::string* reason) {
+  const auto beside = [&](const std::string& name, std::string* bytes) {
+    return ReadFile(package_path.parent_path() / name, kMaxPackageBytes, bytes);
+  };
+  return InstallPlan(package, beside, prefix, entry, unix_time, {}, files, reason);
+}
+
 bool InstallPackage(const std::filesystem::path& package_path, const std::filesystem::path& prefix,
                     const RedistEntry& entry, std::int64_t unix_time, std::size_t* files, std::string* reason) {
   std::string package;
@@ -358,13 +397,82 @@ bool InstallPackage(const std::filesystem::path& package_path, const std::filesy
     *reason = "the package could not be read";
     return false;
   }
-  const auto beside = [&](const std::string& name, std::string* bytes) {
-    return ReadFile(package_path.parent_path() / name, kMaxPackageBytes, bytes);
-  };
-  return InstallPlan(package, beside, prefix, entry, unix_time, {}, files, reason);
+  return InstallPackageBytes(package, package_path, prefix, entry, unix_time, files, reason);
+}
+
+// A package that reads as one and has files.
+bool PackageWithFiles(std::string_view package) {
+  MsiInstallPlan plan;
+  std::string reason;
+  return ReadMsiPackage(package, &plan, &reason) && !plan.files.empty();
+}
+
+constexpr char kCompoundSignature[] = "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
+constexpr std::size_t kMaxCandidates = 16;
+// A package a setup program carries, at most (PhysX 9.09's is 33 MiB): it is read whole, and the console's heap is
+// small.
+constexpr std::size_t kMaxEmbeddedBytes = 96u * 1024u * 1024u;
+
+// Whether the compound file header at offset looks like one a package has (the sector sizes Compound reads), so
+// a signature that only happens to be in the program isn't read to the end.
+bool CompoundHeaderAt(int file, off_t offset) {
+  unsigned char header[0x22];
+  if (::pread(file, header, sizeof(header), offset) != static_cast<ssize_t>(sizeof(header))) return false;
+  const unsigned shift = header[0x1e] | header[0x1f] << 8, mini = header[0x20] | header[0x21] << 8;
+  return std::memcmp(header, kCompoundSignature, 8) == 0 && (shift == 9 || shift == 12) && mini == 6;
+}
+
+// FindEmbeddedMsi on a file, read a piece at a time: only the package, from its offset to the
+// file's end, is kept, in *package (the console's heap is small and a setup program can be large).
+bool FindEmbeddedMsiFile(const std::filesystem::path& path, std::string* package) {
+  const int file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (file < 0) return false;
+  const std::string_view signature(kCompoundSignature, 8);
+  std::vector<char> chunk(1u << 20);
+  std::string carry;  // the previous piece's last bytes, for a signature across two pieces
+  off_t carry_at = 0;  // where carry starts in the file
+  std::size_t candidates = 0;
+  bool found = false;
+  for (off_t read_at = 0; !found && candidates < kMaxCandidates && read_at < static_cast<off_t>(kMaxPackageBytes);) {
+    const auto count = ::read(file, chunk.data(), chunk.size());
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) break;
+    std::string window = carry;
+    window.append(chunk.data(), static_cast<std::size_t>(count));
+    const off_t window_at = carry_at;
+    for (auto at = window.find(signature); at != std::string::npos && !found && candidates < kMaxCandidates;
+         at = window.find(signature, at + 1)) {
+      const off_t offset = window_at + static_cast<off_t>(at);
+      if (offset == 0) continue;  // the program itself
+      ++candidates;
+      if (CompoundHeaderAt(file, offset) && ReadFile(path, kMaxEmbeddedBytes, package, offset) &&
+          PackageWithFiles(*package))
+        found = true;
+    }
+    read_at += count;
+    const auto keep = std::min<std::size_t>(window.size(), signature.size() - 1);
+    carry = window.substr(window.size() - keep);
+    carry_at = window_at + static_cast<off_t>(window.size() - keep);
+  }
+  ::close(file);
+  if (!found) package->clear();
+  return found;
 }
 
 }  // namespace
+
+std::optional<std::size_t> FindEmbeddedMsi(std::string_view program) {
+  // Compound files the program carries; a setup program can hold other ones (its own resources),
+  // so each is read as a package until one has files. A few are enough for a setup program.
+  const std::string_view signature(kCompoundSignature, 8);
+  std::size_t candidates = 0;
+  for (auto at = program.find(signature, 1); at != std::string_view::npos && candidates < kMaxCandidates;
+       at = program.find(signature, at + 1)) {
+    ++candidates;
+    if (PackageWithFiles(program.substr(at))) return at;
+  }
+  return std::nullopt;
+}
 
 RedistAction ClassifyRedist(const RedistEntry& entry, const std::string& install_dir, std::string* package) {
   const auto program = FileName(entry.process);
@@ -614,7 +722,13 @@ RedistInstallResult InstallRedistributables(const std::string& game_root, const 
   }
   const std::filesystem::path prefix(prefix_dir);
   auto installed = InstalledPackages(prefix);
-  std::set<std::string> seen;  // a package two scripts run is installed once
+  // A package two scripts run is installed once. One that failed isn't tried again from the same folder (its
+  // external cabinets are looked for there), and a setup program is looked into once.
+  std::map<std::string, std::string> failed;  // hash and folder -> why
+  std::set<std::string> without_package;      // setup programs' hashes
+  const auto failure_key = [](const std::string& hash, const std::filesystem::path& path) {
+    return hash + '\n' + path.parent_path().string();
+  };
   for (const auto& script : scripts) {
     std::string text, reason;
     std::vector<RedistEntry> entries;
@@ -627,6 +741,47 @@ RedistInstallResult InstallRedistributables(const std::string& game_root, const 
       outcome.name = entry.name;
       std::string package;
       const auto action = ClassifyRedist(entry, install_dir, &package);
+      if (action == RedistAction::kNotRun && InsideGame(entry.process, install_dir, &package) && package.size() > 4 &&
+          Lower(package).compare(package.size() - 4, 4, ".exe") == 0) {
+        // A setup program the console can't start may carry its package as is (PhysX's). One
+        // installed before is known by the program's hash, without reading its package again.
+        const auto path = std::filesystem::path(game_root) / package;
+        const auto hash = HashArtifactFile(path);
+        std::string embedded;
+        const bool already = hash && installed.count(*hash);
+        const auto earlier = hash ? failed.find(failure_key(*hash, path)) : failed.end();
+        bool carries = false;
+        if (hash && !already && earlier == failed.end() && !without_package.count(*hash)) {
+          carries = FindEmbeddedMsiFile(path, &embedded);
+          if (!carries) without_package.insert(*hash);
+        }
+        if (already || earlier != failed.end() || carries) {
+          outcome.detail = package + " (its package)";
+          if (already) {
+            outcome.result = "already";
+          } else if (earlier != failed.end()) {
+            outcome.result = "failed";
+            outcome.detail = package + ": " + earlier->second;
+          } else {
+            std::string failure;
+            if (!InstallPackageBytes(embedded, path, prefix, entry, unix_time, &outcome.files, &failure)) {
+              outcome.result = "failed";
+            } else if (!RecordPackage(prefix, *hash, package)) {
+              outcome.result = "failed";
+              failure = "installed, but could not be recorded";
+            } else {
+              outcome.result = "installed";
+              installed[*hash] = package;
+            }
+            if (outcome.result == "failed") {
+              outcome.detail = package + ": " + failure;
+              failed[failure_key(*hash, path)] = failure;
+            }
+          }
+          result.outcomes.push_back(std::move(outcome));
+          continue;
+        }
+      }
       if (action != RedistAction::kMsi) {
         outcome.result = action == RedistAction::kCovered ? "covered" : "not-run";
         outcome.detail = FileName(entry.process);
@@ -642,21 +797,27 @@ RedistInstallResult InstallRedistributables(const std::string& game_root, const 
         result.outcomes.push_back(std::move(outcome));
         continue;
       }
-      if (installed.count(*hash) || !seen.insert(*hash).second) {
+      if (installed.count(*hash)) {
         outcome.result = "already";
         result.outcomes.push_back(std::move(outcome));
         continue;
       }
       std::string failure;
-      if (!InstallPackage(path, prefix, entry, unix_time, &outcome.files, &failure)) {
+      if (const auto earlier = failed.find(failure_key(*hash, path)); earlier != failed.end()) {
         outcome.result = "failed";
-        outcome.detail = package + ": " + failure;
+        failure = earlier->second;
+      } else if (!InstallPackage(path, prefix, entry, unix_time, &outcome.files, &failure)) {
+        outcome.result = "failed";
       } else if (!RecordPackage(prefix, *hash, package)) {
         outcome.result = "failed";
-        outcome.detail = package + ": installed, but could not be recorded";
+        failure = "installed, but could not be recorded";
       } else {
         outcome.result = "installed";
         installed[*hash] = package;
+      }
+      if (outcome.result == "failed") {
+        outcome.detail = package + ": " + failure;
+        failed[failure_key(*hash, path)] = failure;
       }
       result.outcomes.push_back(std::move(outcome));
     }

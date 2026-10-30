@@ -15,6 +15,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <vector>
 
@@ -33,8 +34,9 @@ namespace {
 
 // A package like NVIDIA's legacy PhysX one: a 32-bit loader in Vendor\Common (added to PATH),
 // an engine in Vendor\Engine\v1 found through a registry value, a 64-bit feature turned on by
-// VersionNT64, a feature left off, and files in the two-block cabinet above.
-enum class Variant { kNormal, kWrongSize, kUncompressed };
+// VersionNT64, a feature left off, and files in the two-block cabinet above (beside the package for
+// kExternalCabinet, as data.cab).
+enum class Variant { kNormal, kWrongSize, kUncompressed, kExternalCabinet };
 
 std::string SamplePackage(Variant variant = Variant::kNormal) {
   std::vector<TableSpec> tables;
@@ -72,7 +74,7 @@ std::string SamplePackage(Variant variant = Variant::kNormal) {
                      {"off", "C_OFF", "Off.dll", "10", "", "", "512", "4"},
                      {"link", "C_SHORTCUT", "Link.txt", "0", "", "", "512", "5"}}});
   tables.push_back({"Media", {{"DiskId", 'i'}, {"LastSequence", 'i'}, {"DiskPrompt", 's'}, {"Cabinet", 's'}},
-                    {{"1", "5", "", "#data.cab"}}});
+                    {{"1", "5", "", variant == Variant::kExternalCabinet ? "data.cab" : "#data.cab"}}});
   tables.push_back({"Registry",
                     {{"Registry", 's'}, {"Root", 'i'}, {"Key", 's'}, {"Name", 's'}, {"Value", 's'}, {"Component_", 's'}},
                     {{"r1", "2", "SOFTWARE\\Vendor", "Core Path", "[D_ENGINE]", "C_REG"},
@@ -90,6 +92,7 @@ std::string SamplePackage(Variant variant = Variant::kNormal) {
                     {{"e1", "=-*PATH", "[D_COMMON];[~]", "C_ENV"}, {"e2", "=-*OTHER", "x", "C_ENV"}}});
   tables.push_back({"CustomAction", {{"Action", 's'}, {"Type", 'i'}, {"Source", 's'}, {"Target", 's'}},
                     {{"CA1", "1", "Binary1", "Run"}}});
+  if (variant == Variant::kExternalCabinet) return Package(tables, {});
   return Package(tables, {{"data.cab", TwoBlockCabinet()}});
 }
 
@@ -416,6 +419,128 @@ std::filesystem::path MakeBottle(const std::filesystem::path& prefix) {
   return prefix;
 }
 
+// A setup program that carries its package as is, as NVIDIA's PhysX System Software does (a WISE
+// installer): the package is found past another compound file and installed from the program.
+void TestEmbeddedPackage() {
+  const std::string head = "MZ" + std::string(300, '\x90');
+  const auto other = CompoundFile({{"resource", "not a package"}});
+  const auto program = head + other + SamplePackage() + std::string(1000, '\x7f');
+  CHECK(FindEmbeddedMsi(program) == head.size() + other.size());
+  CHECK(!FindEmbeddedMsi(head + other + std::string(1000, '\x7f')));
+  CHECK(!FindEmbeddedMsi(""));
+
+  char pattern[] = "/tmp/playden-redist-XXXXXX";
+  CHECK(::mkdtemp(pattern));
+  const auto base = std::filesystem::canonical(pattern);
+  const auto game = base / "game";
+  const auto prefix = MakeBottle(base / "prefix");
+  WriteText(game / "installscript.vdf",
+            "\"InstallScript\" { \"Run Process\" { \"Version\" { "
+            "\"HasRunKey\" \"HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Vendor\" "
+            "\"Process 1\" \"%INSTALLDIR%\\\\redist\\\\PhysX_SystemSoftware.exe\" \"Command 1\" \"/quiet\" } "
+            "\"Other\" { \"Process 1\" \"%INSTALLDIR%\\\\redist\\\\other_setup.exe\" } } }");
+  WriteText(game / "redist/PhysX_SystemSoftware.exe", program);
+  WriteText(game / "redist/other_setup.exe", head + other);
+  const auto result = InstallRedistributables(game.string(), "Z:\\games\\35140", prefix.string(), 1700000100);
+  CHECK(result.outcomes.size() == 2);
+  // The entry's HasRunKey value is one the package writes itself ("Version" under Vendor): the package's is kept.
+  CHECK(result.outcomes[0].name == "Version" && result.outcomes[0].result == "installed" && result.outcomes[0].files == 3);
+  CHECK(result.outcomes[0].detail == "redist/PhysX_SystemSoftware.exe (its package)");
+  CHECK(result.outcomes[1].name == "Other" && result.outcomes[1].result == "not-run" &&
+        result.outcomes[1].detail == "other_setup.exe");
+  CHECK(ReadText(prefix / "drive_c/Program Files (x86)/Vendor Runtime/Common/Loader.dll") == "0123456789");
+  CHECK(ReadText(prefix / "system.reg").find("\"Core Path\"=") != std::string::npos);
+  CHECK(ReadText(prefix / "system.reg").find("\"Version\"=dword:00000007") != std::string::npos);
+  CHECK(ReadText(prefix / ".playden-redist").find(" redist/PhysX_SystemSoftware.exe\n") != std::string::npos);
+  // Installed once, under the program's own hash.
+  const auto again = InstallRedistributables(game.string(), "Z:\\games\\35140", prefix.string(), 1700000200);
+  CHECK(again.outcomes.size() == 2 && again.outcomes[0].result == "already");
+  // The program is read a piece of 1 MiB at a time: a package whose signature straddles two pieces is found.
+  std::filesystem::remove(prefix / ".playden-redist");
+  const auto straddling = "MZ" + std::string((1u << 20) - 5, '\x90') + SamplePackage();
+  CHECK(FindEmbeddedMsi(straddling) == (1u << 20) - 3);
+  WriteText(game / "redist/PhysX_SystemSoftware.exe", straddling);
+  const auto large = InstallRedistributables(game.string(), "Z:\\games\\35140", prefix.string(), 1700000300);
+  CHECK(large.outcomes.size() == 2 && large.outcomes[0].result == "installed" && large.outcomes[0].files == 3);
+  // The same program in two folders, its cabinet beside only the second: the first fails (again for a second entry,
+  // without another try) and the second still installs.
+  std::filesystem::remove(prefix / ".playden-redist");
+  const auto external = head + SamplePackage(Variant::kExternalCabinet);
+  WriteText(game / "installscript.vdf",
+            "\"InstallScript\" { \"Run Process\" { "
+            "\"A\" { \"Process 1\" \"%INSTALLDIR%\\\\a\\\\setup.exe\" } "
+            "\"A again\" { \"Process 1\" \"%INSTALLDIR%\\\\a\\\\setup.exe\" } "
+            "\"B\" { \"Process 1\" \"%INSTALLDIR%\\\\b\\\\setup.exe\" } } }");
+  WriteText(game / "a/setup.exe", external);
+  WriteText(game / "b/setup.exe", external);
+  WriteText(game / "b/data.cab", TwoBlockCabinet());
+  const auto split = InstallRedistributables(game.string(), "Z:\\games\\35140", prefix.string(), 1700000400);
+  CHECK(split.outcomes.size() == 3);
+  CHECK(split.outcomes[0].result == "failed" && split.outcomes[1].result == "failed");
+  CHECK(split.outcomes[0].detail == split.outcomes[1].detail && split.outcomes[0].detail.rfind("a/setup.exe: ", 0) == 0);
+  CHECK(split.outcomes[2].result == "installed" && split.outcomes[2].files == 3);
+  std::filesystem::remove_all(base);
+}
+
+// NVIDIA's PhysX System Software 9.09.0814 setup program (Batman: Arkham Asylum's), when PLAYDEN_TEST_PHYSX_SETUP names a copy.
+void TestPhysxSetupProgram() {
+  const char* path = std::getenv("PLAYDEN_TEST_PHYSX_SETUP");
+  if (!path || !*path) return;
+  char pattern[] = "/tmp/playden-redist-XXXXXX";
+  CHECK(::mkdtemp(pattern));
+  const auto base = std::filesystem::canonical(pattern);
+  const auto prefix = MakeBottle(base / "prefix");
+  const auto game = base / "game";
+  WriteText(game / "installscript.vdf",
+            "\"InstallScript\" { \"Run Process\" { \"PhysX Version\" { "
+            "\"HasRunKey\" \"HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\AGEIA Technologies\" "
+            "\"Process 1\" \"%INSTALLDIR%\\\\redist\\\\PhysX_9.08.14_9.09.0814_SystemSoftware.exe\" \"Command 1\" \"/quiet\" "
+            "\"MinimumHasRunValue\" \"9090814\" } } }");
+  std::filesystem::create_directories(game / "redist");
+  std::filesystem::copy_file(path, game / "redist/PhysX_9.08.14_9.09.0814_SystemSoftware.exe");
+  // Installed first, before this test reads anything itself, so the peak it adds can be seen.
+  struct rusage before {}, after {};
+  ::getrusage(RUSAGE_SELF, &before);
+  const auto result = InstallRedistributables(game.string(), "Z:\\games\\35140", prefix.string(), 1700000100);
+  ::getrusage(RUSAGE_SELF, &after);
+  CHECK(result.outcomes.size() == 1);
+  std::fprintf(stderr, "PhysX setup program: %s %s, %zu files, peak memory %ld MB before, %ld MB after\n",
+               result.outcomes[0].result.c_str(), result.outcomes[0].detail.c_str(), result.outcomes[0].files,
+               static_cast<long>(before.ru_maxrss / (1024 * 1024)), static_cast<long>(after.ru_maxrss / (1024 * 1024)));
+  CHECK(result.outcomes[0].result == "installed");
+  CHECK(std::filesystem::exists(prefix / "drive_c/windows/syswow64/PhysXLoader.dll"));
+  CHECK(std::filesystem::exists(prefix / "drive_c/Program Files (x86)/AGEIA Technologies/v2.8.1/PhysXCore.dll"));
+  std::filesystem::remove_all(base);
+
+  const auto program = ReadText(path);
+  const auto at = FindEmbeddedMsi(program);
+  CHECK(at);
+  MsiInstallPlan plan;
+  std::string reason;
+  CHECK(ReadMsiPackage(std::string_view(program).substr(*at), &plan, &reason));
+  const auto has = [&](const std::string& target) {
+    return std::any_of(plan.files.begin(), plan.files.end(), [&](const MsiFile& file) { return file.target == target; });
+  };
+  // 9.09.0814 puts its loader in the system folder and the engines under AGEIA Technologies.
+  CHECK(plan.product_name == "NVIDIA PhysX" && plan.product_version == "9.09.0814");
+  CHECK(has("windows/syswow64/PhysXLoader.dll"));
+  CHECK(has("Program Files (x86)/AGEIA Technologies/v2.8.1/PhysXCore.dll"));
+  CHECK(!plan.unsupported_files && result.outcomes[0].files == plan.files.size());
+  // Its cabinet is LZX. PLAYDEN_TEST_PHYSX_SETUP_FILES may name a folder with the members another tool extracted.
+  if (const char* reference = std::getenv("PLAYDEN_TEST_PHYSX_SETUP_FILES"); reference && *reference) {
+    const auto cabinet = ReadMsiStream(std::string_view(program).substr(*at), plan.cabinets.at(0).name);
+    CHECK(cabinet);
+    std::size_t compared = 0;
+    CHECK(ExtractCabinet(*cabinet, [&](const std::string& name, std::string_view data) {
+      CHECK(ReadText(std::filesystem::path(reference) / name) == data);
+      ++compared;
+      return true;
+    }, &reason));
+    std::fprintf(stderr, "PhysX setup program: %zu members match the reference\n", compared);
+    CHECK(compared > 0);
+  }
+}
+
 VcRedist SyntheticRedist(bool x64, const std::string& bundle) {
   const std::string arch = x64 ? "x64" : "x86";
   return {arch, "https://download.example/pr/" + *HashArtifactBytes(bundle) + "/VC_redist." + arch + ".exe",
@@ -660,7 +785,9 @@ int main() {
   TestBurnBundle();
   TestScripts();
   TestInstall();
+  TestEmbeddedPackage();
   TestPhysxPackage();
+  TestPhysxSetupProgram();
   TestMfcFilter();
   TestMfcInstall();
   TestMfcScanRecord();
