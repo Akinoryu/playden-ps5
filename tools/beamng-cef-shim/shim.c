@@ -117,6 +117,7 @@ static BOOL g_keep_settings;
 static BOOL g_keep_profiler;
 static BOOL g_no_commit;
 static BOOL g_vk_fix;
+static BOOL g_vk_reuse;
 static char g_config[4096];
 static DWORD g_config_size;
 static BOOL g_have_config;
@@ -411,6 +412,10 @@ static void LoadConfig(void) {
       i = 0;
       while (no_fix[i] && p[i] == no_fix[i]) ++i;
       if (!no_fix[i]) g_vk_fix = 0;
+      static const char no_reuse[] = "shim:no-vk-reuse";
+      i = 0;
+      while (no_reuse[i] && p[i] == no_reuse[i]) ++i;
+      if (!no_reuse[i]) g_vk_reuse = 0;
       static const char no_commit[] = "shim:no-commit";
       i = 0;
       while (no_commit[i] && p[i] == no_commit[i]) ++i;
@@ -678,7 +683,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 10)\n");
+    Log("libcef-shim: loaded (build 11)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

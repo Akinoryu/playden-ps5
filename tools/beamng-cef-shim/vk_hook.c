@@ -23,6 +23,12 @@ typedef struct {
   uint32_t width, height, image_count;
   BOOL retired;
   uint32_t acquired;  // bit per image index: acquired and not presented
+  // Reuse: the game destroyed it and the shim kept it for an identical create.
+  BOOL parked;
+  uint32_t orphaned;  // images the game held when it destroyed it, presented once a queue is known
+  uint64_t surface;
+  uint32_t format, color_space, usage, present_mode;
+  uint64_t device;
 } chain_t;
 
 static unix_call_fn g_real_dispatcher;
@@ -35,6 +41,7 @@ static uint64_t g_last_queue;
 static volatile long g_vk_lock;
 static long g_vk_logged;
 static BOOL g_vk_fix = 1;
+static BOOL g_vk_reuse = 1;
 static int32_t (*g_queue_present)(uint64_t queue, const void* info);
 static uint64_t g_present_handle;
 
@@ -152,8 +159,36 @@ static BOOL ReleaseRetiredImages(void) {
   return 1;
 }
 
+// Presents the images the game held when it destroyed a swapchain the shim kept, which frees
+// their display buffers. Needs a queue, so it runs after the game's first present on that chain.
+static void PresentOrphans(uint64_t swapchain) {
+  uint32_t indices[32];
+  uint32_t count = 0;
+  VkLock();
+  chain_t* chain = FindChain(swapchain);
+  if (chain && chain->orphaned) {
+    for (uint32_t index = 0; index < 32; ++index)
+      if (chain->orphaned & (1u << index)) indices[count++] = index;
+    chain->orphaned = 0;
+  }
+  uint64_t queue = g_last_queue;
+  int32_t (*present)(uint64_t, const void*) = g_queue_present;
+  for (int i = 0; i < g_vk_module_count; ++i)
+    if (g_vk_modules[i].handle_cell && *g_vk_modules[i].handle_cell == g_present_handle)
+      present = g_vk_modules[i].present;
+  VkUnlock();
+  for (uint32_t i = 0; i < count && queue && present; ++i) {
+    present_info_t info = {1000001001, NULL, 0, NULL, 1, &swapchain, &indices[i], NULL};
+    int32_t result = present(queue, &info);
+    VkLog("gave back an image held at destroy: chain, index, result", swapchain, indices[i], (uint32_t)result);
+  }
+}
+
+static long g_presents;
+
 static void NotePresent(uint64_t queue, const present_info_t* info, int32_t result) {
   VkLock();
+  if (++g_presents % 600 == 0) VkLog("presents so far, latest result", g_presents, (uint32_t)result, 0);
   g_last_queue = queue;
   for (uint32_t i = 0; info && i < info->swapchain_count; ++i) {
     chain_t* chain = FindChain(info->swapchains[i]);
@@ -272,6 +307,8 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
     long status = RealFor(handle)(handle, code, args);
     g_present_handle = handle;
     NotePresent(p->queue, p->info, status ? -1 : p->result);
+    for (uint32_t i = 0; !status && p->info && i < p->info->swapchain_count; ++i)
+      PresentOrphans(p->info->swapchains[i]);
     return status;
   }
   if (code == g_code_create) {
@@ -282,9 +319,50 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       uint64_t* swapchain;
       int32_t result;
     }* p = args;
-    long status = RealFor(handle)(handle, code, args);
     uint32_t width = *(const uint32_t*)(p->info + 44), height = *(const uint32_t*)(p->info + 48);
     uint64_t old = *(const uint64_t*)(p->info + 96);
+    uint64_t surface = *(const uint64_t*)(p->info + 24);
+    uint32_t format = *(const uint32_t*)(p->info + 36), color_space = *(const uint32_t*)(p->info + 40);
+    uint32_t usage = *(const uint32_t*)(p->info + 56), present_mode = *(const uint32_t*)(p->info + 88);
+    // An identical swapchain to one the game just destroyed: hand back the one the shim kept.
+    // On the PS5 each destroy and create of a same-size swapchain reuses its display buffers,
+    // and BeamNG's third one never got an image.
+    VkLock();
+    for (int i = 0; i < kMaxChains; ++i) {
+      chain_t* kept = &g_chains[i];
+      if (!kept->handle || !kept->parked) continue;
+      BOOL same = kept->device == p->device && kept->surface == surface && kept->width == width &&
+                  kept->height == height && kept->format == format && kept->color_space == color_space &&
+                  kept->usage == usage && kept->present_mode == present_mode && (!old || old == kept->handle);
+      if (!same) continue;
+      kept->parked = 0;
+      kept->retired = 0;
+      g_current_chain = kept->handle;
+      *p->swapchain = kept->handle;
+      p->result = 0;
+      VkLog("create swapchain: reused the kept one, held images", kept->handle, kept->orphaned, 0);
+      VkUnlock();
+      return 0;
+    }
+    // Anything else: really destroy what the shim kept, then create.
+    uint64_t kept_handles[kMaxChains], kept_devices[kMaxChains];
+    int kept_count = 0;
+    for (int i = 0; i < kMaxChains; ++i)
+      if (g_chains[i].handle && g_chains[i].parked) {
+        kept_handles[kept_count] = g_chains[i].handle;
+        kept_devices[kept_count++] = g_chains[i].device;
+        g_chains[i].handle = 0;
+      }
+    VkUnlock();
+    for (int i = 0; i < kept_count; ++i) {
+      struct {
+        uint64_t device, swapchain;
+        const void* allocator;
+      } destroy = {kept_devices[i], kept_handles[i], NULL};
+      VkLog("destroying the kept swapchain first", kept_handles[i], 0, 0);
+      RealFor(handle)(handle, g_code_destroy, &destroy);
+    }
+    long status = RealFor(handle)(handle, code, args);
     VkLock();
     VkLog("create swapchain: old, size, result", old, ((uint64_t)width << 32) | height, (uint32_t)p->result);
     if (!status && p->result == 0 && p->swapchain) {
@@ -294,7 +372,8 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
       if (old_chain) old_chain->retired = 1;
       for (int i = 0; i < kMaxChains; ++i)
         if (!g_chains[i].handle) {
-          g_chains[i] = (chain_t){*p->swapchain, width, height, *(const uint32_t*)(p->info + 32), 0, 0};
+          g_chains[i] = (chain_t){*p->swapchain, width, height, *(const uint32_t*)(p->info + 32), 0, 0,
+                                  0, 0, surface, format, color_space, usage, present_mode, p->device};
           break;
         }
       g_current_chain = *p->swapchain;
@@ -311,6 +390,16 @@ static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
     VkLock();
     VkLog("destroy swapchain", p->swapchain, 0, 0);
     chain_t* chain = FindChain(p->swapchain);
+    if (chain && g_vk_reuse && g_current_chain == p->swapchain) {
+      // Kept for the identical create that usually follows; images the game held come back
+      // through PresentOrphans.
+      chain->parked = 1;
+      chain->orphaned |= chain->acquired;
+      chain->acquired = 0;
+      VkLog("  kept it for reuse, held images", chain->orphaned, 0, 0);
+      VkUnlock();
+      return 0;
+    }
     if (chain) {
       if (chain->acquired) VkLog("  it still had acquired images", chain->acquired, 0, 0);
       chain->handle = 0;
