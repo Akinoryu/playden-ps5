@@ -43,6 +43,16 @@ __declspec(dllimport) size_t WINAPI VirtualQuery(const void*, void*, size_t);
 __declspec(dllimport) void* WINAPI AddVectoredExceptionHandler(DWORD, void*);
 __declspec(dllimport) BOOL WINAPI GetModuleHandleExW(DWORD, const void*, HMODULE*);
 __declspec(dllimport) DWORD WINAPI GetCurrentThreadId(void);
+__declspec(dllimport) DWORD WINAPI GetCurrentProcessId(void);
+__declspec(dllimport) HANDLE WINAPI CreateThread(void*, size_t, void*, void*, DWORD, DWORD*);
+__declspec(dllimport) void WINAPI Sleep(DWORD);
+__declspec(dllimport) HANDLE WINAPI CreateToolhelp32Snapshot(DWORD, DWORD);
+__declspec(dllimport) BOOL WINAPI Thread32First(HANDLE, void*);
+__declspec(dllimport) BOOL WINAPI Thread32Next(HANDLE, void*);
+__declspec(dllimport) HANDLE WINAPI OpenThread(DWORD, BOOL, DWORD);
+__declspec(dllimport) DWORD WINAPI SuspendThread(HANDLE);
+__declspec(dllimport) DWORD WINAPI ResumeThread(HANDLE);
+__declspec(dllimport) BOOL WINAPI GetThreadContext(HANDLE, void*);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
 
@@ -210,6 +220,108 @@ static long WINAPI ExceptionLogger(exception_pointers_t* info) {
   return 0;  // EXCEPTION_CONTINUE_SEARCH
 }
 
+// Appends "module+0xoffset" (or "0xaddress") for address to line.
+static size_t FormatAddress(char* line, size_t n, size_t capacity, uint64_t address) {
+  HMODULE module = NULL;
+  WCHAR path[260];
+  uint64_t offset = address;
+  if (GetModuleHandleExW(6, (const void*)address, &module) && module) {
+    DWORD length = GetModuleFileNameW(module, path, 260), start = length;
+    while (start && path[start - 1] != '\\' && path[start - 1] != '/') --start;
+    for (DWORD i = start; i < length && n + 1 < capacity; ++i) line[n++] = path[i] < 0x80 ? (char)path[i] : '?';
+    if (n + 1 < capacity) line[n++] = '+';
+    offset = address - (uint64_t)(uintptr_t)module;
+  }
+  char digits[20];
+  int d = 0;
+  do digits[d++] = "0123456789abcdef"[offset & 15], offset >>= 4; while (offset && d < 20);
+  if (n + 3 < capacity) line[n++] = '0', line[n++] = 'x';
+  while (d && n + 1 < capacity) line[n++] = digits[--d];
+  return n;
+}
+
+static BOOL InModule(uint64_t address) {
+  HMODULE module = NULL;
+  return address > 0x10000 && GetModuleHandleExW(6, (const void*)address, &module) && module;
+}
+
+// One line per thread: where it is now, then the code addresses found on its stack (a scan, so
+// some are stale). Each thread is suspended only to copy its registers and stack; nothing that
+// takes a lock runs while it is suspended.
+static void DumpThreads(void) {
+  typedef struct { DWORD size, usage, thread_id, process_id; long base_priority, delta_priority; DWORD flags; } thread_entry_t;
+  static _Alignas(16) unsigned char context[1232];
+  static uint64_t stack[1024];
+  DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
+  HANDLE snapshot = CreateToolhelp32Snapshot(4 /* TH32CS_SNAPTHREAD */, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    Log("libcef-shim: thread dump: no snapshot\n");
+    return;
+  }
+  Log("libcef-shim: thread dump begins\n");
+  thread_entry_t entry;
+  entry.size = sizeof(entry);
+  for (BOOL more = Thread32First(snapshot, &entry); more; entry.size = sizeof(entry), more = Thread32Next(snapshot, &entry)) {
+    if (entry.process_id != process || entry.thread_id == self) continue;
+    HANDLE thread = OpenThread(0x004a /* SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION */, 0, entry.thread_id);
+    if (!thread) continue;
+    size_t words = 0;
+    uint64_t rip = 0, rsp = 0;
+    if (SuspendThread(thread) != (DWORD)-1) {
+      for (size_t i = 0; i < sizeof(context); ++i) context[i] = 0;
+      *(DWORD*)(context + 0x30) = 0x10000b;  // CONTEXT_FULL
+      if (GetThreadContext(thread, context)) {
+        rip = *(uint64_t*)(context + CONTEXT_RIP);
+        rsp = *(uint64_t*)(context + CONTEXT_RSP);
+        // Copy up to 8 KiB of stack, stopping at the end of its committed region.
+        struct { void* base; void* allocation; DWORD allocation_protect; size_t size; DWORD state, protect, type; } region;
+        size_t limit = 1024;
+        if (VirtualQuery((void*)rsp, &region, sizeof(region))) {
+          size_t left = ((uintptr_t)region.base + region.size - rsp) / 8;
+          if (left < limit) limit = left;
+        }
+        for (words = 0; words < limit; ++words) stack[words] = ((uint64_t*)(uintptr_t)rsp)[words];
+      }
+      ResumeThread(thread);
+    }
+    CloseHandle(thread);
+    char line[1200];
+    size_t n = 0;
+    const char* head = "libcef-shim: thread ";
+    while (*head) line[n++] = *head++;
+    n = FormatAddress(line, n, sizeof(line), entry.thread_id);
+    line[n++] = ' ';
+    line[n++] = 'a';
+    line[n++] = 't';
+    line[n++] = ' ';
+    n = FormatAddress(line, n, sizeof(line), rip);
+    int found = 0;
+    for (size_t i = 0; i < words && found < 14 && n + 80 < sizeof(line); ++i) {
+      if (!InModule(stack[i])) continue;
+      line[n++] = ' ';
+      line[n++] = '<';
+      n = FormatAddress(line, n, sizeof(line), stack[i]);
+      ++found;
+    }
+    line[n++] = '\n';
+    line[n] = 0;
+    Log(line);
+  }
+  CloseHandle(snapshot);
+  Log("libcef-shim: thread dump ends\n");
+}
+
+static DWORD g_dump_seconds = 40;
+
+static DWORD WINAPI DumpLater(void* unused) {
+  (void)unused;
+  for (int round = 0; round < 2; ++round) {
+    Sleep(g_dump_seconds * 1000);
+    DumpThreads();
+  }
+  return 0;
+}
+
 // Directory of this DLL, with a trailing backslash, into dir. Returns its length.
 static DWORD ModuleDirectory(WCHAR* dir, DWORD capacity) {
   extern char __ImageBase;
@@ -238,6 +350,18 @@ static void LoadConfig(void) {
       size_t i = 0;
       while (option[i] && p[i] == option[i]) ++i;
       if (!option[i]) g_no_hook = 1;
+      static const char dump_off[] = "shim:nodump";
+      i = 0;
+      while (dump_off[i] && p[i] == dump_off[i]) ++i;
+      if (!dump_off[i]) g_dump_seconds = 0;
+      static const char dump_after[] = "shim:dump-after=";
+      i = 0;
+      while (dump_after[i] && p[i] == dump_after[i]) ++i;
+      if (!dump_after[i]) {
+        DWORD seconds = 0;
+        for (const char* d = p + i; *d >= '0' && *d <= '9'; ++d) seconds = seconds * 10 + (DWORD)(*d - '0');
+        g_dump_seconds = seconds;
+      }
       static const char keep[] = "shim:keep-settings";
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
@@ -460,6 +584,10 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
     CheckSwitches("global command line after cef_initialize", global);
     ((int (*)(void*))global->base.release)(global);
   }
+  if (g_dump_seconds) {
+    LogNumber("libcef-shim: will list every thread's stack after seconds: ", g_dump_seconds);
+    CreateThread(NULL, 0, (void*)DumpLater, NULL, 0, NULL);
+  }
   return result;
 }
 
@@ -467,7 +595,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
   (void)module;
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
-    Log("libcef-shim: loaded (build 4)\n");
+    Log("libcef-shim: loaded (build 5)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
   }
   return 1;
