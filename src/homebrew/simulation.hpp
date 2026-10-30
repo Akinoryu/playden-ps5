@@ -1410,7 +1410,7 @@ private:
     // A game whose setup waits for its program (LiveGameSetup::steam_choices): the sheet that asks,
     // installers and tools last, and the choice, which sets the game up again.
     void open_steam_programs(GameId id);
-    // Run a program once…: the game folder's programs, then a confirmation.
+    // Run a program once: the game folder's programs, then a confirmation.
     void open_setup_programs();
     void choose_steam_launch(GameId id, const std::string& program);
     std::vector<LaunchProgram> steam_programs_shown_;

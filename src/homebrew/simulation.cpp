@@ -521,7 +521,7 @@ std::string action_label(const std::string& key) {
         {"install-confirm", "Install"}, {"install-version", "Version"}, {"install-language", "Language"}, {"install-dlc", "Includes"}, {"update-confirm", "Download and install"}, {"storage-picker", "Change storage"},
         {"value-edit", "Edit…"}, {"value-reset", "Reset to recipe"}, {"override-add", "Add an override…"},
         {"unlock-setting", "Change anyway"}, {"export-recipe", "Export as recipe"}, {"program-scan", "Looking for programs…"},
-        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"run-once", "Run a program once…"}, {"run-once-start", "Run once"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"clear-shader-cache", "Clear shader cache"},
+        {"preset-picker", "Preset"}, {"game-settings", "Game settings"}, {"game-maintenance", "Maintenance"}, {"run-once", "Run a program once"}, {"run-once-start", "Run once"}, {"game-move", "Move to…"}, {"runtime-check-again", "Check again"}, {"reset-settings", "Reset all to preset"}, {"clear-shader-cache", "Clear shader cache"},
         {"section-compatibility", "Compatibility"}, {"section-advanced", "Advanced"}, {"heading-game", "Game"},
         {"heading-display", "Display"}, {"heading-controls", "Controls"}, {"heading-sound", "Sound"},
         {"heading-graphics", "Graphics"}, {"heading-windows", "Windows"},
@@ -6102,7 +6102,6 @@ void Simulation::rebuild_view() {
                         item.subtitle = "Changes apply on next launch";
                 }
             } else if (action_key == "run-once") {
-                item.subtitle = "Starts a program from the game folder, such as its settings launcher, one time. Play doesn't change.";
                 // Only a game known to run waits: opening the list asks whether it runs, and Run once checks again.
                 std::string refusal;
                 const auto runtime_game = state_.runtime_games.find(state_.navigation.selected_game_id);
@@ -6110,7 +6109,7 @@ void Simulation::rebuild_view() {
                                       runtime_game->second.activity == TitleActivity::Unknown;
                 if (live() && !checking && !game_closed(state_.navigation.selected_game_id, &refusal)) {
                     item.enabled = false;
-                    item.subtitle = refusal;
+                    item.value = "Game running";
                 }
             } else if (modal.id == "setup-programs" && action_key.rfind("setup-program-", 0) == 0) {
                 item.kind = RowKind::Choice;
