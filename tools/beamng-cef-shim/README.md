@@ -29,8 +29,9 @@ In `/data/playden-games/284160/Bin64/`:
 
 With Playden's kit 0.15 the shim also watches the game's Vulkan swapchains through winevulkan's
 Unix call dispatcher. On the PS5, swapchains of one size share their display buffers, and BeamNG
-replaces its swapchain twice at startup while the old ones still hold an acquired image, so its
-third swapchain waits forever for a free buffer (black screen, sound playing). The shim presents
+replaces its swapchain twice at startup; if the old ones still hold an acquired image (the likely
+cause, not yet confirmed on the console), its third swapchain waits forever for a free buffer
+(black screen, sound playing). The shim presents
 those leftover images on the replaced swapchains, which frees their buffers. `shim:no-vk-fix`
 keeps the log and turns that off. A Mesa fix in PS5_Mesa's `wsi_common_videoout.c` would make
 this unnecessary.
