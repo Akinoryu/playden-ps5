@@ -574,10 +574,16 @@ void CompletePublicationAndFreshInspection() {
   CHECK(registry.st_uid == ::geteuid());
   CHECK((registry.st_mode & 0777) == 0600);
   // The profile's empty folders exist although the kit has no file under users/ (Unity needs LocalLow).
-  for (const char* folder : {"AppData/LocalLow", "AppData/Roaming", "Documents", "Saved Games"}) {
+  for (const char* folder : {"AppData/LocalLow", "AppData/Roaming", "AppData/Local/Temp", "Documents", "Saved Games"}) {
     struct stat profile{};
     CHECK(::lstat((bottle / "drive_c/users/prospero" / folder).c_str(), &profile) == 0 && S_ISDIR(profile.st_mode));
     CHECK((profile.st_mode & 0777) == 0700);
+  }
+  // So do C:\ProgramData and the public Documents, which wineboot makes on a PC.
+  for (const char* folder : {"ProgramData", "users/Public", "users/Public/Documents"}) {
+    struct stat made{};
+    CHECK(::lstat((bottle / "drive_c" / folder).c_str(), &made) == 0 && S_ISDIR(made.st_mode));
+    CHECK(made.st_uid == ::geteuid() && (made.st_mode & 0777) == 0700);
   }
   CHECK(installer.ValidateArtifacts(record).state == PackageActionState::kComplete);
   CHECK(installer.PublishProfile(record).state == PackageActionState::kComplete);
@@ -666,8 +672,10 @@ void SharedProfileBottleModes() {
     CHECK(ModeOf(path) == 0711);
   for (const auto& path : {bottle / "drive_c/windows", bottle / "dosdevices"}) CHECK(ModeOf(path) == 0700);
   CHECK(ModeOf(bottle / "drive_c/windows/system.reg") == 0600);
-  for (const char* folder : {"", "AppData", "AppData/LocalLow", "AppData/Roaming", "Documents", "Saved Games"})
+  for (const char* folder : {"", "AppData", "AppData/LocalLow", "AppData/Local/Temp", "AppData/Roaming", "Documents",
+                             "Saved Games"})
     CHECK(ModeOf(profile / folder) == 0777);
+  CHECK(ModeOf(bottle / "drive_c/ProgramData") == 0700 && ModeOf(bottle / "drive_c/users/Public/Documents") == 0700);
   CHECK(ModeOf(profile / "token.txt") == 0600 && ModeOf(profile / "AppData/Launcher") == 0700);
   CHECK(ModeOf(profile / "Documents/kit.ini") == 0666 && Read(profile / "Documents/kit.ini") == "kit");
   CHECK(installer.ValidateArtifacts(record).state == PackageActionState::kComplete);
@@ -693,6 +701,11 @@ void SharedProfileBottleModes() {
     CHECK(installer.SettleBottleModes(record).state == PackageActionState::kComplete);
     CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
   }
+  // Repair adds a shared profile's missing folder open to FTP, and C:\ProgramData private.
+  std::filesystem::remove_all(profile / "AppData/Local/Temp");
+  std::filesystem::remove_all(bottle / "drive_c/ProgramData");
+  CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
+  CHECK(ModeOf(profile / "AppData/Local/Temp") == 0777 && ModeOf(bottle / "drive_c/ProgramData") == 0700);
 
   // Wine (umask 077) saves 0600 in 0700 folders; settling opens them again. Links are never
   // followed, a file with another link (a private one linked in) is left alone, and the
@@ -861,6 +874,28 @@ void UnsharedBottleStaysPrivate() {
   CHECK(installer.SettleBottleModes(record).state == PackageActionState::kComplete);
   CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
   CHECK(ModeOf(bottle / "drive_c/users/prospero/Documents/save.dat") == 0600 && ModeOf(game) == 0700);
+  // A bottle made before these folders were: Repair adds them, private, and leaves one FTP opened as it is.
+  std::filesystem::remove_all(bottle / "drive_c/ProgramData");
+  std::filesystem::remove_all(bottle / "drive_c/users/Public");
+  std::filesystem::remove_all(bottle / "drive_c/users/prospero/AppData/Local");
+  CHECK(::chmod((bottle / "drive_c/users/prospero/Saved Games").c_str(), 0777) == 0);
+  CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
+  for (const auto& path : {bottle / "drive_c/ProgramData", bottle / "drive_c/users/Public/Documents",
+                           bottle / "drive_c/users/prospero/AppData/Local/Temp"})
+    CHECK(ModeOf(path) == 0700);
+  CHECK(ModeOf(bottle / "drive_c/users/prospero/Saved Games") == 0777);
+  CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
+  // Under a folder FTP opened (or a kit downgrade left open), the missing one is still made, private.
+  std::filesystem::remove_all(bottle / "drive_c/users/prospero/AppData/Local/Temp");
+  CHECK(::chmod((bottle / "drive_c/users/prospero/AppData/Local").c_str(), 0777) == 0);
+  CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
+  CHECK(ModeOf(bottle / "drive_c/users/prospero/AppData/Local/Temp") == 0700);
+  CHECK(ModeOf(bottle / "drive_c/users/prospero/AppData/Local") == 0777);
+  // A bottle without its profile at all gets it back.
+  std::filesystem::remove_all(bottle / "drive_c/users/prospero");
+  CHECK(installer.RepairBottle(record).state == PackageActionState::kComplete);
+  for (const char* folder : {"", "AppData/LocalLow", "AppData/Local/Temp", "Documents", "Saved Games"})
+    CHECK(ModeOf(bottle / "drive_c/users/prospero" / folder) == 0700);
 }
 
 void CancelAndSpaceFailuresAreBounded() {

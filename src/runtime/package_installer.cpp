@@ -728,6 +728,17 @@ FilesystemPackageInstaller::TemplateMappings() const {
 namespace {
 bool TitleDirectoriesPublished(const fs::path& title);
 
+// The folders of a bottle that wineboot makes on a PC and the kit (which lists files only) never brings, as all
+// of them are empty in the template. Under drive_c/users/prospero: Unity's persistent data path needs
+// AppData/LocalLow (Caves of Qud stops at startup without it), and TEMP and TMP name AppData/Local/Temp.
+constexpr const char* kProfileFolders[] = {"AppData/LocalLow", "AppData/Local", "AppData/Local/Temp", "AppData/Roaming",
+                                           "Documents", "Saved Games", "Desktop", "Downloads",
+                                           "Music", "Pictures", "Videos"};
+// Under drive_c: C:\ProgramData (Common AppData; the GeForce NOW SDK that Unreal games ship stops Dead by Daylight
+// without it, and Cloud saves map WinProgramData there) and the public Documents folder. They stay private to the
+// app: only Wine opens them.
+constexpr const char* kDriveFolders[] = {"ProgramData", "users/Public/Documents"};
+
 // Creates the missing folders of path with an explicit mode, whatever the umask
 // (console titles run with umask 0). Existing folders are left as they are.
 void CreateDirectoriesWithMode(const fs::path& path, mode_t mode, std::error_code& error) {
@@ -888,7 +899,41 @@ PackageActionResult FilesystemPackageInstaller::RepairBottle(const RuntimeInstal
     if (mode != 0600 && (::chmod(path.c_str(), 0600) != 0 || !SyncPath(path, false)))
       return Failed("repair-mode", std::string(name) + " permissions could not be restored");
   }
+  AddMissingBottleFolders(record, *paths);
   return SettleBottleModes(record);
+}
+
+void FilesystemPackageInstaller::AddMissingBottleFolders(const RuntimeInstall& record, const ResolvedPaths& paths) {
+  // A bottle made before a folder joined the lists gets it here. Folders already there are left as they are, whatever
+  // their mode (FTP or a kit downgrade may have opened them), and the missing ones below are made: the profile's
+  // 0777 with bottle-profile-shared (SettleBottleModes then opens what is in them, as Prepare does), the rest 0700.
+  // One that can't be made is logged, never a failure of the repair.
+  const bool shared = ProfileShared(record, paths);
+  const auto drive = paths.bottle / "drive_c";
+  std::vector<std::string> added, failed;
+  const auto ensure = [&](const fs::path& relative, mode_t mode) {
+    struct stat info{};
+    if (::lstat((drive / relative).c_str(), &info) == 0 || errno != ENOENT) return;
+    auto current = platform::ManagedDirectory::Open(drive, platform::DirectoryPolicy::kApprovedTree);
+    for (const auto& part : relative) {
+      auto next = current ? current->OpenChild(part.string(), platform::DirectoryPolicy::kApprovedTree, true, mode)
+                          : std::nullopt;
+      if (!next || !next->Sync() || !current->Sync()) {
+        failed.push_back(relative.string());
+        return;
+      }
+      current = std::move(next);
+    }
+    added.push_back(relative.string());
+  };
+  for (const char* folder : kDriveFolders) ensure(folder, 0700);
+  for (const char* folder : kProfileFolders) ensure(fs::path("users/prospero") / folder, shared ? 0777 : 0700);
+  if (operations_.log && (!added.empty() || !failed.empty())) {
+    std::string line = "bottle folders install=" + record.install_id;
+    for (const auto& folder : added) line += " added=" + folder;
+    for (const auto& folder : failed) line += " failed=" + folder;
+    operations_.log(line);
+  }
 }
 
 PackageActionResult FilesystemPackageInstaller::SettleBottleModes(const RuntimeInstall& record) {
@@ -1311,9 +1356,6 @@ PackageActionResult FilesystemPackageInstaller::CopyMappings(
   // where Cloud saves cannot see them.
   // With bottle-profile-shared the profile's folders are 0777 (FTP runs as root, which has no
   // permission bypass) and anything the kit put there is opened up too.
-  static constexpr const char* kProfileFolders[] = {"AppData/LocalLow", "AppData/Local", "AppData/Roaming",
-                                                    "Documents", "Saved Games", "Desktop", "Downloads",
-                                                    "Music", "Pictures", "Videos"};
   if (template_stage) {
     const fs::path user = staging / profile_relative;
     if (shared_profile) {
@@ -1343,6 +1385,14 @@ PackageActionResult FilesystemPackageInstaller::CopyMappings(
           return Failed("private-directory", detail);
       }
       for (auto directory = user / folder; directory != staging; directory = directory.parent_path())
+        copied_directories.insert(directory);
+    }
+    for (const char* folder : kDriveFolders) {
+      std::string detail;
+      if (!EnsurePrivateDirectories(paths_.host_data_root, staging, staging / "drive_c" / folder, &detail,
+                                    staging_traversal))
+        return Failed("private-directory", detail);
+      for (auto directory = staging / "drive_c" / folder; directory != staging; directory = directory.parent_path())
         copied_directories.insert(directory);
     }
   }

@@ -220,6 +220,9 @@ class FilesystemPackageInstaller final : public PackageInstaller {
   // The bottle chain's traversal folders (data root, library, library/prefixes, the bottle), with
   // the mode new ones get (0711 when shared). Checks admit 0700 and 0711 either way.
   PrivateTraversal BottleTraversal(const ResolvedPaths& paths, bool shared = false) const;
+  // Repair: the profile and drive_c folders a bottle made before they were created (kProfileFolders,
+  // kDriveFolders) lacks; logged, never a failure.
+  void AddMissingBottleFolders(const RuntimeInstall& record, const ResolvedPaths& paths);
   // The bottle's way to its profile is 0711 and the profile open: the kit has
   // bottle-profile-shared and the record's title was made from it (an older shell demands 0700).
   bool ProfileShared(const RuntimeInstall& record, const ResolvedPaths& paths) const;
