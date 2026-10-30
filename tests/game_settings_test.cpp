@@ -1378,6 +1378,22 @@ int main(int argc, char** argv) {
     CHECK(settings.graphics == "opengl" && settings.dll_overrides.empty());
     CHECK(settings.values.at("steam_features").value == "emulate" && !settings.values.at("graphics").locked);
   }
+  // Batman: Arkham Asylum starts BmLauncher.exe, which can't start the game on the console, while UserEngine.ini has
+  // no [Engine.Engine] Language, so its recipe writes Language=int (English). Otherwise it is what Playden made from
+  // the game's files: DXVK for its Direct3D 9 and the Steam emulator.
+  {
+    GameRecipe asylum;
+    CHECK(ParseGameRecipe(ReadText(source / "runtime/recipes/steam-35140-arkhamasylum-v1.json"), &asylum, &reason));
+    CHECK(asylum.app_id == 35140 && asylum.launch_entries.size() == 1 &&
+          asylum.launch_entries[0].executable == "Binaries/ShippingPC-BmGame.exe");
+    CHECK(asylum.ini == (std::vector<IniValue>{{"BmGame/Config/UserEngine.ini", "Engine.Engine", "Language", "int"}}));
+    EffectiveSettings settings;
+    SettingsError error;
+    CHECK(BuildEffectiveSettings(asylum, nullptr, {}, KitCapabilities{}, &settings, &error));
+    CHECK(settings.graphics == "dxvk" && settings.dll_overrides == kDxvkOverrides && settings.architecture == "pe32");
+    CHECK(settings.values.at("steam_features").value == "emulate" && !settings.values.at("graphics").locked);
+    CHECK(settings.launch && settings.launch->executable == "Binaries/ShippingPC-BmGame.exe" && settings.arguments.empty());
+  }
   CHECK(!ParseSettingsPresets(R"({"presets":[{"id":"x","name":"X","settings":{"graphics":"gdi"}}]})", &presets, &reason));
   CHECK(!ParseSettingsPresets(R"({"presets":[{"id":"x","name":"X","settings":{"extra_arguments":"-a"}}]})", &presets, &reason));
 
@@ -1411,7 +1427,7 @@ int main(int argc, char** argv) {
   std::vector<SettingsPreset> loaded_presets;
   std::vector<GameRecipe> loaded_recipes;
   CHECK(LoadSettingsData((source / "runtime").string(), &loaded_presets, &loaded_recipes, &reason));
-  CHECK(loaded_presets.size() == 4 && loaded_recipes.size() == 4 && loaded_recipes.front().app_id == 220 &&
+  CHECK(loaded_presets.size() == 4 && loaded_recipes.size() == 5 && loaded_recipes.front().app_id == 220 &&
         loaded_recipes.back().id == "steam-4241920-braziliandrugdealer4-v1");
   CHECK(!LoadSettingsData((source / "missing").string(), &loaded_presets, &loaded_recipes, &reason));
 

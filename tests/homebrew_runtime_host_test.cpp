@@ -3736,6 +3736,47 @@ void ShippedRecipePreparesWithAnotherKitsRecipe() {
   restarted.Shutdown();
 }
 
+// Batman: Arkham Asylum's shipped recipe writes Language into the game folder's UserEngine.ini at preparation, so
+// the game does not start its launcher; a language already there stays.
+void ShippedRecipeWritesGameIni(bool language_chosen) {
+  Fixture fixture;
+  auto config = fixture.Config();
+  config.host_namespace_prefix = fixture.root;
+  config.package_paths.console_data_root = "/data";
+  config.package_paths.host_data_root = fixture.root / "data";
+  config.package_operations.hash_file = HashArtifactFile;
+  config.package_operations.hash_bytes = HashArtifactBytes;
+  config.package_operations.free_space_unverifiable = true;
+  config.package_operations.validate_bottle = [](const fs::path& bottle) {
+    return fs::is_regular_file(bottle / "system.reg") && fs::is_regular_file(bottle / "user.reg");
+  };
+  const auto kit = SyntheticKit(fixture.root / "kit");
+  config.admit_kit = [&kit](std::string*) { return std::optional<RuntimeKit>(kit); };
+  unsigned uuids = 0;
+  config.uuid = [&uuids]() -> std::optional<std::string> {
+    ++uuids; return std::string("00000000-0000-4000-8000-00000000000") + std::to_string(uuids);
+  };
+  config.unix_time = [] { return std::int64_t{1760000000}; };
+  const auto game = fixture.root / "data/homebrew/FAKE77031/games/35140";
+  Write(game / "Binaries/ShippingPC-BmGame.exe", "existing-game", 0644);
+  const std::string shipped = "[Configuration]\r\nBasedOn=..\\BmGame\\Config\\DefaultEngine.ini\r\n\r\n"
+                              "[Engine.Engine]\r\nbSubtitlesEnabled=FALSE\r\n";
+  const auto ini = shipped + (language_chosen ? "Language=deu\r\n" : "");
+  Write(game / "BmGame/Config/UserEngine.ini", ini, 0644);
+  RuntimeHost host(config);
+  CHECK(host.Start());
+  CHECK(WaitFor(host, Started).kit_available);
+  host.Prepare({35140, "/data/homebrew/FAKE77031/games/35140", "internal", "Batman: Arkham Asylum GOTY Edition"});
+  const auto done = WaitFor(host, [](const RuntimeSnapshot& s) {
+    return !s.preparing_app && (s.refusals.count(35140) || (!s.installs.empty() && s.installs[0].state == PreparationState::kReady));
+  }, 60);
+  if (done.refusals.count(35140)) std::fprintf(stderr, "Prepare refused: %s\n", done.refusals.at(35140).c_str());
+  CHECK(!done.refusals.count(35140) && done.installs.size() == 1);
+  CHECK(Read(config.state_root / "installs.json").find("\"recipe_id\":\"steam-35140-arkhamasylum-v1\"") != std::string::npos);
+  CHECK(Read(game / "BmGame/Config/UserEngine.ini") == (language_chosen ? ini : shipped + "Language=int\r\n"));
+  host.Shutdown();
+}
+
 // A shipped recipe's requirements are checked against the kit's template, as the kit's packager
 // checks the kit's own recipe: without PS5 audio in the template, a recipe that needs it is refused.
 void ShippedRecipeRequirementsFollowTheKit(bool template_audio_ps5) {
@@ -5803,6 +5844,8 @@ int main(int argc, char** argv) {
   ExistingBottleOpensWithSharedKit();
   KitWithoutSharedProfileKeepsBottlePrivate();
   ShippedRecipePreparesWithAnotherKitsRecipe();
+  ShippedRecipeWritesGameIni(false);
+  ShippedRecipeWritesGameIni(true);
   ShippedRecipeRequirementsFollowTheKit(false);
   ShippedRecipeRequirementsFollowTheKit(true);
   MigrationRewritesInstallPathsAndRepublishes();

@@ -1,0 +1,22 @@
+{
+  "recipe_id": "steam-35140-arkhamasylum-v1",
+  "recipe_version": 1,
+  "app_id": 35140,
+  "name": "Batman: Arkham Asylum GOTY Edition",
+  "launch_entries": [
+    {"id": "game", "label": "Batman: Arkham Asylum", "executable": "Binaries/ShippingPC-BmGame.exe"}
+  ],
+  "arguments": "",
+  "dll_overrides": "d3d8,d3d9,d3d10core,d3d11,dxgi=n",
+  "architecture": "pe32",
+  "runtime": "wine-wow64",
+  "prefix": "game",
+  "graphics": "dxvk",
+  "defaults": {
+    "steam_features": "emulate"
+  },
+  "ini": {
+    "BmGame/Config/UserEngine.ini": {"Engine.Engine": {"Language": "int"}}
+  },
+  "locked": []
+}
