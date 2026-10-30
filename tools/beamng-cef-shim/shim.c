@@ -108,7 +108,8 @@ typedef struct cef_app_t {
 typedef int (*cef_initialize_fn)(const void* args, const void* settings, cef_app_t* app, void* sandbox_info);
 typedef void (*cef_string_userfree_free_fn)(cef_string_t*);
 
-static const char* const kDefaultSwitches[] = {"single-process", "in-process-gpu", "no-sandbox", NULL};
+static const char* const kDefaultSwitches[] = {"single-process", "in-process-gpu", "no-sandbox",
+                                               "disable-stack-profiler", NULL};
 
 static HMODULE g_real;
 static void (*g_original_hook)(cef_app_t*, const cef_string_t*, cef_command_line_t*);
@@ -233,12 +234,41 @@ static long WINAPI ExceptionLogger(exception_pointers_t* info) {
       g_committed < 64 && !g_no_commit) {
     struct { void* base; void* allocation; DWORD allocation_protect; size_t size; DWORD state, protect, type; } region;
     void* page = (void*)(uintptr_t)(record->parameters[1] & ~(uint64_t)0x3fff);
-    if (VirtualQuery(page, &region, sizeof(region)) && region.state == 0x2000 /* MEM_RESERVE */ &&
-        region.type == 0x20000 /* MEM_PRIVATE */ && VirtualAlloc(page, 0x4000, 0x1000 /* MEM_COMMIT */, PAGE_READWRITE)) {
+    BOOL known = VirtualQuery(page, &region, sizeof(region)) != 0;
+    if (known && region.state == 0x2000 /* MEM_RESERVE */ && region.type == 0x20000 /* MEM_PRIVATE */ &&
+        VirtualAlloc(page, 0x4000, 0x1000 /* MEM_COMMIT */, PAGE_READWRITE)) {
       ++g_committed;
       LogAddress("libcef-shim: committed a reserved page read by ", (uint64_t)(uintptr_t)record->address);
       LogNumber("libcef-shim:   page ", (uint64_t)(uintptr_t)page);
       return -1;  // EXCEPTION_CONTINUE_EXECUTION
+    }
+    if (known) {
+      LogNumber("libcef-shim: read fault page ", (uint64_t)(uintptr_t)page);
+      LogNumber("libcef-shim:   state ", region.state);
+      LogNumber("libcef-shim:   protect ", region.protect);
+      LogNumber("libcef-shim:   type ", region.type);
+      LogNumber("libcef-shim:   region base ", (uint64_t)(uintptr_t)region.base);
+      LogNumber("libcef-shim:   region size ", region.size);
+      LogNumber("libcef-shim:   allocation base ", (uint64_t)(uintptr_t)region.allocation);
+    }
+    // Chromium reading another thread's stack past what is committed, into a no-access page
+    // (a stack guard) or a free one: let the read see zeros instead of ending the game.
+    HMODULE reader = NULL;
+    static const WCHAR real_name[] = {'l', 'i', 'b', 'c', 'e', 'f', '_', 'r', 'e', 'a', 'l', '.', 'd', 'l', 'l', 0};
+    BOOL from_cef = GetModuleHandleExW(6, record->address, &reader) && reader && reader == GetModuleHandleW(real_name);
+    if (known && from_cef && region.state == 0x1000 /* MEM_COMMIT */ && region.protect == 0x01 /* NOACCESS */) {
+      DWORD old_protect;
+      if (VirtualProtect(page, 0x4000, PAGE_READWRITE, &old_protect)) {
+        ++g_committed;
+        LogAddress("libcef-shim: opened a no-access page read by ", (uint64_t)(uintptr_t)record->address);
+        return -1;
+      }
+    }
+    if (known && from_cef && region.state == 0x10000 /* MEM_FREE */ &&
+        VirtualAlloc(page, 0x4000, 0x3000 /* MEM_RESERVE | MEM_COMMIT */, PAGE_READWRITE)) {
+      ++g_committed;
+      LogAddress("libcef-shim: mapped a zero page for a read of free memory by ", (uint64_t)(uintptr_t)record->address);
+      return -1;
     }
   }
   if (!Interesting(record->code) || g_reported >= 12) return 0;
@@ -737,7 +767,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 13)\n");
+    Log("libcef-shim: loaded (build 14)\n");
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
   }

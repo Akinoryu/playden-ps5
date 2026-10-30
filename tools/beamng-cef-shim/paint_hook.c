@@ -65,12 +65,48 @@ static void SampleFrame(const uint32_t* pixels, int width, int height, int* visi
     }
 }
 
+// Saves a frame as libcef_ui_frame_<number>.bmp beside this DLL, to see what CEF draws.
+static void SaveFrame(long number, const void* pixels, int width, int height) {
+  WCHAR path[1024];
+  char name[64] = "libcef_ui_frame_000.bmp";
+  name[16] = (char)('0' + number / 100 % 10);
+  name[17] = (char)('0' + number / 10 % 10);
+  name[18] = (char)('0' + number % 10);
+  DWORD n = ModuleDirectory(path, 980);
+  for (size_t i = 0; name[i]; ++i) path[n++] = (WCHAR)name[i];
+  path[n] = 0;
+  HANDLE file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
+                            0x80, NULL);
+  if (file == INVALID_HANDLE_VALUE) {
+    VkLog("cef frame could not be saved: number", (uint64_t)number, 0, 0);
+    return;
+  }
+  uint32_t bytes = (uint32_t)width * (uint32_t)height * 4;
+  unsigned char header[54] = {'B', 'M'};
+  *(uint32_t*)(header + 2) = 54 + bytes;
+  *(uint32_t*)(header + 10) = 54;
+  *(uint32_t*)(header + 14) = 40;
+  *(int32_t*)(header + 18) = width;
+  *(int32_t*)(header + 22) = -height;  // top-down rows, as CEF gives them
+  *(uint16_t*)(header + 26) = 1;
+  *(uint16_t*)(header + 28) = 32;
+  *(uint32_t*)(header + 34) = bytes;
+  DWORD written;
+  WriteFile(file, header, sizeof(header), &written, NULL);
+  WriteFile(file, pixels, bytes, &written, NULL);
+  CloseHandle(file);
+  VkLog("cef frame saved: number, size", (uint64_t)number, ((uint64_t)(uint32_t)width << 32) | (uint32_t)height, 0);
+}
+
 static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count, const void* dirty, const void* buffer,
                         int width, int height) {
   long count = __sync_add_and_fetch(&g_paints, 1);
   int visible = 0, opaque = 0;
   if (buffer && width > 0 && height > 0) SampleFrame(buffer, width, height, &visible, &opaque);
   if (!visible && !opaque) __sync_add_and_fetch(&g_blank_paints, 1);
+  if (buffer && width > 0 && height > 0 && width <= 4096 && height <= 4096 &&
+      (count == 20 || count == 100 || count == 300 || count == 600))
+    SaveFrame(count, buffer, width, height);
   if (count <= 5 || count % 600 == 0) {
     VkLog("cef paint: number, size, type", count, ((uint64_t)(uint32_t)width << 32) | (uint32_t)height, type);
     VkLog("cef paint: of 144 samples, coloured, opaque", (uint64_t)visible, (uint64_t)opaque, 0);
