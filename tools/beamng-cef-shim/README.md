@@ -1,5 +1,8 @@
 # CEF in-process shim (experimental)
 
+To set up BeamNG.drive on a PS5 with this shim, and for the story of each problem it fixes, see
+[GUIDE.md](GUIDE.md). This file is the technical reference.
+
 BeamNG.drive draws its interface with CEF (Chromium). Chromium starts helper processes for the GPU,
 network and storage services and for each page, and a PS5 title cannot start processes, so BeamNG
 stops a second or so after CEF starts. This shim is a `libcef.dll` stand-in that forwards every export
