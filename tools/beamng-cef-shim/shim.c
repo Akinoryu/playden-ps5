@@ -137,7 +137,8 @@ static BOOL g_no_shared_texture;
 static BOOL g_keep_begin_frame;
 static BOOL g_no_overlay;
 static BOOL g_save_frames;
-static BOOL g_no_sample;  // shim:no-sample: no sampling of the thread that presents (sampler.c)
+static BOOL g_sample;  // shim:sample: sample where the thread that submits spends its time (sampler.c)
+static int64_t g_start_qpc;  // when the shim loaded
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -515,10 +516,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (keep[i] && p[i] == keep[i]) ++i;
       if (!keep[i]) g_keep_settings = 1;
-      static const char no_sample[] = "shim:no-sample";
+      static const char sample[] = "shim:sample";
       i = 0;
-      while (no_sample[i] && p[i] == no_sample[i]) ++i;
-      if (!no_sample[i]) g_no_sample = 1;
+      while (sample[i] && p[i] == sample[i]) ++i;
+      if (!sample[i]) g_sample = 1;
     }
   }
   CloseHandle(file);
@@ -776,6 +777,54 @@ static void AppendAndLog(cef_command_line_t* command_line) {
   }
 }
 
+// Chromium makes most of its threads with no stack size, so they take the program's default; chrome.exe
+// sets 8 MiB (its renderer's main thread needs over 1.5 MiB). In BeamNG they take BeamNG's, and the
+// renderer's thread, which single-process mode runs in the game, overflowed it when the Options page
+// laid out (0xc00000fd, build 20). libcef_real.dll's CreateThread import now gives them 8 MiB of
+// address space; the runtime commits a stack's pages only as they are used (prospero-win patch 0604).
+typedef HANDLE(WINAPI* create_thread_fn)(void*, size_t, void*, void*, DWORD, DWORD*);
+static create_thread_fn g_create_thread;
+static size_t g_cef_stack;  // 8 MiB, or the program's default when that is more
+static volatile long g_cef_threads;
+
+static HANDLE WINAPI CefCreateThread(void* security, size_t stack, void* start, void* parameter, DWORD flags,
+                                     DWORD* id) {
+  if (!stack) {
+    stack = g_cef_stack;
+    flags |= 0x10000;  // STACK_SIZE_PARAM_IS_A_RESERVATION
+    __sync_add_and_fetch(&g_cef_threads, 1);
+  }
+  return g_create_thread(security, stack, start, parameter, flags, id);
+}
+
+// Points every import of name in module (from whichever DLL) at replacement; returns the first function
+// it imported, or NULL.
+static void* PatchImport(HMODULE module, const char* name, void* replacement) {
+  const unsigned char* base = (const unsigned char*)module;
+  const unsigned char* nt = base + *(const int32_t*)(base + 0x3c);
+  uint32_t directory = *(const uint32_t*)(nt + 24 + 120);  // DataDirectory[1], the imports
+  void* first = NULL;
+  if (!directory) return NULL;
+  for (const uint32_t* descriptor = (const uint32_t*)(base + directory); descriptor[3]; descriptor += 5) {
+    if (!descriptor[0]) continue;  // no name table to read
+    const uint64_t* names = (const uint64_t*)(base + descriptor[0]);
+    uint64_t* slots = (uint64_t*)(base + descriptor[4]);
+    for (size_t i = 0; names[i]; ++i) {
+      if (names[i] >> 63) continue;  // by ordinal
+      const char* imported = (const char*)(base + (uint32_t)names[i] + 2);
+      size_t k = 0;
+      while (name[k] && imported[k] == name[k]) ++k;
+      if (name[k] || imported[k]) continue;
+      DWORD old_protect;
+      if (!VirtualProtect(&slots[i], 8, PAGE_READWRITE, &old_protect)) continue;
+      if (!first) first = (void*)(uintptr_t)slots[i];
+      slots[i] = (uint64_t)(uintptr_t)replacement;
+      VirtualProtect(&slots[i], 8, old_protect, &old_protect);
+    }
+  }
+  return first;
+}
+
 static void FallbackAddRef(void* self) { (void)self; }
 static int FallbackRelease(void* self) { (void)self; return 0; }
 static int FallbackHasOneRef(void* self) { (void)self; return 1; }
@@ -790,6 +839,17 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
   if (!real) {
     Log("libcef-shim: libcef_real.dll or its cef_initialize is missing\n");
     return 0;
+  }
+  if (!g_create_thread) {
+    const unsigned char* program = (const unsigned char*)GetModuleHandleW(NULL);
+    size_t reserve = *(const uint64_t*)(program + *(const int32_t*)(program + 0x3c) + 24 + 72);  // SizeOfStackReserve
+    LogNumber("libcef-shim: the program's default thread stack, KiB ", reserve >> 10);
+    g_cef_stack = reserve > ((size_t)8 << 20) ? reserve : (size_t)8 << 20;
+    g_create_thread = (create_thread_fn)PatchImport(g_real, "CreateThread", (void*)CefCreateThread);
+    if (g_create_thread)
+      LogNumber("libcef-shim: CEF's threads get stacks of KiB ", g_cef_stack >> 10);
+    else
+      Log("libcef-shim: CEF imports no CreateThread; its threads keep the default stack\n");
   }
   if (!app) {
     // The game gave no CefApp: give CEF one whose only job is the command line.
@@ -877,11 +937,12 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     path[n] = 0;
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
-    Log("libcef-shim: loaded (build 21)\n");
+    QueryPerformanceCounter(&g_start_qpc);
+    Log("libcef-shim: loaded (build 22)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     CreateThread(NULL, 0, (void*)HookVulkanLater, NULL, 0, NULL);
-    if (!g_no_sample) CreateThread(NULL, 0, (void*)SampleLater, NULL, 0, NULL);
+    if (g_sample) CreateThread(NULL, 0, (void*)SampleLater, NULL, 0, NULL);
   }
   return 1;
 }

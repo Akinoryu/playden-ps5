@@ -296,6 +296,8 @@ static struct {
   int64_t frequency, last, window;
   long frames, over17, over34, over100, paints;
   int64_t longest, acquire, present, paint;
+  int hitches;  // frames over 100 ms this window: when they began, since the shim loaded, and how long
+  int64_t hitch_at[8], hitch_length[8];
 } g_pace;
 
 static int64_t PaceNow(void) {
@@ -321,69 +323,149 @@ static void PaceMs(char* line, size_t* n, int64_t ticks) {
   PaceCount(line, n, tenths % 10);
 }
 
-// The calls of the thread that presents, by kind, for a second pace line: waits for the GPU
-// (fences, semaphores, idle queues and devices), queue submits, polls of fences and timeline
-// semaphores, and every other call (recording, mostly). Timed with rdtsc, a few nanoseconds where
-// QueryPerformanceCounter may cross to the host, and turned into time with each window's ratio of
-// the two. Acquires and presents, and the overlay's calls inside a present, are the present
-// branch's to time (kVkOwn). Only that thread writes these, so they need no lock.
+// The calls of the thread that submits the game's frames, by kind, for a second pace line: waits
+// for the GPU (fences, semaphores, idle queues and devices), queue submits, polls of fences and
+// timeline semaphores, and every other call (recording, mostly). In BeamNG that thread makes about
+// 8,700 calls a frame while another one only acquires and presents (build 21). Timed with rdtsc, a
+// few nanoseconds where QueryPerformanceCounter may cross to the host, when rdtsc is that cheap
+// (MeasureClocks), and turned into time with each window's ratio of the two. Acquires and presents,
+// and the overlay's calls inside a present, are the present branch's to time (kVkOwn). Only that
+// thread writes the counts, which only grow; each pace line takes what they grew by.
 enum { kVkOther, kVkWait, kVkSubmit, kVkPoll, kVkOwn, kVkKinds, kVkCodes = 1024 };
 static unsigned char g_call_kind[kVkCodes];
 static struct {
-  volatile DWORD thread;  // the thread that presents
-  int nested;             // in the present branch
-  uint64_t ticks[kVkKinds];
-  long calls[kVkKinds];
-  uint64_t tsc;           // at the start of the window
-  long all_calls;         // g_vk_calls then
-  volatile long total;    // its calls; g_vk_calls counts the other threads' once a thread presents
+  volatile DWORD thread;           // the thread that submits
+  volatile DWORD presenter;        // the thread that presents
+  int nested;                      // in the present branch
+  BOOL timing;                     // rdtsc is cheap enough to time every call
+  volatile uint64_t last_submit;   // GetTickCount64 at the timed thread's latest submit
+  volatile uint64_t ticks[kVkKinds];
+  volatile long calls[kVkKinds];
+  uint64_t tsc, seen_ticks[kVkKinds];  // the present thread's, at the start of the window
+  long all_calls, seen_calls[kVkKinds];
 } g_vkt;
 
 static uint64_t Tsc(void) { return __builtin_ia32_rdtsc(); }
 
-// The second pace line: per frame, the time and number of calls of each kind, the rest of the
-// frame (the game's own work, CEF's paints included when they run on this thread) and the calls
-// other threads made.
+// The timed thread: the first that submits, and another once it has not submitted for a second.
+static void NoteSubmitter(DWORD thread) {
+  uint64_t now = GetTickCount64();
+  if (g_vkt.thread && now - g_vkt.last_submit < 1000) return;
+  g_vkt.last_submit = now;
+  g_vkt.thread = thread;
+}
+
+// What QueryPerformanceCounter and rdtsc cost here, logged once at start; every call of the timed
+// thread is timed only when rdtsc takes under 200 ns.
+static void MeasureClocks(void) {
+  int64_t frequency = 0, before = 0, after = 0, value = 0;
+  QueryPerformanceFrequency(&frequency);
+  if (!frequency) return;
+  QueryPerformanceCounter(&before);
+  for (int i = 0; i < 10000; ++i) QueryPerformanceCounter(&value);
+  QueryPerformanceCounter(&after);
+  uint64_t qpc_ns = (uint64_t)(after - before) * 100000 / (uint64_t)frequency;  // per call: 1e9 / 10000
+  volatile uint64_t sink = 0;
+  QueryPerformanceCounter(&before);
+  for (int i = 0; i < 100000; ++i) sink += Tsc();
+  QueryPerformanceCounter(&after);
+  uint64_t tsc_ns = (uint64_t)(after - before) * 10000 / (uint64_t)frequency;  // per call: 1e9 / 100000
+  g_vkt.timing = tsc_ns < 200;
+  char line[160];
+  size_t n = 0;
+  PaceText(line, &n, "libcef-shim: clocks: QueryPerformanceCounter takes ");
+  PaceCount(line, &n, qpc_ns);
+  PaceText(line, &n, " ns, rdtsc ");
+  PaceCount(line, &n, tsc_ns);
+  PaceText(line, &n, g_vkt.timing ? " ns\n" : " ns, too slow to time each Vulkan call\n");
+  line[n] = 0;
+  Log(line);
+}
+
+// The second pace line: per frame of the timed thread, the time and number of calls of each kind,
+// the rest of the frame (the game's own work there) and the calls other threads made.
 static void PaceCalls(int64_t now, long frames) {
   uint64_t tsc = Tsc(), elapsed = tsc - g_vkt.tsc;
   int64_t window = now - g_pace.window;
   long all_calls = g_vk_calls;
+  uint64_t ticks[kVkKinds];
+  long calls[kVkKinds];
+  for (int k = 0; k < kVkKinds; ++k) {
+    uint64_t t = g_vkt.ticks[k];
+    long c = g_vkt.calls[k];
+    ticks[k] = t - g_vkt.seen_ticks[k], calls[k] = c - g_vkt.seen_calls[k];
+    g_vkt.seen_ticks[k] = t, g_vkt.seen_calls[k] = c;
+  }
+  DWORD thread = g_vkt.thread;
   // TSC ticks per QueryPerformanceCounter tick, times 16.
   uint64_t scale = window > 0 && (int64_t)elapsed > 0 ? elapsed * 16 / (uint64_t)window : 0;
-  if (scale) {
+  if (scale && thread) {
     int64_t spent[kVkKinds], vulkan = 0;
-    for (int k = 0; k < kVkKinds; ++k) vulkan += spent[k] = (int64_t)(g_vkt.ticks[k] * 16 / scale);
-    int64_t rest = window - g_pace.acquire - g_pace.present - vulkan;
+    for (int k = 0; k < kVkKinds; ++k) vulkan += spent[k] = g_vkt.timing ? (int64_t)(ticks[k] * 16 / scale) : 0;
+    // The rest of that thread's frame; acquires and presents are part of its Vulkan time when it
+    // makes them too.
+    int64_t rest = window - vulkan - (thread == g_vkt.presenter ? g_pace.acquire + g_pace.present : 0);
     static const char* const label[] = {" ms in other Vulkan calls (", " ms waiting for the GPU (", " ms submitting (",
                                         " ms polling ("};
     static const int order[] = {kVkWait, kVkSubmit, kVkPoll, kVkOther};
     char line[400];
     size_t n = 0;
-    PaceText(line, &n, "libcef-shim: pace: per frame ");
+    PaceText(line, &n, "libcef-shim: pace: per frame on the thread that submits (");
+    PaceCount(line, &n, thread);
+    PaceText(line, &n, "): ");
     for (int i = 0; i < 4; ++i) {
       PaceMs(line, &n, spent[order[i]] / frames);
       PaceText(line, &n, label[order[i]]);
-      PaceCount(line, &n, (uint64_t)((g_vkt.calls[order[i]] + frames / 2) / frames));
+      PaceCount(line, &n, (uint64_t)((calls[order[i]] + frames / 2) / frames));
       PaceText(line, &n, i < 3 ? " calls), " : " calls); ");
     }
-    PaceMs(line, &n, rest > 0 ? rest / frames : 0);
-    PaceText(line, &n, " ms the game's own; ");
+    if (g_vkt.timing) {
+      PaceMs(line, &n, rest > 0 ? rest / frames : 0);
+      PaceText(line, &n, " ms the game's own; ");
+    }
     long others = all_calls - g_vkt.all_calls;
     PaceCount(line, &n, (uint64_t)(others > 0 ? (others + frames / 2) / frames : 0));
     PaceText(line, &n, " Vulkan calls on other threads\n");
     line[n] = 0;
     Log(line);
   }
-  for (int k = 0; k < kVkKinds; ++k) g_vkt.ticks[k] = 0, g_vkt.calls[k] = 0;
   g_vkt.tsc = tsc;
   g_vkt.all_calls = all_calls;
+}
+
+// Seconds with one decimal.
+static void PaceSeconds(char* line, size_t* n, int64_t ticks) {
+  uint64_t tenths = ticks > 0 ? (uint64_t)ticks * 10 / (uint64_t)g_pace.frequency : 0;
+  PaceCount(line, n, tenths / 10);
+  PaceText(line, n, ".");
+  PaceCount(line, n, tenths % 10);
+}
+
+// A third pace line when frames took over 100 ms: when each began, in seconds since the shim
+// loaded (BeamNG's own log counts from about then), and how long it took, to see whether they
+// come at a steady rhythm and what else happened then.
+static void PaceHitches(void) {
+  if (!g_pace.hitches) return;
+  char line[400];
+  size_t n = 0;
+  PaceText(line, &n, "libcef-shim: pace: frames over 100 ms, at seconds (ms):");
+  for (int i = 0; i < g_pace.hitches; ++i) {
+    PaceText(line, &n, i ? ", " : " ");
+    PaceSeconds(line, &n, g_pace.hitch_at[i]);
+    PaceText(line, &n, " (");
+    PaceCount(line, &n, (uint64_t)(g_pace.hitch_length[i] * 1000 / g_pace.frequency));
+    PaceText(line, &n, ")");
+  }
+  PaceText(line, &n, "\n");
+  line[n] = 0;
+  Log(line);
 }
 
 static void PaceFrame(int64_t now) {
   if (!g_pace.frequency) {
     QueryPerformanceFrequency(&g_pace.frequency);
     g_pace.last = g_pace.window = now;
-    for (int k = 0; k < kVkKinds; ++k) g_vkt.ticks[k] = 0, g_vkt.calls[k] = 0;
+    for (int k = 0; k < kVkKinds; ++k) g_vkt.seen_ticks[k] = g_vkt.ticks[k], g_vkt.seen_calls[k] = g_vkt.calls[k];
     g_vkt.tsc = Tsc();
     g_vkt.all_calls = g_vk_calls;
     return;
@@ -395,6 +477,10 @@ static void PaceFrame(int64_t now) {
   g_pace.over34 += interval > 34 * ms;
   g_pace.over100 += interval > 100 * ms;
   if (interval > g_pace.longest) g_pace.longest = interval;
+  if (interval > 100 * ms && g_pace.hitches < 8) {
+    g_pace.hitch_at[g_pace.hitches] = now - interval - g_start_qpc;
+    g_pace.hitch_length[g_pace.hitches++] = interval;
+  }
   if (now - g_pace.window < 10 * g_pace.frequency || !g_pace.frames) return;
   char line[400];
   size_t n = 0;
@@ -423,7 +509,9 @@ static void PaceFrame(int64_t now) {
   line[n] = 0;
   Log(line);
   PaceCalls(now, frames);
+  PaceHitches();
   g_pace.window = now;
+  g_pace.hitches = 0;
   g_pace.frames = g_pace.over17 = g_pace.over34 = g_pace.over100 = g_pace.paints = 0;
   g_pace.longest = g_pace.acquire = g_pace.present = g_pace.paint = 0;
 }
@@ -490,7 +578,7 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
       int32_t result;
     }* p = args;
     const present_info_t* game_info = p->info;
-    g_vkt.thread = GetCurrentThreadId();
+    g_vkt.presenter = GetCurrentThreadId();
     g_vkt.nested = 1;
     int64_t start = PaceNow();
     const present_info_t* overlay_info = OverlayPresent((void*)(uintptr_t)p->queue, p->info);
@@ -669,18 +757,21 @@ static long VkDispatch(uint64_t handle, unsigned int code, void* args) {
   return RealFor(handle)(handle, code, args);
 }
 
-// Every call comes here: the thread that presents has its calls timed by kind (see g_vkt).
+// Every call comes here: the thread that submits has its calls timed by kind (see g_vkt).
 static long VkDispatcher(uint64_t handle, unsigned int code, void* args) {
-  if (GetCurrentThreadId() != g_vkt.thread) {
+  DWORD thread = GetCurrentThreadId();
+  unsigned kind = code < kVkCodes ? g_call_kind[code] : kVkOther;
+  if (thread != g_vkt.thread) {
     long calls = __sync_add_and_fetch(&g_vk_calls, 1);
     if (calls <= 40) VkLog("call: number, code, caller", calls, code, (uint64_t)(uintptr_t)__builtin_return_address(0));
+    if (kind == kVkSubmit) NoteSubmitter(thread);
     return VkDispatch(handle, code, args);
   }
-  // The thread that presents counts its own calls, without a locked add.
-  ++g_vkt.total;
-  unsigned kind = g_vkt.nested ? kVkOwn : code < kVkCodes ? g_call_kind[code] : kVkOther;
+  // The timed thread counts its own calls, without a locked add.
+  if (g_vkt.nested) kind = kVkOwn;
   ++g_vkt.calls[kind];
-  if (kind == kVkOwn) return VkDispatch(handle, code, args);
+  if (kind == kVkSubmit) g_vkt.last_submit = GetTickCount64();
+  if (kind == kVkOwn || !g_vkt.timing) return VkDispatch(handle, code, args);
   uint64_t start = Tsc();
   long status = VkDispatch(handle, code, args);
   int64_t spent = (int64_t)(Tsc() - start);
@@ -934,12 +1025,19 @@ static void VerifyPatches(void) {
 static DWORD WINAPI HookVulkanLater(void* unused) {
   (void)unused;
   static unsigned char entry[1080];  // MODULEENTRY32W
+  MeasureClocks();
   for (int round = 0;; ++round) {
     if (g_vk_module_count) VerifyPatches();
     if (round % 100 == 0 && g_vk_module_count)
-      VkLog("calls through the shim so far", (uint64_t)(g_vk_calls + g_vkt.total), 0, 0);
-    if (round % 100 == 50)
+      VkLog("calls through the shim so far",
+            (uint64_t)(g_vk_calls + g_vkt.calls[0] + g_vkt.calls[1] + g_vkt.calls[2] + g_vkt.calls[3] + g_vkt.calls[4]),
+            0, 0);
+    if (round % 100 == 50) {
       VkLog("cef frames so far: painted, of them empty, accelerated", g_paints, g_blank_paints, g_accelerated_paints);
+      static long threads_logged;
+      if (g_cef_threads != threads_logged)
+        VkLog("cef threads made with the bigger stack", threads_logged = g_cef_threads, g_cef_stack >> 10, 0);
+    }
     if (round % 300 == 299) CopyGameLog();
     // Until winevulkan.dll is found, for three minutes at most: a module list every 100 ms is not free.
     if (round >= 1800 || g_vk_module_count) {

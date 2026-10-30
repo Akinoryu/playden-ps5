@@ -13,6 +13,12 @@ Chromium's desktop budgets allow 512 MiB of each. When flexible memory runs out 
 the title: BeamNG went back to the home screen from a menu, the runtime's last `PW_WINE64 memory`
 lines showing 10 to 21 MiB of it free.
 
+Chromium makes most of its threads without a stack size, so they take the program's default, which
+chrome.exe sets to 8 MiB. In BeamNG they took BeamNG's, and the renderer's thread, which runs inside
+the game in single-process mode, overflowed it when the Options page laid out (`0xc00000fd`). The
+shim patches `libcef_real.dll`'s `CreateThread` import so those threads get 8 MiB (or the program's
+default if that is more) of address space; the runtime commits a stack's pages only as they are used.
+
 It needs no runtime or Playden change. Chromium does not support single-process mode officially, so
 this may only move the failure.
 
@@ -69,16 +75,20 @@ The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, 
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). Every
 10 seconds a `pace:` line counts the frames presented, how many took over 17, 34 and 100 ms, and how
 long each frame waited in acquire (for a free display buffer) and spent in present. A second `pace:`
-line splits the rest of the frame on the thread that presents: waiting for the GPU (fences,
-semaphores, idle queues), submitting, polling fences, the other Vulkan calls (recording, mostly),
-and what is left, the game's own work; it also counts the Vulkan calls of other threads.
+line splits each frame of the thread that submits the game's work to the GPU (in BeamNG not the one
+that presents): waiting for the GPU (fences, semaphores, idle queues), submitting, polling fences,
+the other Vulkan calls (recording, mostly), and what is left, the game's own work; it also counts
+the Vulkan calls of other threads. The calls are timed with rdtsc when it is cheap; a `clocks:` line
+at start says what it and `QueryPerformanceCounter` cost. A third `pace:` line lists the frames over
+100 ms, each with when it began in seconds since the shim loaded (BeamNG's own log counts from about
+then) and how long it took.
 
-For 30 seconds of every minute, ten times a second, the shim also stops that thread for a moment
-and notes where it is (`sampler.c`): after each 30 seconds a `sample:` line lists the modules (and
-for Windows' and Wine's, the function) it was found in most, with the Vulkan call when it was in
-one, and a second line the game modules that called into Windows, Wine and Vulkan. Each stop holds
-the thread for a fraction of a millisecond (the line says how long), so the pace lines of the other
-30 seconds are the ones without it. `shim:no-sample` turns it off.
+With `shim:sample`, for 30 seconds of every minute, ten times a second, the shim also stops the
+thread that submits for a moment and notes where it is (`sampler.c`): after each 30 seconds a
+`sample:` line lists the modules (and for Windows' and Wine's, the function) it was found in most,
+with the Vulkan call when it was in one, and a second line the game modules that called into
+Windows, Wine and Vulkan. On the console a stop held the thread 11 to 15 ms, so it is off unless
+asked for.
 
 Every half minute the shim also copies BeamNG's own log, `beamng.log` in the game's user folder
 inside the bottle (which FTP cannot read), to `libcef_shim_beamng.log` beside the DLL.

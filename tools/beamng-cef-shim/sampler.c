@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Where the thread that presents spends its time, included by shim.c.
+// Where the thread that submits spends its time, included by shim.c; off unless shim:sample is set.
 //
 // Ten times a second for 30 s of every minute, the sampler stops that thread (the one the pace
 // lines time), copies its instruction pointer and the top of its stack, and lets it go; nothing
-// that takes a lock runs while it is stopped. A stop holds the thread for a moment (0.9 ms on
-// average under Wine on a PC), so the pace lines of the other 30 s are free of it.
+// that takes a lock runs while it is stopped. A stop held the thread 0.9 ms on average under Wine
+// on a PC, but 11 to 15 ms on the console, up to 387 ms (build 21, on the thread that presents,
+// which mostly waits), so it is off by default; the pace lines of the other 30 s are free of it.
 //
 // Then the sample is named: the module it was in, with the nearest export for the modules of
 // Windows and Wine (ntdll.dll!NtWaitForSingleObject), or the Vulkan call when it was in one (in
@@ -13,7 +14,6 @@
 // a program generated (LuaJIT's) or Wine's host side. Samples in Windows, Wine, Vulkan or outside
 // any module are also counted by the first game module on the stack, the one that made the call.
 // After each 30 s the most frequent names are logged, with how long the stops held the thread.
-// shim:no-sample turns it off.
 
 enum {
   kSampleWords = 256,
@@ -255,7 +255,7 @@ static void SampleReport(long samples, long failed, int64_t held, int64_t longes
   }
   size_t n = SampleAppend(line, 0, sizeof(line), "libcef-shim: sample: ");
   n = SampleNumber(line, n, sizeof(line), (uint64_t)samples);
-  n = SampleAppend(line, n, sizeof(line), " of the thread that presents, each held it ");
+  n = SampleAppend(line, n, sizeof(line), " of the thread that submits, each held it ");
   uint64_t hundredths = (uint64_t)held * 100000 / (uint64_t)frequency / (uint64_t)samples;
   n = SampleNumber(line, n, sizeof(line), hundredths / 100);
   n = SampleAppend(line, n, sizeof(line), ".");
@@ -320,7 +320,7 @@ static DWORD WINAPI SampleLater(void* unused) {
       } info;
       if (thread && query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), NULL) == 0 && info.teb)
         teb = (const volatile uint64_t*)info.teb;
-      LogNumber(teb ? "libcef-shim: sample: the thread that presents is "
+      LogNumber(teb ? "libcef-shim: sample: the thread that submits is "
                     : "libcef-shim: sample: cannot sample thread ",
                 id);
       SampleModulesRefresh();
