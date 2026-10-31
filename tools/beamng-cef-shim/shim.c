@@ -150,6 +150,8 @@ static BOOL g_yield_sleep;  // shim:yield-sleep: the main thread's short sleeps 
 static BOOL g_watch_subtrees;  // shim:watch-subtrees: watches of whole trees stay as asked (watch_hook.c)
 static BOOL g_menu_copy;  // shim:menu-copy: CEF's opaque frames are copied over the game's (overlay.c)
 static void HookCefViews(HMODULE real);  // ui_memory.c
+static BOOL g_no_memory_cache;  // shim:no-memory-cache: CEF's memory checks all reach Windows (memory_check.c)
+static void HookMemoryCheck(HMODULE real);  // memory_check.c
 static uint32_t g_ui_width_option = 1280;  // shim:ui-width=N, shim:ui-full (0): the width CEF draws at (ui_memory.c)
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
@@ -550,6 +552,10 @@ __attribute__((noinline)) static void LoadConfig(void) {
           width = width * 10 + (uint32_t)(*d - '0');
         if (width >= 640) g_ui_width_option = width;
       }
+      static const char no_memory_cache[] = "shim:no-memory-cache";
+      i = 0;
+      while (no_memory_cache[i] && p[i] == no_memory_cache[i]) ++i;
+      if (!no_memory_cache[i]) g_no_memory_cache = 1;
       static const char menu_copy[] = "shim:menu-copy";
       i = 0;
       while (menu_copy[i] && p[i] == menu_copy[i]) ++i;
@@ -890,6 +896,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
     g_cef_stack = reserve > ((size_t)8 << 20) ? reserve : (size_t)8 << 20;
     g_create_thread = (create_thread_fn)PatchImport(g_real, "CreateThread", (void*)CefCreateThread);
     HookCefViews(g_real);
+    HookMemoryCheck(g_real);
     if (g_create_thread)
       LogNumber("libcef-shim: CEF's threads get stacks of KiB ", g_cef_stack >> 10);
     else
@@ -971,6 +978,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 #include "ui_memory.c"
 #include "paint_hook.c"
 #include "sampler.c"
+#include "memory_check.c"
 #include "hitch.c"
 #include "time_hook.c"
 #include "watch_hook.c"
@@ -987,7 +995,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 28)\n");
+    Log("libcef-shim: loaded (build 29)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     HookGameTime();

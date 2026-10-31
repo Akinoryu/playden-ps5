@@ -121,7 +121,6 @@ static uint32_t Noise(uint32_t seed, int x, int y) {
 // what a whole new scale gives, and every pixel that changed must be in the rect passed on.
 static void ScaleChanges(int w, int h, int tw, int th) {
   g_view_width = tw, g_view_height = th;
-  g_ui_factor = (float)w / (float)tw;
   memset(g_ui_sizes, 0, sizeof(g_ui_sizes));
   uint32_t* source = malloc((size_t)w * h * 4);
   uint32_t* whole = malloc((size_t)tw * th * 4);
@@ -195,7 +194,7 @@ int main(void) {
   {
     static uint32_t source[1280 * 720];
     for (int i = 0; i < 1280 * 720; ++i) source[i] = Noise(5, i % 1280, i / 1280);
-    g_view_width = 1920, g_view_height = 1080, g_ui_factor = 1279.75f / 1920.0f;
+    g_view_width = 1920, g_view_height = 1080;
     memset(g_ui_sizes, 0, sizeof(g_ui_sizes));
     int32_t rect[4] = {0, 0, 1280, 720};
     const uint32_t* frame = source;
@@ -218,7 +217,7 @@ int main(void) {
   {
     static uint32_t source[256 * 4];
     for (int i = 0; i < 256 * 4; ++i) source[i] = Grey((uint32_t)(i % 256));
-    g_view_width = 640, g_view_height = 10, g_ui_factor = 0.4f;
+    g_view_width = 640, g_view_height = 10;
     memset(g_ui_sizes, 0, sizeof(g_ui_sizes));
     int32_t rect[4] = {0, 0, 256, 4};
     const uint32_t* frame = source;
@@ -245,14 +244,14 @@ int main(void) {
   {
     static uint32_t source[1280 * 720], whole[2560 * 1440];
     for (int i = 0; i < 1280 * 720; ++i) source[i] = Noise(11, i % 1280, i / 1280);
-    g_view_width = 1920, g_view_height = 1080, g_ui_factor = 1279.75f / 1920.0f;
+    g_view_width = 1920, g_view_height = 1080;
     memset(g_ui_sizes, 0, sizeof(g_ui_sizes));
     int32_t all[4] = {0, 0, 1280, 720}, part[4] = {10, 10, 4, 4};
     const uint32_t* frame = source;
     const int32_t* passed;
     int width = 1280, height = 720;
     Paint(0, all, &frame, &width, &height, &passed);
-    g_view_width = 2560, g_view_height = 1440, g_ui_factor = 1279.75f / 2560.0f;
+    g_view_width = 2560, g_view_height = 1440;
     frame = source, width = 1280, height = 720;
     CHECK(Paint(0, part, &frame, &width, &height, &passed) && width == 2560 && height == 1440, "1440p not scaled");
     UiScaleRegion(source, 1280, 720, whole, 2560, 1440, 0, 0, 2560, 1440);
@@ -261,30 +260,53 @@ int main(void) {
           "after a change of size, the rect passed on is %d,%d %dx%d", passed[0], passed[1], passed[2], passed[3]);
   }
 
-  // Passed on as they are: at a factor of 1, and a frame already at the view's size.
+  // Passed on as they are: a frame already at its view's size, and any with shim:ui-full.
   {
     static uint32_t source[16];
     int32_t rect[4] = {0, 0, 4, 4};
     const uint32_t* frame = source;
     const int32_t* passed;
     int width = 4, height = 4;
-    g_ui_factor = 1.0f;
-    CHECK(!Paint(0, rect, &frame, &width, &height, &passed) && frame == source && width == 4, "scaled at 1");
-    g_ui_factor = 0.5f, g_view_width = 4, g_view_height = 4;
+    g_view_width = 4, g_view_height = 4;
     CHECK(!Paint(0, rect, &frame, &width, &height, &passed) && frame == source && width == 4, "scaled to its size");
+    g_ui_width_option = 0, g_view_width = 8, g_view_height = 8;
+    CHECK(!Paint(0, rect, &frame, &width, &height, &passed) && frame == source && width == 4, "scaled with ui-full");
+    g_ui_width_option = 1280;
   }
 
-  // A popup (a <select> list): scaled to the size OnPopupSize gave, or by the factor before that.
+  // A vehicle screen, a browser of its own made after the main one: its scale stays its own, and the
+  // main view's frames are still scaled.
+  {
+    static uint32_t source[1280 * 720];
+    g_view_width = 1920, g_view_height = 1080;
+    float main_scale = CefScale();
+    g_view_width = 256, g_view_height = 128;
+    float screen_scale = CefScale();
+    CHECK(main_scale < 0.67f && screen_scale == 1.0f, "scales %f and %f", main_scale, screen_scale);
+    int32_t rect[4] = {0, 0, 256, 128};
+    const uint32_t* frame = source;
+    const int32_t* passed;
+    int width = 256, height = 128;
+    CHECK(!Paint(0, rect, &frame, &width, &height, &passed) && frame == source && width == 256, "screen scaled");
+    g_view_width = 1920, g_view_height = 1080;
+    int32_t all[4] = {0, 0, 1280, 720};
+    frame = source, width = 1280, height = 720;
+    BOOL scaled = Paint(0, all, &frame, &width, &height, &passed);
+    CHECK(scaled && width == 1920 && height == 1080, "main view after a screen: scaled %d to %dx%d", scaled, width,
+          height);
+  }
+
+  // A popup (a <select> list): scaled to the size OnPopupSize gave, and passed on as it is before.
   {
     static uint32_t source[200 * 100];
     int32_t rect[4] = {0, 0, 200, 100};
     const uint32_t* frame = source;
     const int32_t* passed;
     int width = 200, height = 100;
-    g_ui_factor = 1279.75f / 1920.0f;
     g_view_width = 0;
     BOOL scaled = Paint(1, rect, &frame, &width, &height, &passed);
-    CHECK(scaled && width == 300 && height == 150, "popup: scaled %d to %dx%d", scaled, width, height);
+    CHECK(!scaled && frame == source && width == 200, "popup without a size: scaled %d to %dx%d", scaled, width,
+          height);
     int popup[4] = {40, 30, 200, 101};  // in the view; CEF draws it at 134x68
     g_game_on_popup_size = GamePopupSize;
     ++g_refs;
@@ -300,7 +322,7 @@ int main(void) {
   // The time of a whole frame, 1280x720 to 1920x1080.
   {
     static uint32_t source[1280 * 720];
-    g_view_width = 1920, g_view_height = 1080, g_ui_factor = 1279.75f / 1920.0f;
+    g_view_width = 1920, g_view_height = 1080;
     int32_t rect[4] = {0, 0, 1280, 720};
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);

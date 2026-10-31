@@ -15,12 +15,20 @@
 // cef_do_message_loop_work, which the main thread (CEF's UI thread, the one that called
 // cef_initialize) calls each frame, says whether the main thread was inside it, and logs every 10 s
 // how long the calls took. shim:no-hitch turns it off.
+//
+// The frames of 34 to 100 ms left in build 27 came at a steady rhythm: one of about 36 ms with each
+// call into CEF of about 25 ms, every 5.01 s, and two of about 49 ms in the same 5.01 s, 2 s apart,
+// outside CEF. So the watchdog also stops the main thread and the ones that submit and present
+// when a frame is 30 ms late in smooth play, and lists them the same way as "slow frame" lines:
+// twelve frames, 15 s apart at least. Each stop holds those threads about as long as it takes to
+// land, which makes those twelve frames that much longer.
 
 enum {
   kHitchThreads = 192,
   kHitchWords = 96,
   kHitchShown = 10,  // code addresses per thread
   kHitchLists = 6,
+  kHitchSamples = 12,  // slow frames
 };
 
 typedef struct {
@@ -143,17 +151,23 @@ static void HitchCopy(hitch_thread_t* t) {
   t->count = count;
 }
 
+// The main thread, the one that submits and the one that presents, each once.
+static int HitchKeyThreads(DWORD* ids) {
+  DWORD key[3] = {g_main_thread, g_vkt.thread, g_vkt.presenter};
+  int count = 0;
+  for (int i = 0; i < 3; ++i) {
+    BOOL seen = !key[i];
+    for (int k = 0; k < count && !seen; ++k) seen = ids[k] == key[i];
+    if (!seen) ids[count++] = key[i];
+  }
+  return count;
+}
+
 // The process's threads: the main thread, the one that submits and the one that presents first.
 static int HitchThreadIds(DWORD* ids, int capacity) {
   typedef struct { DWORD size, usage, thread_id, process_id; long base_priority, delta_priority; DWORD flags; } entry_t;
   DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
-  DWORD first[3] = {g_main_thread, g_vkt.thread, g_vkt.presenter};
-  int count = 0;
-  for (int i = 0; i < 3; ++i) {
-    BOOL seen = !first[i];
-    for (int k = 0; k < count && !seen; ++k) seen = ids[k] == first[i];
-    if (!seen) ids[count++] = first[i];
-  }
+  int count = HitchKeyThreads(ids);
   HANDLE snapshot = CreateToolhelp32Snapshot(4 /* TH32CS_SNAPTHREAD */, 0);
   if (snapshot == INVALID_HANDLE_VALUE) return count;
   entry_t entry;
@@ -169,13 +183,15 @@ static int HitchThreadIds(DWORD* ids, int capacity) {
   return count;
 }
 
-// One line for the list, then one per thread. late, at and in_cef_work are as the watchdog found them,
-// before it stopped any thread.
-static void HitchReport(int list, int64_t late, int64_t at, int64_t in_cef_work, int64_t held,
+// One line for the list ("hitch" or "slow frame"), then one per thread. late, at and in_cef_work are
+// as the watchdog found them, before it stopped any thread.
+static void HitchReport(const char* what, int list, int64_t late, int64_t at, int64_t in_cef_work, int64_t held,
                         const hitch_thread_t* threads, int count, int64_t frequency) {
   static char line[2048];
   SampleModulesRefresh();
-  size_t n = SampleAppend(line, 0, sizeof(line), "libcef-shim: hitch ");
+  size_t n = SampleAppend(line, 0, sizeof(line), "libcef-shim: ");
+  n = SampleAppend(line, n, sizeof(line), what);
+  n = SampleAppend(line, n, sizeof(line), " ");
   n = SampleNumber(line, n, sizeof(line), (uint64_t)list);
   n = SampleAppend(line, n, sizeof(line), ": no frame for ");
   n = SampleNumber(line, n, sizeof(line), (uint64_t)(late * 1000 / frequency));
@@ -246,8 +262,8 @@ static DWORD WINAPI HitchWatch(void* unused) {
   if (!frequency) return 0;
   // Presents counted once a second, for the frame rate of the last 3 s.
   long presents_at[4] = {0, 0, 0, 0};
-  int64_t second = 0, last_list = 0, listed_present = 0, stats_at = 0;
-  int lists = 0, seconds = 0;
+  int64_t second = 0, last_list = 0, listed_present = 0, last_sample = 0, sampled_present = 0, stats_at = 0;
+  int lists = 0, samples = 0, seconds = 0;
   for (;;) {
     Sleep(20);
     int64_t now = PaceNow();
@@ -270,25 +286,32 @@ static DWORD WINAPI HitchWatch(void* unused) {
         Log(line);
       }
       LogCefViews();
+      LogMemoryChecks();
       long slows = g_cef_slows;
       PaceList("cef_do_message_loop_work over 8 ms", slows > 12 ? 12 : (int)slows, g_cef_slow_at, g_cef_slow_length);
       g_cef_slows = 0;
     }
-    if (!g_pace.frequency || lists >= kHitchLists) continue;
+    if (!g_pace.frequency || (lists >= kHitchLists && samples >= kHitchSamples)) continue;
     if (now - second >= frequency) {
       second = now;
       for (int i = 0; i < 3; ++i) presents_at[i] = presents_at[i + 1];
       presents_at[3] = g_presents;
       ++seconds;
     }
-    int64_t last = g_pace.last;
-    if (seconds < 4 || now - g_start_qpc < 60 * frequency || last == listed_present) continue;
-    if (now - last < frequency * 120 / 1000 || (last_list && now - last_list < 5 * frequency)) continue;
+    int64_t last = g_pace.last, late = now - last;
+    if (seconds < 4 || now - g_start_qpc < 60 * frequency) continue;
     if (presents_at[2] - presents_at[0] < 80) continue;  // 40 a second before it: smooth play, not loading
-    listed_present = last;
-    last_list = now;
+    // A stall: every thread, 5 s apart. A slow frame: the main thread and the ones that submit and
+    // present, 15 s apart.
+    BOOL stall = lists < kHitchLists && late >= frequency * 120 / 1000 && last != listed_present &&
+                 (!last_list || now - last_list >= 5 * frequency);
+    BOOL slow = !stall && samples < kHitchSamples && late >= frequency * 30 / 1000 && late < frequency * 120 / 1000 &&
+                last != sampled_present && (!last_sample || now - last_sample >= 15 * frequency);
+    if (!stall && !slow) continue;
+    if (stall) listed_present = last, last_list = now;
+    else sampled_present = last, last_sample = now;
     int64_t since = g_cef_work_since, in_cef_work = since ? now - since : 0;
-    int count = HitchThreadIds(ids, kHitchThreads), taken = 0;
+    int count = stall ? HitchThreadIds(ids, kHitchThreads) : HitchKeyThreads(ids), taken = 0;
     for (int i = 0; i < count; ++i)
       if (HitchOpen(&g_hitch_threads[taken], ids[i], query, describe, free_name)) ++taken;
     int64_t stop_from = PaceNow();
@@ -300,8 +323,8 @@ static DWORD WINAPI HitchWatch(void* unused) {
       if (g_hitch_threads[i].stopped) ResumeThread(g_hitch_threads[i].handle);
     int64_t held = PaceNow() - stop_from;
     for (int i = 0; i < taken; ++i) CloseHandle(g_hitch_threads[i].handle);
-    ++lists;
-    HitchReport(lists, now - last, now, in_cef_work, held, g_hitch_threads, taken, frequency);
+    if (stall) HitchReport("hitch", ++lists, late, now, in_cef_work, held, g_hitch_threads, taken, frequency);
+    else HitchReport("slow frame", ++samples, late, now, in_cef_work, held, g_hitch_threads, taken, frequency);
   }
   return 0;
 }

@@ -32,7 +32,11 @@ interface looks a little softer; the 3D picture keeps its size. `shim:ui-width=N
 wide instead (640 or more), and `shim:ui-full` at the view's size, as before build 28. Every 10
 seconds a `ui:` line gives the shared memory CEF has mapped (`MapViewOfFile` from
 `libcef_real.dll`): its views and MiB, the most so far, and how many views could not be mapped; the
-first eight of those are logged as they happen. Not yet tested on a console.
+first eight of those are logged as they happen. BeamNG's vehicle screens (odometers, navigation,
+gauges) are browsers of their own, with the same render handler and views of 1024x512 or smaller;
+CEF keeps a scale for each browser, and the shim decides for each frame, from its browser's view,
+whether it was drawn smaller. Build 28 kept the last scale it gave instead, which a vehicle screen
+reset: the main view's frames then reached BeamNG at 1280x720. Not yet tested on a console.
 
 Chromium makes most of its threads without a stack size, so they take the program's default, which
 chrome.exe sets to 8 MiB. In BeamNG they took BeamNG's, and the renderer's thread, which runs inside
@@ -136,6 +140,18 @@ addresses on its stack. It does this for six stalls, 5 seconds apart at least, a
 how long the threads were held. It also times `cef_do_message_loop_work`, which the game's main
 thread calls each frame, says whether the main thread was inside it during the stall, and logs every
 10 seconds how long those calls took. `shim:no-hitch` turns it off.
+
+The frames of 34 to 100 ms left in build 27 (about six in each 10 s) came at a steady rhythm: one of
+about 36 ms with each call into CEF of about 25 ms, every 5.01 s, and two of about 49 ms in the same
+5.01 s, 2 s apart, outside CEF. Every 5 seconds Chromium's memory pressure check
+(`SystemMemoryPressureEvaluator`) calls `GlobalMemoryStatusEx` on its browser thread, which in
+BeamNG is the game's main thread, so the shim answers `libcef_real.dll`'s calls (`memory_check.c`)
+with Windows' last answer while it is under a minute old, logs the first with what Windows said and
+any that took over 5 ms, and every 10 seconds how many calls there were. `shim:no-memory-cache`
+passes them all on. For the others the watchdog also stops the main thread and the ones that submit
+and present when a frame is 30 ms late in smooth play, and logs them as `slow frame` lines the same
+way: twelve frames, 15 seconds apart at least. Each stop makes its frame longer by about as long as
+it takes to land.
 
 In each stall it listed (build 23), the game's main thread was in `Sleep`, or reading
 `QueryPerformanceCounter`, in `std::this_thread::sleep_for`, its wait between frames. So the shim

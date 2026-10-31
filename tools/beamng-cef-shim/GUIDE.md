@@ -26,8 +26,8 @@ It was tested with:
 
 It is one console and one game version. Other firmwares, kits and BeamNG versions may behave differently.
 
-Build 28's fix for the interface at 1920x1080 ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080))
-is not yet tested on a console.
+The fix for the interface at 1920x1080 ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080), builds 28
+and 29) is not yet tested on a console.
 
 ## What you need
 
@@ -82,10 +82,11 @@ In `/data/playden-games/284160/Bin64/`:
 These are the settings it was tested with:
 
 - **Display mode:** Fullscreen, 1920x1080. With build 27 it ran smoothly at that size, but its interface ran out of
-  memory: black squares in menus and loading screens, and the game closed in Options and during loading. Build 28
-  draws the interface with fewer pixels to fix that ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080));
-  that was not yet tested on a console. Window 1280x720 is the fallback: the shim scales the picture to fill the TV.
-  A lower 16:9 size (for example 960x540) should run faster and look softer; that was not tested.
+  memory: black squares in menus and loading screens, and the game closed in Options and during loading. Since build
+  28 the shim draws the interface with fewer pixels to fix that
+  ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080)); that was not yet tested on a console. Window
+  1280x720 is the fallback: the shim scales the picture to fill the TV. A lower 16:9 size (for example 960x540)
+  should run faster and look softer; that was not tested.
 - **Graphics:** the lowest preset.
 - **FPS limit:** off. A 30 fps limit made the frame pacing worse.
 
@@ -255,6 +256,10 @@ changed back up to 1920x1080. The interface looks a little softer; the 3D pictur
 seconds the log counts the shared memory Chromium holds (`ui:` lines). This was checked on a PC with a stand-in
 for CEF; it was not yet tested on a console.
 
+BeamNG's vehicle screens (odometers, navigation, gauges) are small browsers of their own, made as vehicles spawn.
+Build 28 kept one scale for all of them, which the first vehicle screen reset: from then on the main interface
+reached BeamNG at 1280x720 instead of 1920x1080. Build 29 decides for each frame from its own browser's size.
+
 ### Along the way
 
 - The shim got lighter. Saving CEF frames and listing every thread's stack are now off unless asked for (each held
@@ -284,6 +289,8 @@ Useful lines in `libcef_shim.log`:
 | `overlay ...` / `vk ...` | The menu copy and the Vulkan hook at work. |
 | `ui: view, drawn at scale (thousandths) ...` | The interface is drawn with fewer pixels than its view (build 28). |
 | `ui: CEF's shared memory: ...` | Every 10 s: the shared memory Chromium holds, the most so far, and how many of its pieces could not get memory. |
+| `memory: ...` | Chromium's checks of the system's memory: what Windows said, slow checks, and every 10 s how many there were. |
+| `slow frame N: ...` | Where the main threads were during a frame of 30 ms or more (build 29, twelve of them). |
 | `exception code ...` | A crash or C++ exception, with its call stack. |
 
 ## Options
@@ -308,7 +315,8 @@ a file with any such line replaces all of the default switches. None of these op
 | `shim:keep-settings` | Keep BeamNG's `command_line_args_disabled` setting. |
 | `shim:keep-profiler` | Keep Chromium's stack profiler (it crashed the game). |
 | `shim:no-commit` | Do not commit reserved pages on read faults. |
-| `shim:no-hitch` | Turn off the watchdog that lists threads when a frame stalls. |
+| `shim:no-hitch` | Turn off the watchdog that lists threads when a frame stalls or is slow. |
+| `shim:no-memory-cache` | Pass every one of Chromium's memory checks on to Windows (each took about 25 ms on the game's main thread). |
 | `shim:sample` | Sample where the rendering thread spends its time (costly, for debugging). |
 | `shim:yield-sleep` | Make the game's short sleeps on its main thread yield the CPU instead (for debugging). |
 | `shim:save-frames` | Save CEF frames 20, 100, 300 and 600 as `libcef_ui_frame_<n>.bmp` (holds up the game). |
@@ -329,6 +337,8 @@ a file with any such line replaces all of the default switches. None of these op
   out of memory (`exception code 0xe0000008` in `libcef_shim.log`). On a shim older than build 28, use the latest. If
   it still happens, report the `ui:` lines from `libcef_shim.log`, and meanwhile set Playden's Resolution to
   1280×720, or try `shim:ui-width=960`.
+- **After a vehicle spawns, the interface is drawn small, in a corner, or looks wrong.** You are on build 28. Use the
+  latest.
 - **The interface looks soft at 1920x1080.** Since build 28 it is drawn 1280 pixels wide and scaled up, to save
   memory. `shim:ui-width=1600` draws it sharper, and takes more memory.
 - **The picture shakes, or jumps between two sizes.** You are on a shim older than build 27. Use the latest.
@@ -344,8 +354,10 @@ a file with any such line replaces all of the default switches. None of these op
 
 ## Known limits
 
-- **Small hitches remain:** about 6 frames in every 10 s take 35-50 ms instead of 17 ms. Build 27 logs when each one
-  happens, to find the cause.
+- **Small hitches remain:** about 6 frames in every 10 s took 35-50 ms instead of 17 ms (build 27). They come every
+  5 seconds: one of about 36 ms when Chromium checks the system's memory, which build 29 answers from a cache, and
+  two of about 49 ms whose cause is not known yet. Build 29 logs where the game's main threads are during twelve
+  of them (`slow frame` lines).
 - **Heavier scenes may be slower.** In one run, the frame rate dropped to about 16 fps for about a minute after a
   level loaded. It was not investigated.
 - **At 1920x1080 the interface is drawn at 1280x720 and scaled up** (since build 28), so it is a little softer than

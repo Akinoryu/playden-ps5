@@ -15,6 +15,11 @@
 // pixels wide. Before BeamNG gets each frame, the shim scales the parts that changed back up to the
 // view's size (OnPaint), and a popup's (a <select> list) to the size OnPopupSize gave it, so BeamNG
 // sees the frames it asked for. The 3D picture keeps its own size.
+//
+// BeamNG's vehicle screens (odometers, navigation, gauges) are browsers of their own, made as
+// vehicles spawn, with the same render handler and views of 1024x512 or smaller: CEF keeps a scale
+// for each browser, and the shim decides for each frame, from its browser's view, whether it was
+// drawn smaller (build 28 kept the last scale it gave instead, which each vehicle screen reset).
 // shim:ui-width=N draws N pixels wide instead (640 or more), shim:ui-full at the view's size.
 //
 // Every 10 seconds a line gives the shared memory CEF has mapped (MapViewOfFile from
@@ -27,8 +32,7 @@ static size_t SampleAppend(char* line, size_t n, size_t capacity, const char* te
 static size_t SampleNumber(char* line, size_t n, size_t capacity, uint64_t value);
 static get_screen_info_fn g_game_get_screen_info;
 static on_popup_size_fn g_game_on_popup_size;
-static volatile float g_ui_factor = 1.0f;  // the scale factor last given to CEF, against BeamNG's
-static volatile float g_ui_game_scale = 1.0f;  // BeamNG's own
+static volatile float g_ui_game_scale = 1.0f;  // BeamNG's own scale factor
 static int g_ui_popup[2];  // the popup's (a <select> list's) size in the view, from OnPopupSize
 static long g_ui_logged;
 
@@ -56,7 +60,6 @@ static int GetScreenInfoHook(void* self, void* browser, unsigned char* info) {
   if (g_ui_width_option && pixels > (float)g_ui_width_option) factor = ((float)g_ui_width_option - 0.25f) / pixels;
   g_ui_game_scale = *scale;
   *scale *= factor;
-  g_ui_factor = factor;
   if (g_ui_logged < 8 && factor < 1.0f) {
     ++g_ui_logged;
     VkLog("ui: view, drawn at scale (thousandths)", ((uint64_t)(uint32_t)view[2] << 32) | (uint32_t)view[3],
@@ -130,18 +133,17 @@ static void UiScaleRegion(const uint32_t* from, int width, int height, uint32_t*
 
 // From OnPaint: when CEF drew the frame smaller than the size BeamNG expects, scales the dirty
 // parts up into the kept frame and gives back the frame, its size and the dirty rects to pass on.
-// Returns 0 when the frame is to be passed on as it is.
+// Returns 0 when the frame is to be passed on as it is. Only BeamNG's main view is wider than 1280,
+// so one kept frame of each type serves.
 static BOOL UiScaleFrame(void* self, void* browser, int type, size_t* dirty_count, const int32_t** dirty,
                          const void** buffer, int* width, int* height) {
-  float factor = g_ui_factor;
-  if (factor >= 1.0f || !*buffer || *width <= 0 || *height <= 0 || (type != 0 && type != 1)) return 0;
-  // The size CEF would draw at BeamNG's own scale (ScaleToCeiledSize): of the view, or of the popup.
+  if (!g_ui_width_option || !*buffer || *width <= 0 || *height <= 0 || (type != 0 && type != 1)) return 0;
+  // The size CEF would draw at BeamNG's own scale (ScaleToCeiledSize): of this browser's view, or of
+  // the popup.
   int size[4] = {0, 0, g_ui_popup[0], g_ui_popup[1]};
   if (type == 0) UiViewRect(self, browser, size);  // before the game's OnPaint, which releases the browser
   float scale = g_ui_game_scale;
   int to_width = (int)((float)size[2] * scale + 0.999f), to_height = (int)((float)size[3] * scale + 0.999f);
-  if (type == 1 && (to_width <= 0 || to_height <= 0))
-    to_width = (int)((float)*width / factor + 0.5f), to_height = (int)((float)*height / factor + 0.5f);
   if (to_width <= *width || to_height <= *height || to_width > 7680 || to_height > 4320) return 0;
   uint32_t bytes = (uint32_t)to_width * (uint32_t)to_height * 4;
   if (g_ui_frame_bytes[type] < bytes) {
