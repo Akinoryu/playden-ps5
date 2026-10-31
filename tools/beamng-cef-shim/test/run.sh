@@ -4,9 +4,10 @@
 # Runs overlay_test.c under Wine on Mesa's lavapipe with the Khronos validation layer, on an Xvfb
 # display, once per mode (small, full, bars; see overlay_test.c), and checks screenshots of the
 # display after the game's own frames and after the menu; then standin_test.c (the stand-in
-# swapchain of a second window) the same way, without screenshots. Needs wine, Xvfb, ImageMagick,
-# mesa-vulkan-drivers, vulkan-validationlayers, clang/lld-link/llvm-dlltool, and Vulkan-Headers'
-# include folder:
+# swapchain of a second window) the same way, without screenshots; then ui_memory_test.c (the
+# interface scaled up from a smaller frame) built for the host. Needs wine, Xvfb, ImageMagick,
+# mesa-vulkan-drivers, vulkan-validationlayers, clang/lld-link/llvm-dlltool, a host C compiler (cc),
+# and Vulkan-Headers' include folder:
 #
 #   tools/beamng-cef-shim/test/run.sh /path/to/Vulkan-Headers/include
 set -eu
@@ -93,6 +94,10 @@ errors=$(grep -ciE 'Validation Error|SYNC-HAZARD' run.log || true)
 echo "standin: validation errors: $errors"
 [ "$errors" = 0 ] || failed=1
 grep -q 'test: done' run.log && ! grep -q FAILED run.log || failed=1
+
+cc -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wno-unused-function "$here/ui_memory_test.c" -lm \
+  -o ui_memory_test
+./ui_memory_test || failed=1
 
 [ "$failed" = 0 ] && echo PASS && exit 0
 echo FAIL

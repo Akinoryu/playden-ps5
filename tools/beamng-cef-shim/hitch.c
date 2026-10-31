@@ -269,6 +269,7 @@ static DWORD WINAPI HitchWatch(void* unused) {
         SampleAppend(line, n, sizeof(line), " ms\n");
         Log(line);
       }
+      LogCefViews();
       long slows = g_cef_slows;
       PaceList("cef_do_message_loop_work over 8 ms", slows > 12 ? 12 : (int)slows, g_cef_slow_at, g_cef_slow_length);
       g_cef_slows = 0;

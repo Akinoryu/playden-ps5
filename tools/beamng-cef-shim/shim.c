@@ -60,11 +60,15 @@ __declspec(dllimport) BOOL WINAPI FlushInstructionCache(HANDLE, const void*, siz
 __declspec(dllimport) BOOL WINAPI Module32FirstW(HANDLE, void*);
 __declspec(dllimport) BOOL WINAPI Module32NextW(HANDLE, void*);
 __declspec(dllimport) void* WINAPI VirtualAlloc(void*, size_t, DWORD, DWORD);
+__declspec(dllimport) BOOL WINAPI VirtualFree(void*, size_t, DWORD);
 __declspec(dllimport) DWORD WINAPI GetEnvironmentVariableW(const WCHAR*, WCHAR*, DWORD);
 __declspec(dllimport) BOOL WINAPI QueryPerformanceCounter(int64_t*);
 __declspec(dllimport) BOOL WINAPI QueryPerformanceFrequency(int64_t*);
 __declspec(dllimport) void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*);
 __declspec(dllimport) void* WINAPI RtlVirtualUnwind(DWORD, uint64_t, uint64_t, void*, void*, void**, uint64_t*, void*);
+
+// Code that uses floating point refers to _fltused, which the C runtime would define (ui_memory.c).
+int _fltused = 0;
 
 // CEF C API, Windows: cef_string_t is UTF-16. Only the parts used here.
 typedef struct {
@@ -145,6 +149,8 @@ static DWORD g_main_thread;  // the thread that called cef_initialize: CEF's UI 
 static BOOL g_yield_sleep;  // shim:yield-sleep: the main thread's short sleeps yield instead (time_hook.c)
 static BOOL g_watch_subtrees;  // shim:watch-subtrees: watches of whole trees stay as asked (watch_hook.c)
 static BOOL g_menu_copy;  // shim:menu-copy: CEF's opaque frames are copied over the game's (overlay.c)
+static void HookCefViews(HMODULE real);  // ui_memory.c
+static uint32_t g_ui_width_option = 1280;  // shim:ui-width=N, shim:ui-full (0): the width CEF draws at (ui_memory.c)
 static BOOL g_vk_fullsize;
 static uint32_t g_full_width, g_full_height;
 static char g_config[4096];
@@ -531,6 +537,19 @@ __attribute__((noinline)) static void LoadConfig(void) {
       i = 0;
       while (watch_subtrees[i] && p[i] == watch_subtrees[i]) ++i;
       if (!watch_subtrees[i]) g_watch_subtrees = 1;
+      static const char ui_full[] = "shim:ui-full";
+      i = 0;
+      while (ui_full[i] && p[i] == ui_full[i]) ++i;
+      if (!ui_full[i]) g_ui_width_option = 0;
+      static const char ui_width[] = "shim:ui-width=";
+      i = 0;
+      while (ui_width[i] && p[i] == ui_width[i]) ++i;
+      if (!ui_width[i]) {
+        uint32_t width = 0;
+        for (const char* d = p + i; *d >= '0' && *d <= '9' && width < 100000; ++d)
+          width = width * 10 + (uint32_t)(*d - '0');
+        if (width >= 640) g_ui_width_option = width;
+      }
       static const char menu_copy[] = "shim:menu-copy";
       i = 0;
       while (menu_copy[i] && p[i] == menu_copy[i]) ++i;
@@ -870,6 +889,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
     LogNumber("libcef-shim: the program's default thread stack, KiB ", reserve >> 10);
     g_cef_stack = reserve > ((size_t)8 << 20) ? reserve : (size_t)8 << 20;
     g_create_thread = (create_thread_fn)PatchImport(g_real, "CreateThread", (void*)CefCreateThread);
+    HookCefViews(g_real);
     if (g_create_thread)
       LogNumber("libcef-shim: CEF's threads get stacks of KiB ", g_cef_stack >> 10);
     else
@@ -948,6 +968,7 @@ __declspec(dllexport) int cef_initialize(const void* args, const void* settings,
 #include "vk_hook.c"
 #include "overlay.c"
 #include "standin.c"
+#include "ui_memory.c"
 #include "paint_hook.c"
 #include "sampler.c"
 #include "hitch.c"
@@ -966,7 +987,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 27)\n");
+    Log("libcef-shim: loaded (build 28)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     HookGameTime();

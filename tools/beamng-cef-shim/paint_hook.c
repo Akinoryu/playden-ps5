@@ -6,8 +6,10 @@
 // each frame to the game's render handler, as pixels (OnPaint) or as a shared
 // GPU texture (OnAcceleratedPaint). The shim wraps cef_browser_host_create_browser
 // and _sync, logs how the browser is set up, and puts its own functions in the
-// game's render handler for those two callbacks: it counts the frames, logs
-// whether they hold any picture, and passes each one on unchanged.
+// game's render handler for those two callbacks, and for GetScreenInfo to draw
+// the interface with fewer pixels than its view (ui_memory.c): it counts the
+// frames, logs whether they hold any picture, and passes each one on, scaled up
+// to the view's size when CEF drew it smaller.
 //
 // BeamNG asks for external begin frames: CEF draws a frame only when the game
 // asks, and takes the next request only once the last one is acknowledged. In
@@ -22,6 +24,8 @@
 enum {
   kClientGetRenderHandler = 0xa8,  // the 17th method
   kClientMinSize = 0xb0,
+  kRenderGetScreenInfo = 0x48,
+  kRenderOnPopupSize = 0x58,
   kRenderOnPaint = 0x60,
   kRenderOnAcceleratedPaint = 0x68,
   kRenderMinSize = 0x70,
@@ -109,11 +113,15 @@ static void OnPaintHook(void* self, void* browser, int type, size_t dirty_count,
   if (g_save_frames && buffer && width > 0 && height > 0 && width <= 4096 && height <= 4096 &&
       (count == 20 || count == 100 || count == 300 || count == 600))
     SaveFrame(count, buffer, width, height);
-  if (buffer && type == 0 /* PET_VIEW */) OverlayTakeFrame(buffer, width, height, opaque);
   if (count <= 5 || count % 600 == 0) {
     VkLog("cef paint: number, size, type", count, ((uint64_t)(uint32_t)width << 32) | (uint32_t)height, type);
     VkLog("cef paint: of 144 samples, coloured, opaque", (uint64_t)visible, (uint64_t)opaque, 0);
   }
+  // Drawn at fewer pixels than the view (ui_memory.c): scaled back up to the size BeamNG expects.
+  if (UiScaleFrame(self, browser, type, &dirty_count, (const int32_t**)&dirty, &buffer, &width, &height) &&
+      (count <= 5 || count % 600 == 0))
+    VkLog("ui: frame scaled up to", ((uint64_t)(uint32_t)width << 32) | (uint32_t)height, dirty_count, type);
+  if (buffer && type == 0 /* PET_VIEW */) OverlayTakeFrame(buffer, width, height, opaque);
   g_game_on_paint(self, browser, type, dirty_count, dirty, buffer, width, height);
   g_pace.paint += PaceNow() - start;
   ++g_pace.paints;
@@ -135,15 +143,20 @@ static void WrapRenderHandler(void* handler) {
   if (*(size_t*)handler < kRenderMinSize) return;
   on_paint_fn paint = (on_paint_fn)Field(handler, kRenderOnPaint);
   on_accelerated_paint_fn accelerated = (on_accelerated_paint_fn)Field(handler, kRenderOnAcceleratedPaint);
+  get_screen_info_fn screen_info = (get_screen_info_fn)Field(handler, kRenderGetScreenInfo);
+  on_popup_size_fn popup_size = (on_popup_size_fn)Field(handler, kRenderOnPopupSize);
   if (paint == OnPaintHook) return;
   VkLock();
   if (!g_game_on_paint) {
     g_game_on_paint = paint;
     g_game_on_accelerated_paint = accelerated;
+    g_game_get_screen_info = screen_info;
+    g_game_on_popup_size = popup_size;
     VkLog("cef render handler: OnPaint, OnAcceleratedPaint", (uint64_t)(uintptr_t)paint,
           (uint64_t)(uintptr_t)accelerated, 0);
   }
-  BOOL same = paint == g_game_on_paint && accelerated == g_game_on_accelerated_paint;
+  BOOL same = paint == g_game_on_paint && accelerated == g_game_on_accelerated_paint &&
+              screen_info == g_game_get_screen_info && popup_size == g_game_on_popup_size;
   VkUnlock();
   if (!same) {
     VkLog("cef render handler with other callbacks left alone", (uint64_t)(uintptr_t)paint, 0, 0);
@@ -151,6 +164,10 @@ static void WrapRenderHandler(void* handler) {
   }
   *(void**)((unsigned char*)handler + kRenderOnPaint) = (void*)OnPaintHook;
   *(void**)((unsigned char*)handler + kRenderOnAcceleratedPaint) = (void*)OnAcceleratedPaintHook;
+  if (g_ui_width_option) {
+    *(void**)((unsigned char*)handler + kRenderGetScreenInfo) = (void*)GetScreenInfoHook;
+    if (popup_size) *(void**)((unsigned char*)handler + kRenderOnPopupSize) = (void*)OnPopupSizeHook;
+  }
 }
 
 static void* GetRenderHandlerHook(void* client) {

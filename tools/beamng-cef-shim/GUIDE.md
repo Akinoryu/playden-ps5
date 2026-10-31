@@ -26,6 +26,9 @@ It was tested with:
 
 It is one console and one game version. Other firmwares, kits and BeamNG versions may behave differently.
 
+Build 28's fix for the interface at 1920x1080 ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080))
+is not yet tested on a console.
+
 ## What you need
 
 - A jailbroken PS5 running Playden, signed in to Steam, with BeamNG.drive downloaded.
@@ -44,7 +47,7 @@ Open BeamNG.drive's **Game settings** in Playden and set:
 | **Program** | `Bin64/BeamNG.drive.x64.exe` |
 | **Extra arguments** | `-gfx vk --single-process --in-process-gpu --no-sandbox --disable-gpu --disable-gpu-compositing --disable-stack-profiler` |
 | **Advanced › Library overrides** | `crashrpt=d` |
-| **Resolution** | `1280×720` (recommended, see below) |
+| **Resolution** | `1920×1080` |
 
 Why each one is there:
 
@@ -59,11 +62,11 @@ Why each one is there:
 - **`crashrpt=d`** stops BeamNG's crash reporter from loading. The reporter tries to start a helper program, fails,
   unloads itself, and then the game crashed calling into it. BeamNG's log then says it could not install the crash
   reporter. That message is expected.
-- **Resolution `1280×720`** is the size of the Windows screen the game sees; the PS5 still shows the picture full
-  screen. At that size BeamNG cannot pick 1920x1080, whatever its own settings say. At 1920x1080 its interface takes
-  far more of the PS5's memory: menus and loading screens showed black squares and the game closed in Options and
-  during loading. This Playden setting avoids that without opening BeamNG's Options. It was not yet tested with the
-  shim on a console; if the picture looks wrong, set it back to 1920×1080 and use BeamNG's Window 1280x720 instead.
+- **Resolution `1920×1080`** is the size of the Windows screen the game sees; the PS5 shows the picture full screen
+  either way. It lets BeamNG run Fullscreen at 1920x1080. Before build 28, BeamNG's interface ran out of the PS5's
+  memory at that size (see [problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080)). If black squares or
+  crashes in menus come back, set it to `1280×720`: BeamNG then cannot pick 1920x1080, whatever its own settings
+  say, and you need not open its Options to change it.
 
 ### 2. Install the shim (FTP)
 
@@ -78,11 +81,11 @@ In `/data/playden-games/284160/Bin64/`:
 
 These are the settings it was tested with:
 
-- **Display mode:** Window, 1280x720. The shim scales the picture to fill the TV. **Do not use 1920x1080:** at
-  that size BeamNG's interface takes much more of the PS5's memory: black squares showed in menus and loading
-  screens, and the game closed in Options and during loading. It also costs more CPU time per frame (about 49 fps
-  instead of 60). Playden's Resolution setting at 1280×720 (above) keeps BeamNG at that size even if its Options
-  cannot be reached. A lower 16:9 size (for example 960x540) should run faster and look softer; that was not tested.
+- **Display mode:** Fullscreen, 1920x1080. With build 27 it ran smoothly at that size, but its interface ran out of
+  memory: black squares in menus and loading screens, and the game closed in Options and during loading. Build 28
+  draws the interface with fewer pixels to fix that ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080));
+  that was not yet tested on a console. Window 1280x720 is the fallback: the shim scales the picture to fill the TV.
+  A lower 16:9 size (for example 960x540) should run faster and look softer; that was not tested.
 - **Graphics:** the lowest preset.
 - **FPS limit:** off. A 30 fps limit made the frame pacing worse.
 
@@ -236,6 +239,22 @@ so Wine refuses a swapchain for it. BeamNG asked ten times, then used the swapch
 **Fix:** a second window now gets a stand-in swapchain: images of the shim's own that BeamNG draws into and presents.
 BeamNG keeps running, but the pop-up itself is not shown.
 
+### 11. Black squares and crashes in menus at 1920x1080
+
+In Fullscreen 1920x1080, menus and loading screens showed black squares, and the game closed in menus, in Options
+and during loading, with Chromium's out-of-memory exception (`0xe0000008`). Each black square was a 256 KiB piece
+of the interface (a tile) that got no memory. The tiles and images come out of the same pool of about 440 MiB as in
+[problem 6](#6-back-to-the-ps5-home-screen-from-a-menu), and at 1920x1080 the interface has 2.25 times the pixels
+of 1280x720: the main menu took about 215 MiB of the pool in 5 seconds and left 35 to 51 MiB, while at 1280x720
+about 215 to 270 MiB stayed free.
+
+**Fix (build 28):** the shim tells Chromium that the screen has fewer pixels for its size (the "device scale
+factor"). Chromium lays the interface out at 1920x1080 as before, with the mouse where it was, but draws it 1280
+pixels wide, with the tiles and memory of 1280x720. Before BeamNG gets each frame, the shim scales the parts that
+changed back up to 1920x1080. The interface looks a little softer; the 3D picture keeps its full size. Every 10
+seconds the log counts the shared memory Chromium holds (`ui:` lines). This was checked on a PC with a stand-in
+for CEF; it was not yet tested on a console.
+
 ### Along the way
 
 - The shim got lighter. Saving CEF frames and listing every thread's stack are now off unless asked for (each held
@@ -263,6 +282,8 @@ Useful lines in `libcef_shim.log`:
 | `pace: frames over 100 ms, at seconds (ms): ...` | When each long frame happened and how long it took. |
 | `sleep: ... GetTickCount64 stood still N times ...` | Every 10 s. Anything above 0 means the Wine server is stalling. |
 | `overlay ...` / `vk ...` | The menu copy and the Vulkan hook at work. |
+| `ui: view, drawn at scale (thousandths) ...` | The interface is drawn with fewer pixels than its view (build 28). |
+| `ui: CEF's shared memory: ...` | Every 10 s: the shared memory Chromium holds, the most so far, and how many of its pieces could not get memory. |
 | `exception code ...` | A crash or C++ exception, with its call stack. |
 
 ## Options
@@ -276,6 +297,8 @@ a file with any such line replaces all of the default switches. None of these op
 | `shim:watch-subtrees` | Keep whole-tree folder watches as asked (brings the stutter back). |
 | `shim:no-overlay` | Turn off the scaler and the menu copy (the screen goes black at 1280x720). |
 | `shim:menu-copy` | Copy CEF's opaque frames (loading screens, menus) over the game's picture, as builds 15 to 26 did. |
+| `shim:ui-width=N` | Draw BeamNG's interface N pixels wide when its view is wider (640 or more; 1280 by default). More is sharper and takes more memory. |
+| `shim:ui-full` | Draw the interface at its view's full size, as before build 28 (at 1920x1080 it ran out of memory). |
 | `shim:no-vk-fullsize` | Keep BeamNG's own swapchain size instead of 1920x1080. |
 | `shim:vk-size=WxH` | Use another full size, for example `3840x2160` (not tested). |
 | `shim:no-vk-fix` | Do not free display buffers held by replaced swapchains. |
@@ -301,10 +324,13 @@ a file with any such line replaces all of the default switches. None of these op
 - **The game freezes for a moment every 1.7 seconds.** You are on a shim older than build 25. Use the latest.
 - **Opening Options crashes the game.**
   - On a shim older than build 22, use the latest.
-  - At 1920x1080, Options ran out of memory: set Playden's Resolution to 1280×720.
-- **Black squares in menus or loading screens, or the game closes in menus or while loading.** BeamNG runs at
-  1920x1080 and its interface ran out of memory (`exception code 0xe0000008` in `libcef_shim.log`). Set Playden's
-  Resolution to 1280×720.
+  - At 1920x1080 on a shim older than build 28, Options ran out of memory: use the latest.
+- **Black squares in menus or loading screens, or the game closes in menus or while loading.** The interface ran
+  out of memory (`exception code 0xe0000008` in `libcef_shim.log`). On a shim older than build 28, use the latest. If
+  it still happens, report the `ui:` lines from `libcef_shim.log`, and meanwhile set Playden's Resolution to
+  1280×720, or try `shim:ui-width=960`.
+- **The interface looks soft at 1920x1080.** Since build 28 it is drawn 1280 pixels wide and scaled up, to save
+  memory. `shim:ui-width=1600` draws it sharper, and takes more memory.
 - **The picture shakes, or jumps between two sizes.** You are on a shim older than build 27. Use the latest.
 - **A pop-up window crashes the game.** You are on a shim older than build 27. Use the latest.
 - **A black screen with sound.** Check that `-gfx vk` is in Extra arguments, and look for `vk` and `overlay` lines in
@@ -322,6 +348,8 @@ a file with any such line replaces all of the default switches. None of these op
   happens, to find the cause.
 - **Heavier scenes may be slower.** In one run, the frame rate dropped to about 16 fps for about a minute after a
   level loaded. It was not investigated.
+- **At 1920x1080 the interface is drawn at 1280x720 and scaled up** (since build 28), so it is a little softer than
+  the 3D picture.
 - **Pop-up windows are not shown.** Debug pop-ups that open a second window, such as the Performance Graph's Export,
   no longer crash the game, but the PS5 can show only the game's own window.
 - **While the game runs, it does not notice files that change** in subfolders of the folders it watches. Restart it

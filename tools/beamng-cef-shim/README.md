@@ -19,6 +19,21 @@ about 215 MiB stayed free while driving, while in Fullscreen 1920x1080 the main 
 90 MiB and opening Options used the rest (Chromium's out-of-memory exception `0xe0000008`, which
 the shim logs with the other crashes).
 
+At 1920x1080 menus and loading screens also showed black squares where 256 KiB tiles could not be
+mapped, and the game closed in menus, Options and loading screens. So when BeamNG's view is wider
+than 1280 pixels, the shim (`ui_memory.c`) lowers the device scale factor BeamNG reports to CEF
+(`GetScreenInfo`, which CEF asks again at each resize) by 1280 / the view's width. Chromium lays the
+page out at BeamNG's size as before and keeps mouse positions in it, but draws it 1280 pixels wide,
+with the tiles of 1280x720. Before BeamNG gets each frame (`OnPaint`), the shim scales the parts
+that changed up to the size BeamNG expects (a `<select>` list's popup to the size `OnPopupSize`
+gave), into a frame of its own that it keeps between paints: 1280x720 to 1920x1080 in blocks of two
+pixels to three (a whole frame took about 1.3 ms on a 2.8 GHz Xeon), other sizes bilinear. The
+interface looks a little softer; the 3D picture keeps its size. `shim:ui-width=N` draws N pixels
+wide instead (640 or more), and `shim:ui-full` at the view's size, as before build 28. Every 10
+seconds a `ui:` line gives the shared memory CEF has mapped (`MapViewOfFile` from
+`libcef_real.dll`): its views and MiB, the most so far, and how many views could not be mapped; the
+first eight of those are logged as they happen. Not yet tested on a console.
+
 Chromium makes most of its threads without a stack size, so they take the program's default, which
 chrome.exe sets to 8 MiB. In BeamNG they took BeamNG's, and the renderer's thread, which runs inside
 the game in single-process mode, overflowed it when the Options page laid out (`0xc00000fd`). The
@@ -95,7 +110,7 @@ the shim. The pop-up itself is not shown.
 
 `test/run.sh` checks the overlay and the scaling, and a stand-in used beside a real swapchain, on
 real Vulkan (Mesa's lavapipe under Wine, with the Khronos validation layer and its synchronization
-checks).
+checks), and the interface's scaling (`test/ui_memory_test.c`, built for the host).
 
 The shim logs each step to stderr as `libcef-shim: ...` lines in the title log, and to
 `libcef_shim.log` beside the DLL (Playden keeps only the start and end of a long title log). Every
