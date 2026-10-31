@@ -20,14 +20,14 @@ It was tested with:
 | | |
 | --- | --- |
 | Console | PS5, firmware 13.60 |
-| Playden | 0.9.0-beta.2 with runtime kit 0.15. Playden 0.9.0 uses the same kit, but was not tested. |
+| Playden | 0.9.0-beta.2 with runtime kit 0.15, and 0.9.0-beta.3 with kit 0.16 (builds 27 to 29) |
 | Game | BeamNG.drive 0.40.4.0 (build 296339), from Steam (app 284160) |
 | BeamNG's CEF | 150.0.20 (the export list in [exports-cef-150.0.20.txt](exports-cef-150.0.20.txt)) |
 
 It is one console and one game version. Other firmwares, kits and BeamNG versions may behave differently.
 
-The fix for the interface at 1920x1080 ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080), builds 28
-and 29) is not yet tested on a console.
+Build 29 was played on the console at Fullscreen 1920x1080 for 26 minutes, on Small Island and West Coast USA,
+with no black squares and no crash ([problem 11](#11-black-squares-and-crashes-in-menus-at-1920x1080)).
 
 ## What you need
 
@@ -253,12 +253,16 @@ about 215 to 270 MiB stayed free.
 factor"). Chromium lays the interface out at 1920x1080 as before, with the mouse where it was, but draws it 1280
 pixels wide, with the tiles and memory of 1280x720. Before BeamNG gets each frame, the shim scales the parts that
 changed back up to 1920x1080. The interface looks a little softer; the 3D picture keeps its full size. Every 10
-seconds the log counts the shared memory Chromium holds (`ui:` lines). This was checked on a PC with a stand-in
-for CEF; it was not yet tested on a console.
+seconds the log counts the shared memory Chromium holds (`ui:` lines).
 
 BeamNG's vehicle screens (odometers, navigation, gauges) are small browsers of their own, made as vehicles spawn.
 Build 28 kept one scale for all of them, which the first vehicle screen reset: from then on the main interface
 reached BeamNG at 1280x720 instead of 1920x1080. Build 29 decides for each frame from its own browser's size.
+
+On the console (build 29, kit 0.16) no piece of the interface failed to get memory in 26 minutes, and the flexible
+memory pool stayed at about 270 MiB free while Chromium's shared memory went up to 314 MiB: with kit 0.16 that
+memory seems no longer to come out of the pool. `shim:ui-full` (the interface at its full size) may then work too
+on kit 0.16; that was not tested.
 
 ### Along the way
 
@@ -289,7 +293,7 @@ Useful lines in `libcef_shim.log`:
 | `overlay ...` / `vk ...` | The menu copy and the Vulkan hook at work. |
 | `ui: view, drawn at scale (thousandths) ...` | The interface is drawn with fewer pixels than its view (build 28). |
 | `ui: CEF's shared memory: ...` | Every 10 s: the shared memory Chromium holds, the most so far, and how many of its pieces could not get memory. |
-| `memory: ...` | Chromium's checks of the system's memory: what Windows said, slow checks, and every 10 s how many there were. |
+| `memory: ...` | Chromium's and BeamNG's checks of memory: what Windows said, slow checks, and every 10 s how many there were. |
 | `slow frame N: ...` | Where the main threads were during a frame of 30 ms or more (build 29, twelve of them). |
 | `exception code ...` | A crash or C++ exception, with its call stack. |
 
@@ -316,7 +320,7 @@ a file with any such line replaces all of the default switches. None of these op
 | `shim:keep-profiler` | Keep Chromium's stack profiler (it crashed the game). |
 | `shim:no-commit` | Do not commit reserved pages on read faults. |
 | `shim:no-hitch` | Turn off the watchdog that lists threads when a frame stalls or is slow. |
-| `shim:no-memory-cache` | Pass every one of Chromium's memory checks on to Windows (each took about 25 ms on the game's main thread). |
+| `shim:no-memory-cache` | Pass every one of Chromium's and BeamNG's memory checks on to Windows (each took about 25 ms on the console). |
 | `shim:sample` | Sample where the rendering thread spends its time (costly, for debugging). |
 | `shim:yield-sleep` | Make the game's short sleeps on its main thread yield the CPU instead (for debugging). |
 | `shim:save-frames` | Save CEF frames 20, 100, 300 and 600 as `libcef_ui_frame_<n>.bmp` (holds up the game). |
@@ -354,12 +358,13 @@ a file with any such line replaces all of the default switches. None of these op
 
 ## Known limits
 
-- **Small hitches remain:** about 6 frames in every 10 s took 35-50 ms instead of 17 ms (build 27). They come every
-  5 seconds: one of about 36 ms when Chromium checks the system's memory, which build 29 answers from a cache, and
-  two of about 49 ms whose cause is not known yet. Build 29 logs where the game's main threads are during twelve
-  of them (`slow frame` lines).
-- **Heavier scenes may be slower.** In one run, the frame rate dropped to about 16 fps for about a minute after a
-  level loaded. It was not investigated.
+- **Small hitches remain:** in build 27 about 6 frames in every 10 s took 35-50 ms instead of 17 ms. The ones of
+  about 36 ms came when Chromium checked the system's memory, and were gone with build 29's cache. The ones of
+  about 50 ms still came every 2 s; in one of them BeamNG's main thread was asking for its own memory use, the same
+  slow query, which build 30 answers from a cache too (not yet tested on a console).
+- **Big maps are slower.** On West Coast USA (build 29) the game made 13,000 to 40,000 Vulkan calls a frame,
+  against about 6,000 on Small Island, and ran at 15 to 35 fps instead of about 50. The time goes to the game and
+  the PS5's Vulkan driver, not to the shim. Lower graphics settings and less traffic should help; not tested.
 - **At 1920x1080 the interface is drawn at 1280x720 and scaled up** (since build 28), so it is a little softer than
   the 3D picture.
 - **Pop-up windows are not shown.** Debug pop-ups that open a second window, such as the Performance Graph's Export,

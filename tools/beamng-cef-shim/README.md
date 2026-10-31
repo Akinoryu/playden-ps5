@@ -153,6 +153,14 @@ and present when a frame is 30 ms late in smooth play, and logs them as `slow fr
 way: twelve frames, 15 seconds apart at least. Each stop makes its frame longer by about as long as
 it takes to land.
 
+On the console (build 29) `GlobalMemoryStatusEx` took 24 to 25 ms: Wine works out the process's
+memory counters (`NtQueryInformationProcess`, `ProcessVmCounters`) there from every mapping. With
+the cache the frames of about 36 ms were gone. The frames of about 50 ms still came, every 2 s on
+Small Island, and in one of them BeamNG's main thread was in `GetProcessMemoryInfo`, which asks for
+the same counters. So build 30 answers `GetProcessMemoryInfo` and `K32GetProcessMemoryInfo` for the
+game's own process, and `GlobalMemoryStatusEx`, the same way for `BeamNG.drive.x64.exe` and
+`mimalloc.dll` as for `libcef_real.dll`.
+
 In each stall it listed (build 23), the game's main thread was in `Sleep`, or reading
 `QueryPerformanceCounter`, in `std::this_thread::sleep_for`, its wait between frames. So the shim
 also wraps the game's `Sleep` and `QueryPerformanceCounter` imports (`time_hook.c`): every 10

@@ -150,7 +150,7 @@ static BOOL g_yield_sleep;  // shim:yield-sleep: the main thread's short sleeps 
 static BOOL g_watch_subtrees;  // shim:watch-subtrees: watches of whole trees stay as asked (watch_hook.c)
 static BOOL g_menu_copy;  // shim:menu-copy: CEF's opaque frames are copied over the game's (overlay.c)
 static void HookCefViews(HMODULE real);  // ui_memory.c
-static BOOL g_no_memory_cache;  // shim:no-memory-cache: CEF's memory checks all reach Windows (memory_check.c)
+static BOOL g_no_memory_cache;  // shim:no-memory-cache: memory checks all reach Windows (memory_check.c)
 static void HookMemoryCheck(HMODULE real);  // memory_check.c
 static uint32_t g_ui_width_option = 1280;  // shim:ui-width=N, shim:ui-full (0): the width CEF draws at (ui_memory.c)
 static BOOL g_vk_fullsize;
@@ -995,7 +995,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, void* reserved) {
     g_log_file = CreateFileW(path, 0x40000000 /* GENERIC_WRITE */, FILE_SHARE_READ, NULL, 2 /* CREATE_ALWAYS */,
                              0x80 /* FILE_ATTRIBUTE_NORMAL */, NULL);
     QueryPerformanceCounter(&g_start_qpc);
-    Log("libcef-shim: loaded (build 29)\n");
+    Log("libcef-shim: loaded (build 30)\n");
     LoadConfig();
     AddVectoredExceptionHandler(1, (void*)ExceptionLogger);
     HookGameTime();
